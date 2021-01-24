@@ -1,12 +1,12 @@
 /*
- * Copyright 2017 Google Inc.
- * 
+ * Copyright 2019 The Vitess Authors.
+
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,7 +21,18 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.primitives.UnsignedLong;
 import com.google.protobuf.ByteString;
+
+import io.vitess.client.cursor.Cursor;
+import io.vitess.client.cursor.CursorWithError;
+import io.vitess.client.cursor.SimpleCursor;
+import io.vitess.proto.Query;
+import io.vitess.proto.Query.BindVariable;
+import io.vitess.proto.Query.BoundQuery;
+import io.vitess.proto.Query.QueryResult;
+import io.vitess.proto.Vtrpc.RPCError;
+
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.SQLException;
 import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.SQLInvalidAuthorizationSpecException;
@@ -33,25 +44,21 @@ import java.sql.SQLTransientException;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import javax.annotation.Nullable;
 
-import io.vitess.client.cursor.Cursor;
-import io.vitess.client.cursor.CursorWithError;
-import io.vitess.client.cursor.SimpleCursor;
-import io.vitess.proto.Query;
-import io.vitess.proto.Query.BindVariable;
-import io.vitess.proto.Query.BoundQuery;
-import io.vitess.proto.Query.QueryResult;
-import io.vitess.proto.Vtgate.BoundKeyspaceIdQuery;
-import io.vitess.proto.Vtgate.BoundShardQuery;
-import io.vitess.proto.Vtgate.ExecuteEntityIdsRequest.EntityId;
-import io.vitess.proto.Vtrpc.RPCError;
+import javax.annotation.Nullable;
 
 /**
  * Proto contains methods for working with Vitess protobuf messages.
  */
 public class Proto {
 
+  public static final Function<byte[], ByteString> BYTE_ARRAY_TO_BYTE_STRING =
+      new Function<byte[], ByteString>() {
+        @Override
+        public ByteString apply(byte[] from) {
+          return ByteString.copyFrom(from);
+        }
+      };
   private static final int MAX_DECIMAL_UNIT = 30;
 
   /**
@@ -59,7 +66,7 @@ public class Proto {
    *
    * <p>
    * Errors returned by Vitess are documented in the
-   * <a href="https://github.com/youtube/vitess/blob/master/proto/vtrpc.proto">vtrpc proto</a>.
+   * <a href="https://github.com/vitessio/vitess/blob/master/proto/vtrpc.proto">vtrpc proto</a>.
    */
   public static void checkError(RPCError error) throws SQLException {
     if (error != null) {
@@ -132,7 +139,7 @@ public class Proto {
     }
     try {
       return Integer.parseInt(errorMessage.substring(start, end));
-    } catch (NumberFormatException e) {
+    } catch (NumberFormatException exc) {
       return 0;
     }
   }
@@ -192,13 +199,6 @@ public class Proto {
     return builder.build();
   }
 
-  public static EntityId buildEntityId(byte[] keyspaceId, Object value) {
-    TypedValue tval = new TypedValue(value);
-
-    return EntityId.newBuilder().setKeyspaceId(ByteString.copyFrom(keyspaceId)).setType(tval.type)
-        .setValue(tval.value).build();
-  }
-
   /**
    * bindQuery creates a BoundQuery from query and vars.
    */
@@ -212,50 +212,8 @@ public class Proto {
     return boundQueryBuilder.build();
   }
 
-  /**
-   * bindShardQuery creates a BoundShardQuery.
-   */
-  public static BoundShardQuery bindShardQuery(String keyspace, Iterable<String> shards,
-      BoundQuery query) {
-    return BoundShardQuery.newBuilder().setKeyspace(keyspace).addAllShards(shards).setQuery(query)
-        .build();
-  }
-
-  /**
-   * bindShardQuery creates a BoundShardQuery.
-   */
-  public static BoundShardQuery bindShardQuery(String keyspace, Iterable<String> shards,
-      String query, Map<String, ?> vars) {
-    return bindShardQuery(keyspace, shards, bindQuery(query, vars));
-  }
-
-  /**
-   * bindKeyspaceIdQuery creates a BoundKeyspaceIdQuery.
-   */
-  public static BoundKeyspaceIdQuery bindKeyspaceIdQuery(String keyspace,
-      Iterable<byte[]> keyspaceIds, BoundQuery query) {
-    return BoundKeyspaceIdQuery.newBuilder().setKeyspace(keyspace)
-        .addAllKeyspaceIds(Iterables.transform(keyspaceIds, BYTE_ARRAY_TO_BYTE_STRING))
-        .setQuery(query).build();
-  }
-
-  /**
-   * bindKeyspaceIdQuery creates a BoundKeyspaceIdQuery.
-   */
-  public static BoundKeyspaceIdQuery bindKeyspaceIdQuery(String keyspace,
-      Iterable<byte[]> keyspaceIds, String query, Map<String, ?> vars) {
-    return bindKeyspaceIdQuery(keyspace, keyspaceIds, bindQuery(query, vars));
-  }
-
-  public static List<Cursor> toCursorList(List<QueryResult> queryResults) {
-    ImmutableList.Builder<Cursor> builder = new ImmutableList.Builder<Cursor>();
-    for (QueryResult queryResult : queryResults) {
-      builder.add(new SimpleCursor(queryResult));
-    }
-    return builder.build();
-  }
-
-  public static List<CursorWithError> fromQueryResponsesToCursorList(List<Query.ResultWithError> resultWithErrorList) {
+  public static List<CursorWithError> fromQueryResponsesToCursorList(
+      List<Query.ResultWithError> resultWithErrorList) {
     ImmutableList.Builder<CursorWithError> builder = new ImmutableList.Builder<CursorWithError>();
     for (Query.ResultWithError resultWithError : resultWithErrorList) {
       builder.add(new CursorWithError(resultWithError));
@@ -263,26 +221,11 @@ public class Proto {
     return builder.build();
   }
 
-  public static final Function<byte[], ByteString> BYTE_ARRAY_TO_BYTE_STRING =
-      new Function<byte[], ByteString>() {
-        @Override
-        public ByteString apply(byte[] from) {
-          return ByteString.copyFrom(from);
-        }
-      };
-
-  public static final Function<Map.Entry<byte[], ?>, EntityId> MAP_ENTRY_TO_ENTITY_KEYSPACE_ID =
-      new Function<Map.Entry<byte[], ?>, EntityId>() {
-        @Override
-        public EntityId apply(Map.Entry<byte[], ?> entry) {
-          return buildEntityId(entry.getKey(), entry.getValue());
-        }
-      };
-
   /**
    * Represents a type and value in the type system used in query.proto.
    */
   protected static class TypedValue {
+
     Query.Type type;
     ByteString value;
 
@@ -302,6 +245,9 @@ public class Proto {
           || value instanceof Byte) {
         // Int32, Int64, Short, Byte
         this.type = Query.Type.INT64;
+        this.value = ByteString.copyFromUtf8(value.toString());
+      } else if (value instanceof BigInteger) {
+        this.type = Query.Type.VARCHAR;
         this.value = ByteString.copyFromUtf8(value.toString());
       } else if (value instanceof UnsignedLong) {
         // Uint64

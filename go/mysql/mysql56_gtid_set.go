@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,10 +19,12 @@ package mysql
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 type interval struct {
@@ -48,10 +50,10 @@ func parseInterval(s string) (interval, error) {
 	parts := strings.Split(s, "-")
 	start, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		return interval{}, fmt.Errorf("invalid interval (%q): %v", s, err)
+		return interval{}, vterrors.Wrapf(err, "invalid interval (%q)", s)
 	}
 	if start < 1 {
-		return interval{}, fmt.Errorf("invalid interval (%q): start must be > 0", s)
+		return interval{}, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid interval (%q): start must be > 0", s)
 	}
 
 	switch len(parts) {
@@ -60,11 +62,11 @@ func parseInterval(s string) (interval, error) {
 	case 2:
 		end, err := strconv.ParseInt(parts[1], 10, 64)
 		if err != nil {
-			return interval{}, fmt.Errorf("invalid interval (%q): %v", s, err)
+			return interval{}, vterrors.Wrapf(err, "invalid interval (%q)", s)
 		}
 		return interval{start: start, end: end}, nil
 	default:
-		return interval{}, fmt.Errorf("invalid interval (%q): expected start-end or single number", s)
+		return interval{}, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid interval (%q): expected start-end or single number", s)
 	}
 }
 
@@ -84,13 +86,13 @@ func parseMysql56GTIDSet(s string) (GTIDSet, error) {
 		// uuid_set: uuid:interval[:interval]...
 		parts := strings.Split(uuidSet, ":")
 		if len(parts) < 2 {
-			return nil, fmt.Errorf("invalid MySQL 5.6 GTID set (%q): expected uuid:interval", s)
+			return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid MySQL 5.6 GTID set (%q): expected uuid:interval", s)
 		}
 
 		// Parse Server ID.
 		sid, err := ParseSID(parts[0])
 		if err != nil {
-			return nil, fmt.Errorf("invalid MySQL 5.6 GTID set (%q): %v", s, err)
+			return nil, vterrors.Wrapf(err, "invalid MySQL 5.6 GTID set (%q)", s)
 		}
 
 		// Parse Intervals.
@@ -98,7 +100,7 @@ func parseMysql56GTIDSet(s string) (GTIDSet, error) {
 		for _, part := range parts[1:] {
 			iv, err := parseInterval(part)
 			if err != nil {
-				return nil, fmt.Errorf("invalid MySQL 5.6 GTID set (%q): %v", s, err)
+				return nil, vterrors.Wrapf(err, "invalid MySQL 5.6 GTID set (%q)", s)
 			}
 			if iv.end < iv.start {
 				// According to MySQL 5.6 code:
@@ -169,8 +171,28 @@ func (set Mysql56GTIDSet) String() string {
 	return buf.String()
 }
 
+// Last returns the last gtid as string
+// For gtidset having multiple SIDs or multiple intervals
+// it just returns the last SID with last interval
+func (set Mysql56GTIDSet) Last() string {
+	buf := &bytes.Buffer{}
+
+	if len(set.SIDs()) > 0 {
+		sid := set.SIDs()[len(set.SIDs())-1]
+		buf.WriteString(sid.String())
+		sequences := set[sid]
+		if len(sequences) > 0 {
+			buf.WriteByte(':')
+			lastInterval := sequences[len(sequences)-1]
+			buf.WriteString(strconv.FormatInt(lastInterval.end, 10))
+		}
+	}
+
+	return buf.String()
+}
+
 // Flavor implements GTIDSet.
-func (Mysql56GTIDSet) Flavor() string { return mysql56FlavorID }
+func (Mysql56GTIDSet) Flavor() string { return Mysql56FlavorID }
 
 // ContainsGTID implements GTIDSet.
 func (set Mysql56GTIDSet) ContainsGTID(gtid GTID) bool {
@@ -195,6 +217,10 @@ func (set Mysql56GTIDSet) ContainsGTID(gtid GTID) bool {
 
 // Contains implements GTIDSet.
 func (set Mysql56GTIDSet) Contains(other GTIDSet) bool {
+	if other == nil {
+		return false
+	}
+
 	other56, ok := other.(Mysql56GTIDSet)
 	if !ok {
 		return false
@@ -332,6 +358,75 @@ func (set Mysql56GTIDSet) AddGTID(gtid GTID) GTIDSet {
 	return newSet
 }
 
+// Union implements GTIDSet.Union().
+func (set Mysql56GTIDSet) Union(other GTIDSet) GTIDSet {
+	if set == nil && other != nil {
+		return other
+	}
+	if set == nil || other == nil {
+		return set
+	}
+	mydbOther, ok := other.(Mysql56GTIDSet)
+	if !ok {
+		return set
+	}
+
+	// Make a copy and add the new GTID in the proper place.
+	// This function is not supposed to modify the original set.
+	newSet := make(Mysql56GTIDSet)
+
+	for otherSID, otherIntervals := range mydbOther {
+		intervals, ok := set[otherSID]
+		if !ok {
+			// No matching server id, so we must add it from other set.
+			newSet[otherSID] = otherIntervals
+			continue
+		}
+
+		// Found server id match between sets, so now we need to add each interval.
+		s1 := intervals
+		s2 := otherIntervals
+		var nextInterval interval
+		var newIntervals []interval
+
+		// While our stacks have intervals to process, do work.
+		for popInterval(&nextInterval, &s1, &s2) {
+			if len(newIntervals) == 0 {
+				newIntervals = append(newIntervals, nextInterval)
+				continue
+			}
+
+			activeInterval := &newIntervals[len(newIntervals)-1]
+
+			if nextInterval.end <= activeInterval.end {
+				// We hit an interval whose start was after or equal to the previous interval's start, but whose
+				// end is prior to the active intervals end. Skip to next interval.
+				continue
+			}
+
+			if nextInterval.start > activeInterval.end+1 {
+				// We found a gap, so we need to start a new interval.
+				newIntervals = append(newIntervals, nextInterval)
+				continue
+			}
+
+			// Extend our active interval.
+			activeInterval.end = nextInterval.end
+		}
+
+		newSet[otherSID] = newIntervals
+	}
+
+	// Add any intervals from SIDs that exist in caller set, but don't exist in other set.
+	for sid, intervals := range set {
+		if _, ok := newSet[sid]; !ok {
+			newSet[sid] = intervals
+		}
+	}
+
+	return newSet
+}
+
 // SIDBlock returns the binary encoding of a MySQL 5.6 GTID set as expected
 // by internal commands that refer to an "SID block".
 //
@@ -360,6 +455,130 @@ func (set Mysql56GTIDSet) SIDBlock() []byte {
 	return buf.Bytes()
 }
 
+// Difference will supply the difference between the receiver and supplied Mysql56GTIDSets, and supply the result
+// as a Mysql56GTIDSet.
+func (set Mysql56GTIDSet) Difference(other Mysql56GTIDSet) Mysql56GTIDSet {
+	if other == nil || set == nil {
+		return set
+	}
+
+	// Make a fresh, empty set to hold the new value.
+	// This function is not supposed to modify the original set.
+	differenceSet := make(Mysql56GTIDSet)
+
+	for sid, intervals := range set {
+		otherIntervals, ok := other[sid]
+		if !ok {
+			// We didn't find SID in other set, so diff should include all intervals for sid unique to receiver.
+			differenceSet[sid] = intervals
+			continue
+		}
+
+		// Found server id match between sets, so now we need to subtract each interval.
+		var diffIntervals []interval
+		advance := func() bool {
+			if len(intervals) == 0 {
+				return false
+			}
+			diffIntervals = append(diffIntervals, intervals[0])
+			intervals = intervals[1:]
+			return true
+		}
+
+		var otherInterval interval
+		advanceOther := func() bool {
+			if len(otherIntervals) == 0 {
+				return false
+			}
+			otherInterval = otherIntervals[0]
+			otherIntervals = otherIntervals[1:]
+			return true
+		}
+
+		if !advance() {
+			continue
+		}
+		if !advanceOther() {
+			differenceSet[sid] = intervals
+			continue
+		}
+
+	diffLoop:
+		for {
+			iv := diffIntervals[len(diffIntervals)-1]
+
+			switch {
+			case iv.end < otherInterval.start:
+				// [1, 2] - [3, 5]
+				// Need to skip to next s1 interval. This one is completely before otherInterval even starts. It's a diff in whole.
+				if !advance() {
+					break diffLoop
+				}
+
+			case iv.start > otherInterval.end:
+				// [3, 5] - [1, 2]
+				// Interval is completely past other interval. We need a valid other to compare against.
+				if !advanceOther() {
+					break diffLoop
+				}
+
+			case iv.start >= otherInterval.start && iv.end <= otherInterval.end:
+				// [3, 4] - [1, 5]
+				// Interval is completed contained. Pop off diffIntervals, and advance to next s1.
+				diffIntervals = diffIntervals[:len(diffIntervals)-1]
+				if !advance() {
+					break diffLoop
+				}
+
+			case iv.start < otherInterval.start && iv.end >= otherInterval.start && iv.end <= otherInterval.end:
+				// [1, 4] - [3, 5]
+				// We have a unique interval prior to where otherInterval starts and should adjust end to match this piece.
+				diffIntervals[len(diffIntervals)-1].end = otherInterval.start - 1
+
+				if !advance() {
+					break diffLoop
+				}
+
+			case iv.start >= otherInterval.start && iv.start <= otherInterval.end && iv.end > otherInterval.end:
+				// [3, 7] - [1, 5]
+				// We have an end piece to deal with.
+				diffIntervals[len(diffIntervals)-1].start = otherInterval.end + 1
+
+				// We need to pop s2 at this point. s1's new interval is fully past otherInterval, so no point in comparing
+				// this one next round.
+				if !advanceOther() {
+					break diffLoop
+				}
+
+			case iv.start < otherInterval.start && iv.end > otherInterval.end:
+				// [1, 7] - [3, 4]
+				// End is strictly greater. In this case we need to create an extra diff interval. We'll deal with any necessary trimming of it next round.
+				diffIntervals[len(diffIntervals)-1].end = otherInterval.start - 1
+				diffIntervals = append(diffIntervals, interval{start: otherInterval.end + 1, end: iv.end})
+
+				// We need to pop s2 at this point. s1's new interval is fully past otherInterval, so no point in comparing
+				// this one next round.
+				if !advanceOther() {
+					break diffLoop
+				}
+
+			default:
+				panic("This should never happen.")
+			}
+		}
+
+		if len(intervals) != 0 {
+			// If we've gotten to this point, then we have intervals that exist beyond the bounds of any intervals in otherIntervals, and they
+			// are all diffs and should be added in whole.
+			diffIntervals = append(diffIntervals, intervals...)
+		}
+
+		differenceSet[sid] = diffIntervals
+	}
+
+	return differenceSet
+}
+
 // NewMysql56GTIDSetFromSIDBlock builds a Mysql56GTIDSet from parsing a SID Block.
 // This is the reverse of the SIDBlock method.
 //
@@ -377,24 +596,24 @@ func NewMysql56GTIDSetFromSIDBlock(data []byte) (Mysql56GTIDSet, error) {
 	var set Mysql56GTIDSet = make(map[SID][]interval)
 	var nSIDs uint64
 	if err := binary.Read(buf, binary.LittleEndian, &nSIDs); err != nil {
-		return nil, fmt.Errorf("cannot read nSIDs: %v", err)
+		return nil, vterrors.Wrapf(err, "cannot read nSIDs")
 	}
 	for i := uint64(0); i < nSIDs; i++ {
 		var sid SID
 		if c, err := buf.Read(sid[:]); err != nil || c != 16 {
-			return nil, fmt.Errorf("cannot read SID %v: %v %v", i, err, c)
+			return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "cannot read SID %v: %v %v", i, err, c)
 		}
 		var nIntervals uint64
 		if err := binary.Read(buf, binary.LittleEndian, &nIntervals); err != nil {
-			return nil, fmt.Errorf("cannot read nIntervals %v: %v", i, err)
+			return nil, vterrors.Wrapf(err, "cannot read nIntervals %v", i)
 		}
 		for j := uint64(0); j < nIntervals; j++ {
 			var start, end uint64
 			if err := binary.Read(buf, binary.LittleEndian, &start); err != nil {
-				return nil, fmt.Errorf("cannot read start %v/%v: %v", i, j, err)
+				return nil, vterrors.Wrapf(err, "cannot read start %v/%v", i, j)
 			}
 			if err := binary.Read(buf, binary.LittleEndian, &end); err != nil {
-				return nil, fmt.Errorf("cannot read end %v/%v: %v", i, j, err)
+				return nil, vterrors.Wrapf(err, "cannot read end %v/%v", i, j)
 			}
 			set[sid] = append(set[sid], interval{
 				start: int64(start),
@@ -405,6 +624,28 @@ func NewMysql56GTIDSetFromSIDBlock(data []byte) (Mysql56GTIDSet, error) {
 	return set, nil
 }
 
+// popInterval will look at the two pre-sorted interval stacks supplied, and if at least one of the stacks is non-empty
+// will mutate the destination interval with the next earliest interval based on start sequence.
+// popInterval will return true if we were able to pop, or false if both stacks are now empty.
+func popInterval(dst *interval, s1, s2 *[]interval) bool {
+	if len(*s1) == 0 && len(*s2) == 0 {
+		return false
+	}
+
+	// Find which intervals list has earliest start.
+	if len(*s2) == 0 || (len(*s1) != 0 && (*s1)[0].start <= (*s2)[0].start) {
+		*dst = (*s1)[0]
+		// Progress pointer since this stack has earliest.
+		*s1 = (*s1)[1:]
+	} else {
+		*dst = (*s2)[0]
+		// Progress pointer since this stack has earliest.
+		*s2 = (*s2)[1:]
+	}
+
+	return true
+}
+
 func init() {
-	gtidSetParsers[mysql56FlavorID] = parseMysql56GTIDSet
+	gtidSetParsers[Mysql56FlavorID] = parseMysql56GTIDSet
 }

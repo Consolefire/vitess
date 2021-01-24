@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ limitations under the License.
 // the environment. It also needs to call env.Close before exiting.
 //
 // Note: If you need to plug in any custom initialization/cleanup for
-// a vitess distribution, register them using onInit and onClose. A
+// a vitess distribution, register them using OnInit and onClose. A
 // clean way of achieving that is adding to this package a file with
 // an init() function that registers the hooks.
 package servenv
@@ -32,7 +32,9 @@ import (
 	"flag"
 	"net/url"
 	"os"
+	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,13 +42,13 @@ import (
 	// register the HTTP handlers for profiling
 	_ "net/http/pprof"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/event"
-	"github.com/youtube/vitess/go/netutil"
-	"github.com/youtube/vitess/go/stats"
+	"vitess.io/vitess/go/event"
+	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/log"
 
 	// register the proper init and shutdown hooks for logging
-	_ "github.com/youtube/vitess/go/vt/logutil"
+	_ "vitess.io/vitess/go/vt/logutil"
 )
 
 var (
@@ -54,9 +56,11 @@ var (
 	Port *int
 
 	// Flags to alter the behavior of the library.
-	lameduckPeriod = flag.Duration("lameduck-period", 50*time.Millisecond, "keep running at least this long after SIGTERM before stopping")
-	onTermTimeout  = flag.Duration("onterm_timeout", 10*time.Second, "wait no more than this for OnTermSync handlers before stopping")
-	memProfileRate = flag.Int("mem-profile-rate", 512*1024, "profile every n bytes allocated")
+	lameduckPeriod       = flag.Duration("lameduck-period", 50*time.Millisecond, "keep running at least this long after SIGTERM before stopping")
+	onTermTimeout        = flag.Duration("onterm_timeout", 10*time.Second, "wait no more than this for OnTermSync handlers before stopping")
+	memProfileRate       = flag.Int("mem-profile-rate", 512*1024, "profile every n bytes allocated")
+	mutexProfileFraction = flag.Int("mutex-profile-fraction", 0, "profile every n mutex contention events (see runtime.SetMutexProfileFraction)")
+	catchSigpipe         = flag.Bool("catch-sigpipe", false, "catch and ignore SIGPIPE on stdout and stderr if specified")
 
 	// mutex used to protect the Init function
 	mu sync.Mutex
@@ -75,6 +79,22 @@ var (
 func Init() {
 	mu.Lock()
 	defer mu.Unlock()
+
+	// Ignore SIGPIPE if specified
+	// The Go runtime catches SIGPIPE for us on all fds except stdout/stderr
+	// See https://golang.org/pkg/os/signal/#hdr-SIGPIPE
+	if *catchSigpipe {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGPIPE)
+		go func() {
+			<-sigChan
+			log.Warning("Caught SIGPIPE (ignoring all future SIGPIPEs)")
+			signal.Ignore(syscall.SIGPIPE)
+		}()
+	}
+
+	// Add version tag to every info log
+	log.Infof(AppVersion.String())
 	if inited {
 		log.Fatal("servenv.Init called second time")
 	}
@@ -83,10 +103,15 @@ func Init() {
 	// Once you run as root, you pretty much destroy the chances of a
 	// non-privileged user starting the program correctly.
 	if uid := os.Getuid(); uid == 0 {
-		log.Fatalf("servenv.Init: running this as root makes no sense")
+		log.Exitf("servenv.Init: running this as root makes no sense")
 	}
 
 	runtime.MemProfileRate = *memProfileRate
+
+	if *mutexProfileFraction != 0 {
+		log.Infof("setting mutex profile fraction to %v", *mutexProfileFraction)
+		runtime.SetMutexProfileFraction(*mutexProfileFraction)
+	}
 
 	// We used to set this limit directly, but you pretty much have to
 	// use a root account to allow increasing a limit reliably. Dropping
@@ -97,30 +122,30 @@ func Init() {
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, fdLimit); err != nil {
 		log.Errorf("max-open-fds failed: %v", err)
 	}
-	fdl := stats.NewInt("MaxFds")
+	fdl := stats.NewGauge("MaxFds", "File descriptor limit")
 	fdl.Set(int64(fdLimit.Cur))
 
 	onInitHooks.Fire()
 }
 
-func populateListeningURL() {
+func populateListeningURL(port int32) {
 	host, err := netutil.FullyQualifiedHostname()
 	if err != nil {
 		host, err = os.Hostname()
 		if err != nil {
-			log.Fatalf("os.Hostname() failed: %v", err)
+			log.Exitf("os.Hostname() failed: %v", err)
 		}
 	}
 	ListeningURL = url.URL{
 		Scheme: "http",
-		Host:   netutil.JoinHostPort(host, int32(*Port)),
+		Host:   netutil.JoinHostPort(host, port),
 		Path:   "/",
 	}
 }
 
-// onInit registers f to be run at the beginning of the app
+// OnInit registers f to be run at the beginning of the app
 // lifecycle. It should be called in an init() function.
-func onInit(f func()) {
+func OnInit(f func()) {
 	onInitHooks.Add(f)
 }
 
@@ -148,6 +173,7 @@ func OnTermSync(f func()) {
 
 // fireOnTermSyncHooks returns true iff all the hooks finish before the timeout.
 func fireOnTermSyncHooks(timeout time.Duration) bool {
+	defer log.Flush()
 	log.Infof("Firing synchronous OnTermSync hooks and waiting up to %v for them", timeout)
 
 	timer := time.NewTimer(timeout)
@@ -192,4 +218,38 @@ func RegisterDefaultFlags() {
 // RunDefault calls Run() with the parameters from the flags.
 func RunDefault() {
 	Run(*Port)
+}
+
+// ParseFlags initializes flags and handles the common case when no positional
+// arguments are expected.
+func ParseFlags(cmd string) {
+	flag.Parse()
+
+	if *Version {
+		AppVersion.Print()
+		os.Exit(0)
+	}
+
+	args := flag.Args()
+	if len(args) > 0 {
+		flag.Usage()
+		log.Exitf("%s doesn't take any positional arguments, got '%s'", cmd, strings.Join(args, " "))
+	}
+}
+
+// ParseFlagsWithArgs initializes flags and returns the positional arguments
+func ParseFlagsWithArgs(cmd string) []string {
+	flag.Parse()
+
+	if *Version {
+		AppVersion.Print()
+		os.Exit(0)
+	}
+
+	args := flag.Args()
+	if len(args) == 0 {
+		log.Exitf("%s expected at least one positional argument", cmd)
+	}
+
+	return args
 }

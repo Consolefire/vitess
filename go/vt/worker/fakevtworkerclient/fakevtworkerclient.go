@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,13 +18,11 @@ limitations under the License.
 package fakevtworkerclient
 
 import (
-	"time"
+	"context"
 
-	"golang.org/x/net/context"
-
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/vtctl/fakevtctlclient"
-	"github.com/youtube/vitess/go/vt/worker/vtworkerclient"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/vtctl/fakevtctlclient"
+	"vitess.io/vitess/go/vt/worker/vtworkerclient"
 )
 
 // FakeVtworkerClient is a fake which implements the vtworkerclient interface.
@@ -41,7 +39,7 @@ func NewFakeVtworkerClient() *FakeVtworkerClient {
 
 // FakeVtworkerClientFactory returns the current instance and stores the
 // dialed server address in an outer struct.
-func (f *FakeVtworkerClient) FakeVtworkerClientFactory(addr string, dialTimeout time.Duration) (vtworkerclient.Client, error) {
+func (f *FakeVtworkerClient) FakeVtworkerClientFactory(addr string) (vtworkerclient.Client, error) {
 	return &perAddrFakeVtworkerClient{f, addr}, nil
 }
 

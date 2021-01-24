@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -20,6 +20,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 const (
@@ -48,7 +51,7 @@ type Position struct {
 	// a problem until the runtime panic. Note that this must not be
 	// the last field of the struct, or else the Go compiler will add
 	// padding to prevent pointers to this field from becoming invalid.
-	_ [0]struct{ notComparable []byte }
+	_ [0]struct{ _ []byte }
 
 	// GTIDSet is the underlying GTID set. It must not be anonymous,
 	// or else Position would itself also implement the GTIDSet interface.
@@ -137,7 +140,7 @@ func DecodePosition(s string) (rp Position, err error) {
 func ParsePosition(flavor, value string) (rp Position, err error) {
 	parser := gtidSetParsers[flavor]
 	if parser == nil {
-		return rp, fmt.Errorf("parse error: unknown GTIDSet flavor %#v", flavor)
+		return rp, vterrors.Errorf(vtrpc.Code_INTERNAL, "parse error: unknown GTIDSet flavor %#v", flavor)
 	}
 	gtidSet, err := parser(value)
 	if err != nil {
@@ -165,4 +168,41 @@ func (rp *Position) UnmarshalJSON(buf []byte) error {
 		return err
 	}
 	return nil
+}
+
+// MatchesFlavor will take a flavor string, and return whether the positions GTIDSet matches the supplied flavor.
+// The caller should use the constants Mysql56FlavorID, MariadbFlavorID, or FilePosFlavorID when supplying the flavor string.
+func (rp *Position) MatchesFlavor(flavor string) bool {
+	switch flavor {
+	case Mysql56FlavorID:
+		_, matches := rp.GTIDSet.(Mysql56GTIDSet)
+		return matches
+	case MariadbFlavorID:
+		_, matches := rp.GTIDSet.(MariadbGTIDSet)
+		return matches
+	case FilePosFlavorID:
+		_, matches := rp.GTIDSet.(filePosGTID)
+		return matches
+	}
+	return false
+}
+
+// Comparable returns whether the receiver is comparable to the supplied position, based on whether one
+// of the two positions contains the other.
+func (rp *Position) Comparable(other Position) bool {
+	return rp.GTIDSet.Contains(other.GTIDSet) || other.GTIDSet.Contains(rp.GTIDSet)
+}
+
+// AllPositionsComparable returns true if all positions in the supplied list are comparable with one another, and false
+// if any are non-comparable.
+func AllPositionsComparable(positions []Position) bool {
+	for i := 0; i < len(positions); i++ {
+		for j := i + 1; j < len(positions); j++ {
+			if !positions[i].Comparable(positions[j]) {
+				return false
+			}
+		}
+	}
+
+	return true
 }

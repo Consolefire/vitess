@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,27 +26,26 @@ package vtworkerclienttest
 // (e.g.  zookeeper) won't be drawn into production binaries as well.
 
 import (
-	"fmt"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/vterrors"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/worker"
-	"github.com/youtube/vitess/go/vt/worker/vtworkerclient"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/worker"
+	"vitess.io/vitess/go/vt/worker/vtworkerclient"
 
 	// Import the gRPC client implementation for tablet manager because the real
 	// vtworker implementation requires it.
-	_ "github.com/youtube/vitess/go/vt/vttablet/grpctmclient"
+	_ "vitess.io/vitess/go/vt/vttablet/grpctmclient"
 
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 func init() {
@@ -88,7 +87,7 @@ func commandSucceeds(t *testing.T, client vtworkerclient.Client) {
 	if logutil.EventString(got) != expected {
 		t.Errorf("Got unexpected log line '%v' expected '%v'", got.String(), expected)
 	}
-	got, err = stream.Recv()
+	_, err = stream.Recv()
 	if err != io.EOF {
 		t.Fatalf("Didn't get EOF as expected: %v", err)
 	}
@@ -102,7 +101,7 @@ func commandSucceeds(t *testing.T, client vtworkerclient.Client) {
 func runVtworkerCommand(client vtworkerclient.Client, args []string) error {
 	stream, err := client.ExecuteVtworkerCommand(context.Background(), args)
 	if err != nil {
-		return fmt.Errorf("cannot execute remote command: %v", err)
+		return vterrors.Wrap(err, "cannot execute remote command")
 	}
 
 	for {
@@ -130,10 +129,17 @@ func commandErrorsBecauseBusy(t *testing.T, client vtworkerclient.Client, server
 	blockCommandStarted := make(chan struct{})
 	var errorCodeCheck error
 	wg.Add(1)
+	errChan := make(chan error, 1)
+	defer close(errChan)
 	go func() {
+		defer wg.Done()
 		stream, err := client.ExecuteVtworkerCommand(ctx, []string{"Block"})
 		if err != nil {
-			t.Fatalf("Block command should not have failed: %v", err)
+			errChan <- err
+			close(blockCommandStarted)
+			return
+		} else {
+			errChan <- nil
 		}
 
 		firstLineReceived := false
@@ -142,7 +148,7 @@ func commandErrorsBecauseBusy(t *testing.T, client vtworkerclient.Client, server
 				// We see CANCELED from the RPC client (client side cancelation) or
 				// from vtworker itself (server side cancelation).
 				if vterrors.Code(err) != vtrpcpb.Code_CANCELED {
-					errorCodeCheck = fmt.Errorf("Block command should only error due to canceled context: %v", err)
+					errorCodeCheck = vterrors.Wrap(err, "Block command should only error due to canceled context")
 				}
 				// Stream has finished.
 				break
@@ -155,7 +161,6 @@ func commandErrorsBecauseBusy(t *testing.T, client vtworkerclient.Client, server
 				close(blockCommandStarted)
 			}
 		}
-		wg.Done()
 	}()
 
 	// Try to run a second, concurrent vtworker command.
@@ -178,6 +183,9 @@ func commandErrorsBecauseBusy(t *testing.T, client vtworkerclient.Client, server
 	cancel()
 
 	wg.Wait()
+	if err := <-errChan; err != nil {
+		t.Fatalf("Block command should not have failed: %v", err)
+	}
 	if errorCodeCheck != nil {
 		t.Fatalf("Block command did not return the CANCELED error code: %v", errorCodeCheck)
 	}
@@ -227,11 +235,11 @@ func resetVtworker(t *testing.T, client vtworkerclient.Client) error {
 		}
 
 		if time.Since(start) > 5*time.Second {
-			return fmt.Errorf("Reset was not successful after 5s and %d attempts: %v", attempts, err)
+			return vterrors.Wrapf(err, "Reset was not successful after 5s and %d attempts", attempts)
 		}
 
 		if !strings.Contains(err.Error(), "worker still executing") {
-			return fmt.Errorf("Reset must not fail: %v", err)
+			return vterrors.Wrap(err, "Reset must not fail")
 		}
 
 		t.Logf("retrying to Reset vtworker because the previous command has not finished yet. got err: %v", err)

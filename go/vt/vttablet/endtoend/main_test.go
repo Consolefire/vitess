@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,12 +24,14 @@ import (
 	"os"
 	"testing"
 
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/vt/tableacl"
-	"github.com/youtube/vitess/go/vt/tableacl/simpleacl"
-	"github.com/youtube/vitess/go/vt/vttablet/endtoend/framework"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
-	"github.com/youtube/vitess/go/vt/vttest"
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/vt/tableacl"
+	"vitess.io/vitess/go/vt/tableacl/simpleacl"
+	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttest"
+
+	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
 )
 
 var (
@@ -42,25 +44,42 @@ func TestMain(m *testing.M) {
 	tabletenv.Init()
 
 	exitCode := func() int {
-		hdl, err := vttest.LaunchVitess(vttest.MySQLOnly("vttest"), vttest.Schema(testSchema), vttest.Verbose(testing.Verbose()))
-		if err != nil {
+		// Launch MySQL.
+		// We need a Keyspace in the topology, so the DbName is set.
+		// We need a Shard too, so the database 'vttest' is created.
+		cfg := vttest.Config{
+			Topology: &vttestpb.VTTestTopology{
+				Keyspaces: []*vttestpb.Keyspace{
+					{
+						Name: "vttest",
+						Shards: []*vttestpb.Shard{
+							{
+								Name:           "0",
+								DbNameOverride: "vttest",
+							},
+						},
+					},
+				},
+			},
+			OnlyMySQL: true,
+		}
+		if err := cfg.InitSchemas("vttest", testSchema, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "InitSchemas failed: %v\n", err)
+			return 1
+		}
+		defer os.RemoveAll(cfg.SchemaDir)
+		cluster := vttest.LocalCluster{
+			Config: cfg,
+		}
+		if err := cluster.Setup(); err != nil {
 			fmt.Fprintf(os.Stderr, "could not launch mysql: %v\n", err)
 			return 1
 		}
-		defer hdl.TearDown()
-		connParams, err = hdl.MySQLConnParams()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "could not fetch mysql params: %v\n", err)
-			return 1
-		}
+		defer cluster.TearDown()
 
-		connAppDebugParams, err = hdl.MySQLAppDebugConnParams()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "could not fetch mysql appdebug params: %v\n", err)
-			return 1
-		}
-
-		err = framework.StartServer(connParams, connAppDebugParams)
+		connParams = cluster.MySQLConnParams()
+		connAppDebugParams = cluster.MySQLAppDebugConnParams()
+		err := framework.StartServer(connParams, connAppDebugParams, cluster.DbName())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v", err)
 			return 1
@@ -98,7 +117,7 @@ func initTableACL() error {
 	return nil
 }
 
-var testSchema = `create table vitess_test(intval int default 0, floatval float default null, charval varchar(256) default null, binval varbinary(256) default null, primary key(intval));
+var testSchema = `create table vitess_test(intval int default 0, floatval float default null, charval varchar(10) default null, binval varbinary(256) default null, primary key(intval));
 create table vitess_test_debuguser(intval int default 0, floatval float default null, charval varchar(256) default null, binval varbinary(256) default null, primary key(intval));
 grant select, show databases, process on *.* to 'vt_appdebug'@'localhost';
 revoke select on *.* from 'vt_appdebug'@'localhost';
@@ -197,6 +216,13 @@ var tableACLConfig = `{
       "admins": ["dev"]
     },
     {
+      "name": "vitess_test_ddl",
+      "table_names_or_prefixes": ["vitess_test_ddl"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
       "name": "vitess_seq",
       "table_names_or_prefixes": ["vitess_seq"],
       "readers": ["dev"],
@@ -206,27 +232,6 @@ var tableACLConfig = `{
     {
       "name": "vitess_reset_seq",
       "table_names_or_prefixes": ["vitess_reset_seq"],
-      "readers": ["dev"],
-      "writers": ["dev"],
-      "admins": ["dev"]
-    },
-    {
-      "name": "vitess_message",
-      "table_names_or_prefixes": ["vitess_message"],
-      "readers": ["dev"],
-      "writers": ["dev"],
-      "admins": ["dev"]
-    },
-    {
-      "name": "vitess_message3",
-      "table_names_or_prefixes": ["vitess_message3"],
-      "readers": ["dev"],
-      "writers": ["dev"],
-      "admins": ["dev"]
-    },
-    {
-      "name": "vitess_message_auto",
-      "table_names_or_prefixes": ["vitess_message_auto"],
       "readers": ["dev"],
       "writers": ["dev"],
       "admins": ["dev"]
@@ -270,6 +275,27 @@ var tableACLConfig = `{
       "table_names_or_prefixes": ["vitess_test_debuguser"],
       "readers": ["dev", "vt_appdebug"],
       "writers": ["dev", "vt_appdebug"]
+    },
+    {
+      "name": "version",
+      "table_names_or_prefixes": ["vitess_version"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "schema_version",
+      "table_names_or_prefixes": ["schema_version"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
+    },
+    {
+      "name": "historian_test1",
+      "table_names_or_prefixes": ["historian_test1"],
+      "readers": ["dev"],
+      "writers": ["dev"],
+      "admins": ["dev"]
     }
   ]
 }`

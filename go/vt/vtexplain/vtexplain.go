@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,19 +21,36 @@ package vtexplain
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/jsonutil"
+	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/engine"
 
-	"github.com/youtube/vitess/go/jsonutil"
-	"github.com/youtube/vitess/go/sync2"
-	"github.com/youtube/vitess/go/vt/sqlparser"
-	"github.com/youtube/vitess/go/vt/vtgate/engine"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+)
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+var (
+	batchInterval = flag.Duration("batch-interval", 10*time.Millisecond, "Interval between logical time slots.")
+)
+
+// ExecutorMode controls the mode of operation for the vtexplain simulator
+type ExecutorMode string
+
+const (
+	vtexplainCell = "explainCell"
+
+	// ModeMulti is the default mode with autocommit implemented at vtgate
+	ModeMulti = "multi"
+
+	// ModeTwoPC enables the twopc feature
+	ModeTwoPC = "twopc"
 )
 
 // Options to control the explain process
@@ -47,6 +64,17 @@ type Options struct {
 
 	// Normalize controls whether or not vtgate does query normalization
 	Normalize bool
+
+	// ExecutionMode must be set to one of the modes above
+	ExecutionMode string
+
+	// StrictDDL is used in unit tests only to verify that the schema
+	// is parsed properly.
+	StrictDDL bool
+
+	// Target is used to override the "database" target in the
+	// vtgate session to simulate `USE <target>`
+	Target string
 }
 
 // TabletQuery defines a query that was sent to a given tablet and how it was
@@ -77,7 +105,7 @@ func (tq *TabletQuery) MarshalJSON() ([]byte, error) {
 	// Convert Bindvars to strings for nicer output
 	bindVars := make(map[string]string)
 	for k, v := range tq.BindVars {
-		var b bytes.Buffer
+		var b strings.Builder
 		sqlparser.EncodeValue(&b, v)
 		bindVars[k] = b.String()
 	}
@@ -115,18 +143,14 @@ type Explain struct {
 	TabletActions map[string]*TabletActions
 }
 
-const (
-	vtexplainCell = "explainCell"
-)
-
 // Init sets up the fake execution environment
-func Init(vSchemaStr, sqlSchema string, opts *Options) error {
+func Init(vSchemaStr, sqlSchema, ksShardMapStr string, opts *Options) error {
 	// Verify options
 	if opts.ReplicationMode != "ROW" && opts.ReplicationMode != "STATEMENT" {
 		return fmt.Errorf("invalid replication mode \"%s\"", opts.ReplicationMode)
 	}
 
-	parsedDDLs, err := parseSchema(sqlSchema)
+	parsedDDLs, err := parseSchema(sqlSchema, opts)
 	if err != nil {
 		return fmt.Errorf("parseSchema: %v", err)
 	}
@@ -136,7 +160,7 @@ func Init(vSchemaStr, sqlSchema string, opts *Options) error {
 		return fmt.Errorf("initTabletEnvironment: %v", err)
 	}
 
-	err = initVtgateExecutor(vSchemaStr, opts)
+	err = initVtgateExecutor(vSchemaStr, ksShardMapStr, opts)
 	if err != nil {
 		return fmt.Errorf("initVtgateExecutor: %v", err)
 	}
@@ -144,8 +168,21 @@ func Init(vSchemaStr, sqlSchema string, opts *Options) error {
 	return nil
 }
 
-func parseSchema(sqlSchema string) ([]*sqlparser.DDL, error) {
-	parsedDDLs := make([]*sqlparser.DDL, 0, 16)
+// Stop and cleans up fake execution environment
+func Stop() {
+	// Cleanup all created fake dbs.
+	if explainTopo != nil {
+		for _, conn := range explainTopo.TabletConns {
+			conn.tsv.StopService()
+		}
+		for _, conn := range explainTopo.TabletConns {
+			conn.db.Close()
+		}
+	}
+}
+
+func parseSchema(sqlSchema string, opts *Options) ([]sqlparser.DDLStatement, error) {
+	parsedDDLs := make([]sqlparser.DDLStatement, 0, 16)
 	for {
 		sql, rem, err := sqlparser.SplitStatement(sqlSchema)
 		sqlSchema = rem
@@ -155,28 +192,34 @@ func parseSchema(sqlSchema string) ([]*sqlparser.DDL, error) {
 		if sql == "" {
 			break
 		}
-		s := sqlparser.StripLeadingComments(sql)
-		s, _ = sqlparser.SplitTrailingComments(sql)
-		s = strings.TrimSpace(s)
-		if s == "" {
+		sql, _ = sqlparser.SplitMarginComments(sql)
+		if sql == "" {
 			continue
 		}
 
-		stmt, err := sqlparser.Parse(sql)
-		if err != nil {
-			log.Errorf("ERROR: failed to parse sql: %s, got error: %v", sql, err)
-			continue
+		var stmt sqlparser.Statement
+		if opts.StrictDDL {
+			stmt, err = sqlparser.ParseStrictDDL(sql)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			stmt, err = sqlparser.Parse(sql)
+			if err != nil {
+				log.Errorf("ERROR: failed to parse sql: %s, got error: %v", sql, err)
+				continue
+			}
 		}
-		ddl, ok := stmt.(*sqlparser.DDL)
+		ddl, ok := stmt.(sqlparser.DDLStatement)
 		if !ok {
 			log.Infof("ignoring non-DDL statement: %s", sql)
 			continue
 		}
-		if ddl.Action != sqlparser.CreateStr {
-			log.Infof("ignoring %s table statement", ddl.Action)
+		if ddl.GetAction() != sqlparser.CreateDDLAction {
+			log.Infof("ignoring %s table statement", ddl.GetAction().ToString())
 			continue
 		}
-		if ddl.TableSpec == nil {
+		if ddl.GetTableSpec() == nil && ddl.GetOptLike() == nil {
 			log.Errorf("invalid create table statement: %s", sql)
 			continue
 		}
@@ -211,8 +254,11 @@ func Run(sql string) ([]*Explain, error) {
 		}
 
 		if sql != "" {
-			// Reset the global time simulator for each query
-			batchTime = sync2.NewBatcher(time.Duration(10 * time.Millisecond))
+			// Reset the global time simulator unless there's an open transaction
+			// in the session from the previous staement.
+			if vtgateSession == nil || !vtgateSession.GetInTransaction() {
+				batchTime = sync2.NewBatcher(*batchInterval)
+			}
 			log.V(100).Infof("explain %s", sql)
 			e, err := explain(sql)
 			if err != nil {
@@ -283,7 +329,7 @@ func ExplainsAsText(explains []*Explain) string {
 		fmt.Fprintf(&b, "\n")
 	}
 	fmt.Fprintf(&b, "----------------------------------------------------------------------\n")
-	return string(b.Bytes())
+	return b.String()
 }
 
 // ExplainsAsJSON returns a json representation of the explains

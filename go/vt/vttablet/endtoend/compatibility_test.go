@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,9 +21,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	"github.com/youtube/vitess/go/vt/vttablet/endtoend/framework"
+	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
 )
 
 var point12 = "\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0?\x00\x00\x00\x00\x00\x00\x00@"
@@ -63,7 +63,7 @@ func TestCharaterSet(t *testing.T) {
 				OrgTable:     "vitess_test",
 				Database:     "vttest",
 				OrgName:      "charval",
-				ColumnLength: 768,
+				ColumnLength: 30,
 				Charset:      33,
 			}, {
 				Name:         "binval",
@@ -657,90 +657,6 @@ func TestNull(t *testing.T) {
 	}
 }
 
-func TestTypeLimits(t *testing.T) {
-	client := framework.NewClient()
-	defer func() {
-		for _, cleanup := range []string{
-			"delete from vitess_ints",
-			"delete from vitess_fracts",
-			"delete from vitess_strings",
-		} {
-			_, err := client.Execute(cleanup, nil)
-			if err != nil {
-				t.Error(err)
-			}
-		}
-	}()
-
-	for _, query := range []string{
-		"insert into vitess_ints(tiny, medium) values(1, -129)",
-		"insert into vitess_fracts(id, num) values(1, 1)",
-		"insert into vitess_strings(vb) values('a')",
-	} {
-		_, err := client.Execute(query, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	mismatchCases := []struct {
-		query string
-		bv    map[string]*querypb.BindVariable
-		out   string
-	}{{
-		query: "insert into vitess_ints(tiny) values('str')",
-		bv:    nil,
-		out:   "strconv.ParseInt",
-	}, {
-		query: "insert into vitess_ints(tiny) values(:str)",
-		bv:    map[string]*querypb.BindVariable{"str": sqltypes.StringBindVariable("str")},
-		out:   "strconv.ParseInt",
-	}, {
-		query: "insert into vitess_ints(tiny) values(1.2)",
-		bv:    nil,
-		out:   "unsupported: cannot identify primary key of statement",
-	}, {
-		query: "insert into vitess_ints(tiny) values(:fl)",
-		bv:    map[string]*querypb.BindVariable{"fl": sqltypes.Float64BindVariable(1.2)},
-		out:   "invalid syntax",
-	}, {
-		query: "insert into vitess_strings(vb) select tiny from vitess_ints",
-		bv:    nil,
-		out:   "type mismatch",
-	}, {
-		query: "insert into vitess_ints(tiny) select num from vitess_fracts",
-		bv:    nil,
-		out:   "type mismatch",
-	}, {
-		query: "insert into vitess_ints(tiny) select vb from vitess_strings",
-		bv:    nil,
-		out:   "type mismatch",
-	}}
-	for _, tcase := range mismatchCases {
-		_, err := client.Execute(tcase.query, tcase.bv)
-		if err == nil || !strings.Contains(err.Error(), tcase.out) {
-			t.Errorf("Error(%s): %v, want %s", tcase.query, err, tcase.out)
-		}
-	}
-
-	want := "Out of range"
-	for _, query := range []string{
-		"insert into vitess_ints(tiny) values(-129)",
-		"insert into vitess_ints(tiny) select medium from vitess_ints",
-	} {
-		_, err := client.Execute(query, nil)
-		if err == nil || !strings.HasPrefix(err.Error(), want) {
-			t.Errorf("Error(%s): %v, want %s", query, err, want)
-		}
-	}
-
-	want = "Data too long"
-	_, err := client.Execute("insert into vitess_strings(vb) values('12345678901234567')", nil)
-	if err == nil || !strings.HasPrefix(err.Error(), want) {
-		t.Errorf("Error: %v, want %s", err, want)
-	}
-}
-
 func TestJSONType(t *testing.T) {
 	// JSON is supported only after mysql57.
 	client := framework.NewClient()
@@ -794,7 +710,14 @@ func TestJSONType(t *testing.T) {
 		},
 	}
 	if !reflect.DeepEqual(*qr, want) {
-		t.Errorf("Execute: \n%v, want \n%v", prettyPrint(*qr), prettyPrint(want))
+		// MariaDB 10.3 has different behavior.
+		want2 := want.Copy()
+		want2.Fields[1].Type = sqltypes.Blob
+		want2.Fields[1].Charset = 33
+		want2.Rows[0][1] = sqltypes.TestValue(sqltypes.Blob, "{\"foo\": \"bar\"}")
+		if !reflect.DeepEqual(*qr, *want2) {
+			t.Errorf("Execute:\n%v, want\n%v or\n%v", prettyPrint(*qr), prettyPrint(want), prettyPrint(*want2))
+		}
 	}
 
 }

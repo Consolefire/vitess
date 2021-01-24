@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,16 +21,16 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/dbconnpool"
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/dbconnpool"
+	"vitess.io/vitess/go/vt/log"
 )
 
 // getPoolReconnect gets a connection from a pool, tests it, and reconnects if
-// it gets errno 2006.
+// the connection is lost.
 func getPoolReconnect(ctx context.Context, pool *dbconnpool.ConnectionPool) (*dbconnpool.PooledDBConnection, error) {
 	conn, err := pool.Get(ctx)
 	if err != nil {
@@ -38,13 +38,16 @@ func getPoolReconnect(ctx context.Context, pool *dbconnpool.ConnectionPool) (*db
 	}
 	// Run a test query to see if this connection is still good.
 	if _, err := conn.ExecuteFetch("SELECT 1", 1, false); err != nil {
-		// If we get "MySQL server has gone away (errno 2006)", try to reconnect.
-		if sqlErr, ok := err.(*mysql.SQLError); ok && sqlErr.Number() == 2006 {
-			if err := conn.Reconnect(); err != nil {
+		// If we get a connection error, try to reconnect.
+		if sqlErr, ok := err.(*mysql.SQLError); ok && (sqlErr.Number() == mysql.CRServerGone || sqlErr.Number() == mysql.CRServerLost) {
+			if err := conn.Reconnect(ctx); err != nil {
 				conn.Recycle()
-				return conn, err
+				return nil, err
 			}
+			return conn, nil
 		}
+		conn.Recycle()
+		return nil, err
 	}
 	return conn, nil
 }
@@ -65,11 +68,20 @@ func (mysqld *Mysqld) ExecuteSuperQueryList(ctx context.Context, queryList []str
 	return mysqld.executeSuperQueryListConn(ctx, conn, queryList)
 }
 
+func limitString(s string, limit int) string {
+	if len(s) > limit {
+		return s[:limit]
+	}
+	return s
+}
+
 func (mysqld *Mysqld) executeSuperQueryListConn(ctx context.Context, conn *dbconnpool.PooledDBConnection, queryList []string) error {
+	const LogQueryLengthLimit = 200
 	for _, query := range queryList {
-		log.Infof("exec %v", redactMasterPassword(query))
+		log.Infof("exec %s", limitString(redactPassword(query), LogQueryLengthLimit))
 		if _, err := mysqld.executeFetchContext(ctx, conn, query, 10000, false); err != nil {
-			return fmt.Errorf("ExecuteFetch(%v) failed: %v", redactMasterPassword(query), err.Error())
+			log.Errorf("ExecuteFetch(%v) failed: %v", redactPassword(query), redactPassword(err.Error()))
+			return fmt.Errorf("ExecuteFetch(%v) failed: %v", redactPassword(query), redactPassword(err.Error()))
 		}
 	}
 	return nil
@@ -157,7 +169,7 @@ func (mysqld *Mysqld) killConnection(connID int64) error {
 	// Get another connection with which to kill.
 	// Use background context because the caller's context is likely expired,
 	// which is the reason we're being asked to kill the connection.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if poolConn, connErr := getPoolReconnect(ctx, mysqld.dbaPool); connErr == nil {
 		// We got a pool connection.
@@ -168,10 +180,12 @@ func (mysqld *Mysqld) killConnection(connID int64) error {
 		// It might be because the connection pool is exhausted,
 		// because some connections need to be killed!
 		// Try to open a new connection without the pool.
-		killConn, connErr = mysqld.GetDbaConnection()
+		conn, connErr := mysqld.GetDbaConnection(ctx)
 		if connErr != nil {
 			return connErr
 		}
+		defer conn.Close()
+		killConn = conn
 	}
 
 	_, err := killConn.ExecuteFetch(fmt.Sprintf("kill %d", connID), 10000, false)
@@ -196,17 +210,31 @@ func (mysqld *Mysqld) fetchVariables(ctx context.Context, pattern string) (map[s
 	return varMap, nil
 }
 
-const masterPasswordStart = "  MASTER_PASSWORD = '"
-const masterPasswordEnd = "',\n"
+const (
+	masterPasswordStart = "  MASTER_PASSWORD = '"
+	masterPasswordEnd   = "',\n"
+	passwordStart       = " PASSWORD = '"
+	passwordEnd         = "'"
+)
 
-func redactMasterPassword(input string) string {
+func redactPassword(input string) string {
 	i := strings.Index(input, masterPasswordStart)
+	// We have master password in the query, try to redact it
+	if i != -1 {
+		j := strings.Index(input[i+len(masterPasswordStart):], masterPasswordEnd)
+		if j == -1 {
+			return input
+		}
+		input = input[:i+len(masterPasswordStart)] + strings.Repeat("*", 4) + input[i+len(masterPasswordStart)+j:]
+	}
+	// We also check if we have any password keyword in the query
+	i = strings.Index(input, passwordStart)
 	if i == -1 {
 		return input
 	}
-	j := strings.Index(input[i+len(masterPasswordStart):], masterPasswordEnd)
+	j := strings.Index(input[i+len(passwordStart):], passwordEnd)
 	if j == -1 {
 		return input
 	}
-	return input[:i+len(masterPasswordStart)] + strings.Repeat("*", j) + input[i+len(masterPasswordStart)+j:]
+	return input[:i+len(passwordStart)] + strings.Repeat("*", 4) + input[i+len(passwordStart)+j:]
 }

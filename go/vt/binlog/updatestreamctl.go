@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,19 +20,19 @@ import (
 	"fmt"
 	"sync"
 
-	log "github.com/golang/glog"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/stats"
-	"github.com/youtube/vitess/go/sync2"
-	"github.com/youtube/vitess/go/tb"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/tb"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 
-	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 /* API and config for UpdateStream Service */
@@ -48,23 +48,25 @@ var usStateNames = map[int64]string{
 }
 
 var (
-	streamCount          = stats.NewCounters("UpdateStreamStreamCount")
-	updateStreamErrors   = stats.NewCounters("UpdateStreamErrors")
-	keyrangeStatements   = stats.NewInt("UpdateStreamKeyRangeStatements")
-	keyrangeTransactions = stats.NewInt("UpdateStreamKeyRangeTransactions")
-	tablesStatements     = stats.NewInt("UpdateStreamTablesStatements")
-	tablesTransactions   = stats.NewInt("UpdateStreamTablesTransactions")
+	streamCount          = stats.NewCountersWithSingleLabel("UpdateStreamStreamCount", "update stream count", "type")
+	updateStreamErrors   = stats.NewCountersWithSingleLabel("UpdateStreamErrors", "update stream error count", "type")
+	keyrangeStatements   = stats.NewCounter("UpdateStreamKeyRangeStatements", "update stream key range statement count")
+	keyrangeTransactions = stats.NewCounter("UpdateStreamKeyRangeTransactions", "update stream key range transaction count")
+	tablesStatements     = stats.NewCounter("UpdateStreamTablesStatements", "update stream table statement count")
+	tablesTransactions   = stats.NewCounter("UpdateStreamTablesTransactions", "update stream table transaction count")
 )
 
 // UpdateStreamControl is the interface an UpdateStream service implements
 // to bring it up or down.
 type UpdateStreamControl interface {
+	// InitDBConfigs is called after the db name is computed.
+	InitDBConfig(*dbconfigs.DBConfigs)
+	// RegisterService registers the UpdateStream service.
+	RegisterService()
 	// Enable will allow any new RPC calls
 	Enable()
-
 	// Disable will interrupt all current calls, and disallow any new call
 	Disable()
-
 	// IsEnabled returns true iff the service is enabled
 	IsEnabled() bool
 }
@@ -79,6 +81,14 @@ type UpdateStreamControlMock struct {
 // NewUpdateStreamControlMock creates a new UpdateStreamControlMock
 func NewUpdateStreamControlMock() *UpdateStreamControlMock {
 	return &UpdateStreamControlMock{}
+}
+
+// InitDBConfig is part of UpdateStreamControl
+func (m *UpdateStreamControlMock) InitDBConfig(*dbconfigs.DBConfigs) {
+}
+
+// RegisterService is part of UpdateStreamControl
+func (m *UpdateStreamControlMock) RegisterService() {
 }
 
 // Enable is part of UpdateStreamControl
@@ -106,11 +116,10 @@ func (m *UpdateStreamControlMock) IsEnabled() bool {
 // and UpdateStreamControl
 type UpdateStreamImpl struct {
 	// the following variables are set at construction time
-	ts       topo.Server
+	ts       *topo.Server
 	keyspace string
 	cell     string
-	mysqld   mysqlctl.MysqlDaemon
-	dbname   string
+	cp       dbconfigs.Connector
 	se       *schema.Engine
 
 	// actionLock protects the following variables
@@ -171,15 +180,18 @@ type RegisterUpdateStreamServiceFunc func(UpdateStream)
 var RegisterUpdateStreamServices []RegisterUpdateStreamServiceFunc
 
 // NewUpdateStream returns a new UpdateStreamImpl object
-func NewUpdateStream(ts topo.Server, keyspace string, cell string, mysqld mysqlctl.MysqlDaemon, se *schema.Engine, dbname string) *UpdateStreamImpl {
+func NewUpdateStream(ts *topo.Server, keyspace string, cell string, se *schema.Engine) *UpdateStreamImpl {
 	return &UpdateStreamImpl{
 		ts:       ts,
 		keyspace: keyspace,
 		cell:     cell,
-		mysqld:   mysqld,
 		se:       se,
-		dbname:   dbname,
 	}
+}
+
+// InitDBConfig should be invoked after the db name is computed.
+func (updateStream *UpdateStreamImpl) InitDBConfig(dbcfgs *dbconfigs.DBConfigs) {
+	updateStream.cp = dbcfgs.DbaWithDB()
 }
 
 // RegisterService needs to be called to publish stats, and to start listening
@@ -213,7 +225,7 @@ func (updateStream *UpdateStreamImpl) Enable() {
 
 	updateStream.state.Set(usEnabled)
 	updateStream.streams.Init()
-	log.Infof("Enabling update stream, dbname: %s", updateStream.dbname)
+	log.Infof("Enabling update stream, dbname: %s", updateStream.cp.DBName())
 }
 
 // Disable will disallow any connection to the service
@@ -263,7 +275,7 @@ func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, positi
 		keyrangeTransactions.Add(1)
 		return callback(trans)
 	})
-	bls := NewStreamer(updateStream.dbname, updateStream.mysqld, updateStream.se, charset, pos, 0, f)
+	bls := NewStreamer(updateStream.cp, updateStream.se, charset, pos, 0, f)
 	bls.resolverFactory, err = newKeyspaceIDResolverFactory(ctx, updateStream.ts, updateStream.keyspace, updateStream.cell)
 	if err != nil {
 		return fmt.Errorf("newKeyspaceIDResolverFactory failed: %v", err)
@@ -303,7 +315,7 @@ func (updateStream *UpdateStreamImpl) StreamTables(ctx context.Context, position
 		tablesTransactions.Add(1)
 		return callback(trans)
 	})
-	bls := NewStreamer(updateStream.dbname, updateStream.mysqld, updateStream.se, charset, pos, 0, f)
+	bls := NewStreamer(updateStream.cp, updateStream.se, charset, pos, 0, f)
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	i := updateStream.streams.Add(cancel)

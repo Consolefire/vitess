@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@ limitations under the License.
 
 package throttler
 
-import "github.com/youtube/vitess/go/sync2"
+import (
+	"vitess.io/vitess/go/sync2"
+)
 
 // MaxRateModule allows to set and retrieve a maximum rate limit.
 // It implements the Module interface.

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -21,28 +21,32 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
-const mysql56FlavorID = "MySQL56"
+// Mysql56FlavorID is the string identifier for the Mysql56 flavor.
+const Mysql56FlavorID = "MySQL56"
 
 // parseMysql56GTID is registered as a GTID parser.
 func parseMysql56GTID(s string) (GTID, error) {
 	// Split into parts.
 	parts := strings.Split(s, ":")
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid MySQL 5.6 GTID (%v): expecting UUID:Sequence", s)
+		return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid MySQL 5.6 GTID (%v): expecting UUID:Sequence", s)
 	}
 
 	// Parse Server ID.
 	sid, err := ParseSID(parts[0])
 	if err != nil {
-		return nil, fmt.Errorf("invalid MySQL 5.6 GTID Server ID (%v): %v", parts[0], err)
+		return nil, vterrors.Wrapf(err, "invalid MySQL 5.6 GTID Server ID (%v)", parts[0])
 	}
 
 	// Parse Sequence number.
 	seq, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("invalid MySQL 5.6 GTID Sequence number (%v): %v", parts[1], err)
+		return nil, vterrors.Wrapf(err, "invalid MySQL 5.6 GTID Sequence number (%v)", parts[1])
 	}
 
 	return Mysql56GTID{Server: sid, Sequence: seq}, nil
@@ -65,7 +69,7 @@ func (sid SID) String() string {
 // ParseSID parses an SID in the form used by MySQL 5.6.
 func ParseSID(s string) (sid SID, err error) {
 	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		return sid, fmt.Errorf("invalid MySQL 5.6 SID %q", s)
+		return sid, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid MySQL 5.6 SID %q", s)
 	}
 
 	// Drop the dashes so we can just check the error of Decode once.
@@ -77,7 +81,7 @@ func ParseSID(s string) (sid SID, err error) {
 	b = append(b, s[24:]...)
 
 	if _, err := hex.Decode(sid[:], b); err != nil {
-		return sid, fmt.Errorf("invalid MySQL 5.6 SID %q: %v", s, err)
+		return sid, vterrors.Wrapf(err, "invalid MySQL 5.6 SID %q", s)
 	}
 	return sid, nil
 }
@@ -98,7 +102,7 @@ func (gtid Mysql56GTID) String() string {
 
 // Flavor implements GTID.Flavor().
 func (gtid Mysql56GTID) Flavor() string {
-	return mysql56FlavorID
+	return Mysql56FlavorID
 }
 
 // SequenceDomain implements GTID.SequenceDomain().
@@ -122,5 +126,5 @@ func (gtid Mysql56GTID) GTIDSet() GTIDSet {
 }
 
 func init() {
-	gtidParsers[mysql56FlavorID] = parseMysql56GTID
+	gtidParsers[Mysql56FlavorID] = parseMysql56GTID
 }

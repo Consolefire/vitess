@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -23,13 +23,14 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
+	"context"
+
 	gouuid "github.com/pborman/uuid"
-	"golang.org/x/net/context"
 
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo"
 
-	workflowpb "github.com/youtube/vitess/go/vt/proto/workflow"
+	workflowpb "vitess.io/vitess/go/vt/proto/workflow"
 )
 
 var (
@@ -70,7 +71,7 @@ type Factory interface {
 // Its management API allows it to create, start and stop workflows.
 type Manager struct {
 	// ts is the topo server to use for all topo operations.
-	ts topo.Server
+	ts *topo.Server
 
 	// nodeManager is the NodeManager for UI display.
 	nodeManager *NodeManager
@@ -124,7 +125,7 @@ type runningWorkflow struct {
 }
 
 // NewManager creates an initialized Manager.
-func NewManager(ts topo.Server) *Manager {
+func NewManager(ts *topo.Server) *Manager {
 	return &Manager{
 		ts:          ts,
 		nodeManager: NewNodeManager(),
@@ -140,7 +141,7 @@ func (m *Manager) SetRedirectFunc(rf func() (string, error)) {
 
 // TopoServer returns the topo.Server used by the Manager.
 // It is meant to be used by the running workflows.
-func (m *Manager) TopoServer() topo.Server {
+func (m *Manager) TopoServer() *topo.Server {
 	return m.ts
 }
 
@@ -170,9 +171,7 @@ func (m *Manager) Run(ctx context.Context) {
 	m.mu.Unlock()
 
 	// Wait for the context to be canceled.
-	select {
-	case <-ctx.Done():
-	}
+	<-ctx.Done()
 
 	// Clear context and get a copy of the running jobs.
 	m.mu.Lock()
@@ -181,15 +180,13 @@ func (m *Manager) Run(ctx context.Context) {
 	m.workflows = make(map[string]*runningWorkflow)
 	m.mu.Unlock()
 
-	// Abort the running jobs. They won't save their state as
+	// Cancel the running jobs. They won't save their state as
 	// m.ctx is nil and they know it means we're shutting down.
 	for _, rw := range runningWorkflows {
 		rw.cancel()
 	}
 	for _, rw := range runningWorkflows {
-		select {
-		case <-rw.done:
-		}
+		<-rw.done
 	}
 }
 
@@ -244,7 +241,7 @@ func (m *Manager) loadAndStartJobsLocked() {
 }
 
 // Create creates a workflow from the given factory name with the
-// provided args.  Returns the unique UUID of the workflow. The
+// provided args. Returns the unique UUID of the workflow. The
 // workflowpb.Workflow object is saved in the topo server after
 // creation.
 func (m *Manager) Create(ctx context.Context, factoryName string, args []string) (string, error) {
@@ -260,6 +257,7 @@ func (m *Manager) Create(ctx context.Context, factoryName string, args []string)
 	// Create the initial workflowpb.Workflow object.
 	w := &workflowpb.Workflow{
 		Uuid:        gouuid.NewUUID().String(),
+		CreateTime:  time.Now().UnixNano(),
 		FactoryName: factoryName,
 		State:       workflowpb.WorkflowState_NotStarted,
 	}
@@ -295,6 +293,7 @@ func (m *Manager) instantiateWorkflow(w *workflowpb.Workflow) (*runningWorkflow,
 	}
 	rw.rootNode.Name = w.Name
 	rw.rootNode.PathName = w.Uuid
+	rw.rootNode.CreateTime = w.CreateTime
 	rw.rootNode.Path = "/" + rw.rootNode.PathName
 	rw.rootNode.State = w.State
 
@@ -329,7 +328,7 @@ func (m *Manager) Start(ctx context.Context, uuid string) error {
 
 	rw, ok := m.workflows[uuid]
 	if !ok {
-		return fmt.Errorf("Cannot find workflow %v in the workflow list", uuid)
+		return fmt.Errorf("cannot find workflow %v in the workflow list", uuid)
 	}
 
 	if rw.wi.State != workflowpb.WorkflowState_NotStarted {
@@ -444,10 +443,10 @@ func (m *Manager) Delete(ctx context.Context, uuid string) error {
 
 	rw, ok := m.workflows[uuid]
 	if !ok {
-		return fmt.Errorf("No workflow with uuid %v", uuid)
+		return fmt.Errorf("no workflow with uuid %v", uuid)
 	}
 	if rw.wi.State == workflowpb.WorkflowState_Running {
-		return fmt.Errorf("Cannot delete running workflow")
+		return fmt.Errorf("cannot delete running workflow")
 	}
 	if err := m.ts.DeleteWorkflow(m.ctx, rw.wi); err != nil {
 		log.Errorf("Could not delete workflow %v: %v", rw.wi, err)
@@ -587,4 +586,19 @@ func AvailableFactories() map[string]bool {
 		result[n] = true
 	}
 	return result
+}
+
+// StartManager starts a manager. This function should only be used for tests purposes.
+func StartManager(m *Manager) (*sync.WaitGroup, context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		m.Run(ctx)
+		wg.Done()
+	}()
+
+	m.WaitUntilRunning()
+
+	return wg, ctx, cancel
 }

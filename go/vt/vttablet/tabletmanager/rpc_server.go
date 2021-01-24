@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +19,14 @@ package tabletmanager
 import (
 	"fmt"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/tb"
-	"github.com/youtube/vitess/go/vt/callinfo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vterrors"
+
+	"context"
+
+	"vitess.io/vitess/go/tb"
+	"vitess.io/vitess/go/vt/callinfo"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo/topoproto"
 )
 
 // This file contains the RPC method helpers for the tablet manager.
@@ -32,42 +35,30 @@ import (
 // Utility functions for RPC service
 //
 
-// lock is used at the beginning of an RPC call, to lock the
-// action mutex. It returns ctx.Err() if <-ctx.Done() after the lock.
-func (agent *ActionAgent) lock(ctx context.Context) error {
-	agent.actionMutex.Lock()
-	agent.actionMutexLocked = true
-
-	// After we take the lock (which could take a long time), we
-	// check the client is still here.
-	select {
-	case <-ctx.Done():
-		agent.actionMutexLocked = false
-		agent.actionMutex.Unlock()
-		return ctx.Err()
-	default:
+// lock is used at the beginning of an RPC call, to acquire the
+// action semaphore. It returns ctx.Err() if the context expires.
+func (tm *TabletManager) lock(ctx context.Context) error {
+	if tm.actionSema.AcquireContext(ctx) {
 		return nil
 	}
+	return ctx.Err()
 }
 
-// unlock is the symetrical action to lock.
-func (agent *ActionAgent) unlock() {
-	agent.actionMutexLocked = false
-	agent.actionMutex.Unlock()
+// tryLock will return immediately, true on success and false on failure.
+func (tm *TabletManager) tryLock() bool {
+	return tm.actionSema.TryAcquire()
 }
 
-// checkLock checks we have locked the actionMutex.
-func (agent *ActionAgent) checkLock() {
-	if !agent.actionMutexLocked {
-		panic("programming error: this action should have taken the actionMutex")
-	}
+// unlock is the symmetrical action to lock.
+func (tm *TabletManager) unlock() {
+	tm.actionSema.Release()
 }
 
-// HandleRPCPanic is part of the RPCAgent interface.
-func (agent *ActionAgent) HandleRPCPanic(ctx context.Context, name string, args, reply interface{}, verbose bool, err *error) {
+// HandleRPCPanic is part of the RPCTM interface.
+func (tm *TabletManager) HandleRPCPanic(ctx context.Context, name string, args, reply interface{}, verbose bool, err *error) {
 	// panic handling
 	if x := recover(); x != nil {
-		log.Errorf("TabletManager.%v(%v) on %v panic: %v\n%s", name, args, topoproto.TabletAliasString(agent.TabletAlias), x, tb.Stack(4))
+		log.Errorf("TabletManager.%v(%v) on %v panic: %v\n%s", name, args, topoproto.TabletAliasString(tm.tabletAlias), x, tb.Stack(4))
 		*err = fmt.Errorf("caught panic during %v: %v", name, x)
 		return
 	}
@@ -86,24 +77,24 @@ func (agent *ActionAgent) HandleRPCPanic(ctx context.Context, name string, args,
 
 	if *err != nil {
 		// error case
-		log.Warningf("TabletManager.%v(%v)(on %v from %v) error: %v", name, args, topoproto.TabletAliasString(agent.TabletAlias), from, (*err).Error())
-		*err = fmt.Errorf("TabletManager.%v on %v error: %v", name, topoproto.TabletAliasString(agent.TabletAlias), *err)
+		log.Warningf("TabletManager.%v(%v)(on %v from %v) error: %v", name, args, topoproto.TabletAliasString(tm.tabletAlias), from, (*err).Error())
+		*err = vterrors.Wrapf(*err, "TabletManager.%v on %v error: %v", name, topoproto.TabletAliasString(tm.tabletAlias), (*err).Error())
 	} else {
 		// success case
-		log.Infof("TabletManager.%v(%v)(on %v from %v): %#v", name, args, topoproto.TabletAliasString(agent.TabletAlias), from, reply)
+		log.Infof("TabletManager.%v(%v)(on %v from %v): %#v", name, args, topoproto.TabletAliasString(tm.tabletAlias), from, reply)
 	}
 }
 
 //
-// RegisterQueryService is used to delay registration of RPC servers until we have all the objects.
-type RegisterQueryService func(*ActionAgent)
+// RegisterTabletManager is used to delay registration of RPC servers until we have all the objects.
+type RegisterTabletManager func(*TabletManager)
 
-// RegisterQueryServices is a list of functions to call when the delayed registration is triggered.
-var RegisterQueryServices []RegisterQueryService
+// RegisterTabletManagers is a list of functions to call when the delayed registration is triggered.
+var RegisterTabletManagers []RegisterTabletManager
 
-// registerQueryService will register all the instances.
-func (agent *ActionAgent) registerQueryService() {
-	for _, f := range RegisterQueryServices {
-		f(agent)
+// registerTabletManager will register all the instances.
+func (tm *TabletManager) registerTabletManager() {
+	for _, f := range RegisterTabletManagers {
+		f(tm)
 	}
 }

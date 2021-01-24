@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 	"log/syslog"
 	"strings"
 
-	"github.com/youtube/vitess/go/event/syslogger"
+	"vitess.io/vitess/go/event/syslogger"
 )
 
 // Syslog writes a MigrateServedFrom event to syslog.
@@ -52,10 +52,16 @@ func (ev *MigrateServedTypes) Syslog() (syslog.Priority, string) {
 
 	sourceShards := make([]string, len(ev.SourceShards))
 	for i, shard := range ev.SourceShards {
+		if shard == nil {
+			continue
+		}
 		sourceShards[i] = shard.ShardName()
 	}
 	destShards := make([]string, len(ev.DestinationShards))
 	for i, shard := range ev.DestinationShards {
+		if shard == nil {
+			continue
+		}
 		destShards[i] = shard.ShardName()
 	}
 

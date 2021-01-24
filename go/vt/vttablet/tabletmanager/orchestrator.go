@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -26,15 +27,18 @@ import (
 	"strconv"
 	"time"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/vterrors"
 
-	"github.com/youtube/vitess/go/timer"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/timer"
+	"vitess.io/vitess/go/vt/log"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo/topoproto"
 )
 
 var (
 	orcAddr     = flag.String("orc_api_url", "", "Address of Orchestrator's HTTP API (e.g. http://host:port/api/). Leave empty to disable Orchestrator integration.")
+	orcUser     = flag.String("orc_api_user", "", "(Optional) Basic auth username to authenticate with Orchestrator's HTTP API. Leave empty to disable basic auth.")
+	orcPassword = flag.String("orc_api_password", "", "(Optional) Basic auth password to authenticate with Orchestrator's HTTP API.")
 	orcTimeout  = flag.Duration("orc_timeout", 30*time.Second, "Timeout for calls to Orchestrator's HTTP API")
 	orcInterval = flag.Duration("orc_discover_interval", 0, "How often to ping Orchestrator's HTTP API endpoint to tell it we exist. 0 means never.")
 )
@@ -53,7 +57,7 @@ func newOrcClient() (*orcClient, error) {
 	}
 	apiRoot, err := url.Parse(*orcAddr)
 	if err != nil {
-		return nil, fmt.Errorf("can't parse -orc_api_url flag value (%v): %v", *orcAddr, err)
+		return nil, vterrors.Wrapf(err, "can't parse -orc_api_url flag value (%v)", *orcAddr)
 	}
 	return &orcClient{
 		apiRoot:    apiRoot,
@@ -62,9 +66,9 @@ func newOrcClient() (*orcClient, error) {
 }
 
 // DiscoverLoop periodically calls orc.discover() until process termination.
-// The Tablet is read from the given agent each time before calling discover().
+// The Tablet is read from the given tm each time before calling discover().
 // Usually this will be launched as a background goroutine.
-func (orc *orcClient) DiscoverLoop(agent *ActionAgent) {
+func (orc *orcClient) DiscoverLoop(tm *TabletManager) {
 	if *orcInterval == 0 {
 		// 0 means never.
 		return
@@ -79,7 +83,7 @@ func (orc *orcClient) DiscoverLoop(agent *ActionAgent) {
 
 	for {
 		// Do the first attempt immediately.
-		err := orc.Discover(agent.Tablet())
+		err := orc.Discover(tm.Tablet())
 
 		// Only log if we're transitioning between success and failure states.
 		if (err != nil) != (lastErr != nil) {
@@ -129,12 +133,42 @@ func (orc *orcClient) EndMaintenance(tablet *topodatapb.Tablet) error {
 	return err
 }
 
+func (orc *orcClient) InActiveShardRecovery(tablet *topodatapb.Tablet) (bool, error) {
+	alias := fmt.Sprintf("%v.%v", tablet.GetKeyspace(), tablet.GetShard())
+
+	// TODO(zmagg): Replace this with simpler call to active-cluster-recovery
+	// when call with alias parameter is supported.
+	resp, err := orc.apiGet("audit-recovery", "alias", alias)
+
+	if err != nil {
+		return false, fmt.Errorf("error calling Orchestrator API: %v", err)
+	}
+
+	var r []map[string]interface{}
+
+	if err := json.Unmarshal(resp, &r); err != nil {
+		return false, fmt.Errorf("error parsing JSON response from Orchestrator: %v; response: %q", err, string(resp))
+	}
+
+	// Orchestrator returns a 0-length response when it has no history of recovery on this cluster.
+	if len(r) == 0 {
+		return false, nil
+	}
+
+	active, ok := r[0]["IsActive"].(bool)
+
+	if !ok {
+		return false, fmt.Errorf("error parsing JSON response from Orchestrator")
+	}
+	return active, nil
+}
+
 func mysqlHostPort(tablet *topodatapb.Tablet) (host, port string, err error) {
-	mysqlPort := int(topoproto.MysqlPort(tablet))
+	mysqlPort := int(tablet.MysqlPort)
 	if mysqlPort == 0 {
 		return "", "", fmt.Errorf("MySQL port is unknown for tablet %v (mysqld may not be running yet)", topoproto.TabletAliasString(tablet.Alias))
 	}
-	return topoproto.MysqlHostname(tablet), strconv.Itoa(mysqlPort), nil
+	return tablet.MysqlHostname, strconv.Itoa(mysqlPort), nil
 }
 
 // apiGet calls the given Orchestrator API endpoint.
@@ -151,7 +185,14 @@ func (orc *orcClient) apiGet(pathParts ...string) ([]byte, error) {
 	url.Path = path.Join(fullPath...)
 
 	// Note that url.String() will URL-escape the path we gave it above.
-	resp, err := orc.httpClient.Get(url.String())
+	req, err := http.NewRequest("GET", url.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if *orcUser != "" {
+		req.SetBasicAuth(*orcUser, *orcPassword)
+	}
+	resp, err := orc.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,13 +20,14 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/youtube/vitess/go/sync2"
+	"vitess.io/vitess/go/sync2"
 )
 
 // Histogram tracks counts and totals while
 // splitting the counts under different buckets
 // using specified cutoffs.
 type Histogram struct {
+	help       string
 	cutoffs    []int64
 	labels     []string
 	countLabel string
@@ -41,24 +42,25 @@ type Histogram struct {
 // based on the cutoffs. The buckets are categorized using the
 // following criterion: cutoff[i-1] < value <= cutoff[i]. Anything
 // higher than the highest cutoff is labeled as "inf".
-func NewHistogram(name string, cutoffs []int64) *Histogram {
+func NewHistogram(name, help string, cutoffs []int64) *Histogram {
 	labels := make([]string, len(cutoffs)+1)
 	for i, v := range cutoffs {
 		labels[i] = fmt.Sprintf("%d", v)
 	}
 	labels[len(labels)-1] = "inf"
-	return NewGenericHistogram(name, cutoffs, labels, "Count", "Total")
+	return NewGenericHistogram(name, help, cutoffs, labels, "Count", "Total")
 }
 
 // NewGenericHistogram creates a histogram where all the labels are
 // supplied by the caller. The number of labels has to be one more than
 // the number of cutoffs because the last label captures everything that
 // exceeds the highest cutoff.
-func NewGenericHistogram(name string, cutoffs []int64, labels []string, countLabel, totalLabel string) *Histogram {
+func NewGenericHistogram(name, help string, cutoffs []int64, labels []string, countLabel, totalLabel string) *Histogram {
 	if len(cutoffs) != len(labels)-1 {
 		panic("mismatched cutoff and label lengths")
 	}
 	h := &Histogram{
+		help:       help,
 		cutoffs:    cutoffs,
 		labels:     labels,
 		countLabel: countLabel,
@@ -101,8 +103,9 @@ func (h *Histogram) MarshalJSON() ([]byte, error) {
 	fmt.Fprintf(b, "{")
 	totalCount := int64(0)
 	for i, label := range h.labels {
-		totalCount += h.buckets[i].Get()
-		fmt.Fprintf(b, "\"%v\": %v, ", label, totalCount)
+		count := h.buckets[i].Get()
+		totalCount += count
+		fmt.Fprintf(b, "\"%v\": %v, ", label, count)
 	}
 	fmt.Fprintf(b, "\"%s\": %v, ", h.countLabel, totalCount)
 	fmt.Fprintf(b, "\"%s\": %v", h.totalLabel, h.total.Get())
@@ -159,4 +162,9 @@ func (h *Histogram) Buckets() []int64 {
 		buckets[i] = h.buckets[i].Get()
 	}
 	return buckets
+}
+
+// Help returns the help string.
+func (h *Histogram) Help() string {
+	return h.help
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,18 +18,21 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/vt/vttest"
+	"vitess.io/vitess/go/vt/vttest"
 
-	vschemapb "github.com/youtube/vitess/go/vt/proto/vschema"
-	vttestpb "github.com/youtube/vitess/go/vt/proto/vttest"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
 )
 
 func TestVtclient(t *testing.T) {
-	topology := &vttestpb.VTTestTopology{
+	// Build the config for vttest.
+	var cfg vttest.Config
+	cfg.Topology = &vttestpb.VTTestTopology{
 		Keyspaces: []*vttestpb.Keyspace{
 			{
 				Name: "test_keyspace",
@@ -64,23 +67,19 @@ func TestVtclient(t *testing.T) {
 			},
 		},
 	}
-
-	hdl, err := vttest.LaunchVitess(vttest.ProtoTopo(topology), vttest.Schema(schema), vttest.VSchema(vschema))
-	if err != nil {
-		t.Fatal(err)
+	if err := cfg.InitSchemas("test_keyspace", schema, vschema); err != nil {
+		t.Fatalf("InitSchemas failed: %v", err)
 	}
-	defer func() {
-		err = hdl.TearDown()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	vtgateAddr, err := hdl.VtgateAddress()
-	if err != nil {
-		t.Fatal(err)
+	defer os.RemoveAll(cfg.SchemaDir)
+	cluster := vttest.LocalCluster{
+		Config: cfg,
 	}
+	if err := cluster.Setup(); err != nil {
+		t.Fatalf("InitSchemas failed: %v", err)
+	}
+	defer cluster.TearDown()
 
+	vtgateAddr := fmt.Sprintf("localhost:%v", cluster.Env.PortForProtocol("vtcombo", "grpc"))
 	queries := []struct {
 		args         []string
 		rowsAffected int64
@@ -116,7 +115,7 @@ func TestVtclient(t *testing.T) {
 		},
 		{
 			args:   []string{"SELECT * FROM nonexistent"},
-			errMsg: "table nonexistent not found in schema",
+			errMsg: "table nonexistent not found",
 		},
 	}
 

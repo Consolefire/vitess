@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,12 +18,13 @@ limitations under the License.
 package sysloglogger
 
 import (
+	"bytes"
 	"flag"
 	"log/syslog"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 // syslogWriter is an interface that wraps syslog.Writer, so it can be mocked in unit tests.
@@ -73,7 +74,12 @@ func run() {
 			log.Errorf("Unexpected value in query logs: %#v (expecting value of type %T)", out, &tabletenv.LogStats{})
 			continue
 		}
-		if err := writer.Info(stats.Format(formatParams)); err != nil {
+		var b bytes.Buffer
+		if err := stats.Logf(&b, formatParams); err != nil {
+			log.Errorf("Error formatting logStats: %v", err)
+			continue
+		}
+		if err := writer.Info(b.String()); err != nil {
 			log.Errorf("Error writing to syslog: %v", err)
 			continue
 		}

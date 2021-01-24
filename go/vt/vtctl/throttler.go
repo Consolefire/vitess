@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,21 +23,26 @@ import (
 	"strings"
 	"time"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/olekukonko/tablewriter"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/proto/throttlerdata"
-	"github.com/youtube/vitess/go/vt/throttler"
-	"github.com/youtube/vitess/go/vt/throttler/throttlerclient"
-	"github.com/youtube/vitess/go/vt/wrangler"
-	"golang.org/x/net/context"
+
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/throttler"
+	"vitess.io/vitess/go/vt/throttler/throttlerclient"
+	"vitess.io/vitess/go/vt/wrangler"
+
+	throttlerdatapb "vitess.io/vitess/go/vt/proto/throttlerdata"
+)
+
+const (
+	throttlerGroupName = "Resharding Throttler"
+	shortTimeout       = 15 * time.Second
 )
 
 // This file contains the commands to control the throttler which is used during
 // resharding (vtworker) and by filtered replication (vttablet).
-
-const throttlerGroupName = "Resharding Throttler"
-const shortTimeout = 15 * time.Second
 
 func init() {
 	addCommandGroup(throttlerGroupName)
@@ -220,9 +225,9 @@ func commandUpdateThrottlerConfiguration(ctx context.Context, wr *wrangler.Wrang
 	}
 
 	protoText := subFlags.Arg(0)
-	configuration := &throttlerdata.Configuration{}
+	configuration := &throttlerdatapb.Configuration{}
 	if err := proto.UnmarshalText(protoText, configuration); err != nil {
-		return fmt.Errorf("Failed to unmarshal the configuration protobuf text (%v) into a protobuf instance: %v", protoText, err)
+		return fmt.Errorf("failed to unmarshal the configuration protobuf text (%v) into a protobuf instance: %v", protoText, err)
 	}
 
 	// Connect to the server.

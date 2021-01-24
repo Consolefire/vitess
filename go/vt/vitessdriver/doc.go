@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -28,20 +28,19 @@ Example
 Using this SQL driver is as simple as:
 
   import (
-    "time"
-    "github.com/youtube/vitess/go/vt/vitessdriver"
+    "vitess.io/vitess/go/vt/vitessdriver"
   )
 
   func main() {
     // Connect to vtgate.
-    db, err := vitessdriver.Open("localhost:15991", "keyspace", "master", 30*time.Second)
+    db, err := vitessdriver.Open("localhost:15991", "@master")
 
     // Use "db" via the Golang sql interface.
   }
 
-For a full example, please see: https://github.com/youtube/vitess/blob/master/examples/local/client.go
+For a full example, please see: https://github.com/vitessio/vitess/blob/master/test/client.go
 
-The full example is based on our tutorial for running Vitess locally: http://vitess.io/getting-started/local-instance/
+The full example is based on our tutorial for running Vitess locally: https://vitess.io/docs/get-started/local/
 
 
 Vtgate
@@ -62,21 +61,21 @@ The driver uses the V3 API which doesn't require you to specify routing
 information. You just send the query as if Vitess was a regular database.
 VTGate analyzes the query and uses additional metadata called VSchema
 to perform the necessary routing. See the vtgate v3 Features doc for an overview:
-https://github.com/youtube/vitess/blob/master/doc/VTGateV3Features.md
+https://github.com/vitessio/vitess/blob/master/doc/VTGateV3Features.md
 
 As of 12/2015, the VSchema creation is not documented yet as we are in the
 process of simplifying the VSchema definition and the overall process for
 creating one.
 If you want to create your own VSchema, we recommend to have a
 look at the VSchema from the vtgate v3 demo:
-https://github.com/youtube/vitess/blob/master/examples/demo/schema
+https://github.com/vitessio/vitess/blob/master/examples/demo/schema
 
 (The demo itself is interactive and can be run by executing "./run.py" in the
 "examples/demo/" directory.)
 
 The vtgate v3 design doc, which we will also update and simplify in the future,
 contains more details on the VSchema:
-https://github.com/youtube/vitess/blob/master/doc/V3VindexDesign.md
+https://github.com/vitessio/vitess/blob/master/doc/V3VindexDesign.md
 
 
 Isolation levels

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ func NewRateLimiter(maxCount int, interval time.Duration) *RateLimiter {
 func (rl *RateLimiter) Allow() bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	if time.Now().Sub(rl.lastTime) < rl.interval {
+	if time.Since(rl.lastTime) < rl.interval {
 		if rl.curCount > 0 {
 			rl.curCount--
 			return true

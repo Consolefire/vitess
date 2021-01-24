@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,20 +18,49 @@ limitations under the License.
 package streamlog
 
 import (
+	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/acl"
-	"github.com/youtube/vitess/go/stats"
+	"vitess.io/vitess/go/acl"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/log"
 )
 
 var (
-	sendCount         = stats.NewCounters("StreamlogSend")
-	deliveredCount    = stats.NewMultiCounters("StreamlogDelivered", []string{"Log", "Subscriber"})
-	deliveryDropCount = stats.NewMultiCounters("StreamlogDeliveryDroppedMessages", []string{"Log", "Subscriber"})
+	// RedactDebugUIQueries controls whether full queries and bind variables are suppressed from debug UIs.
+	RedactDebugUIQueries = flag.Bool("redact-debug-ui-queries", false, "redact full queries and bind variables from debug UI")
+
+	// QueryLogFormat controls the format of the query log (either text or json)
+	QueryLogFormat = flag.String("querylog-format", "text", "format for query logs (\"text\" or \"json\")")
+
+	// QueryLogFilterTag contains an optional string that must be present in the query for it to be logged
+	QueryLogFilterTag = flag.String("querylog-filter-tag", "", "string that must be present in the query for it to be logged")
+
+	sendCount      = stats.NewCountersWithSingleLabel("StreamlogSend", "stream log send count", "logger_names")
+	deliveredCount = stats.NewCountersWithMultiLabels(
+		"StreamlogDelivered",
+		"Stream log delivered",
+		[]string{"Log", "Subscriber"})
+	deliveryDropCount = stats.NewCountersWithMultiLabels(
+		"StreamlogDeliveryDroppedMessages",
+		"Dropped messages by streamlog delivery",
+		[]string{"Log", "Subscriber"})
+)
+
+const (
+	// QueryLogFormatText is the format specifier for text querylog output
+	QueryLogFormatText = "text"
+
+	// QueryLogFormatJSON is the format specifier for json querylog output
+	QueryLogFormatJSON = "json"
 )
 
 // StreamLogger is a non-blocking broadcaster of messages.
@@ -42,6 +71,10 @@ type StreamLogger struct {
 	mu         sync.Mutex
 	subscribed map[chan interface{}]string
 }
+
+// LogFormatter is the function signature used to format an arbitrary
+// message for the given output writer.
+type LogFormatter func(out io.Writer, params url.Values, message interface{}) error
 
 // New returns a new StreamLogger that can stream events to subscribers.
 // The size parameter defines the channel size for the subscribers.
@@ -96,7 +129,7 @@ func (logger *StreamLogger) Name() string {
 
 // ServeLogs registers the URL on which messages will be broadcast.
 // It is safe to register multiple URLs for the same StreamLogger.
-func (logger *StreamLogger) ServeLogs(url string, messageFmt func(url.Values, interface{}) string) {
+func (logger *StreamLogger) ServeLogs(url string, logf LogFormatter) {
 	http.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
 		if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 			acl.SendError(w, err)
@@ -113,11 +146,71 @@ func (logger *StreamLogger) ServeLogs(url string, messageFmt func(url.Values, in
 		w.(http.Flusher).Flush()
 
 		for message := range ch {
-			if _, err := io.WriteString(w, messageFmt(r.Form, message)); err != nil {
+			if err := logf(w, r.Form, message); err != nil {
 				return
 			}
 			w.(http.Flusher).Flush()
 		}
 	})
 	log.Infof("Streaming logs from %s at %v.", logger.Name(), url)
+}
+
+// LogToFile starts logging to the specified file path and will reopen the
+// file in response to SIGUSR2.
+//
+// Returns the channel used for the subscription which can be used to close
+// it.
+func (logger *StreamLogger) LogToFile(path string, logf LogFormatter) (chan interface{}, error) {
+	rotateChan := make(chan os.Signal, 1)
+	signal.Notify(rotateChan, syscall.SIGUSR2)
+
+	logChan := logger.Subscribe("FileLog")
+	formatParams := map[string][]string{"full": {}}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			select {
+			case record := <-logChan:
+				logf(f, formatParams, record)
+			case <-rotateChan:
+				f.Close()
+				f, _ = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+			}
+		}
+	}()
+
+	return logChan, nil
+}
+
+// Formatter is a simple interface for objects that expose a Format function
+// as needed for streamlog.
+type Formatter interface {
+	Logf(io.Writer, url.Values) error
+}
+
+// GetFormatter returns a formatter function for objects conforming to the
+// Formatter interface
+func GetFormatter(logger *StreamLogger) LogFormatter {
+	return func(w io.Writer, params url.Values, val interface{}) error {
+		fmter, ok := val.(Formatter)
+		if !ok {
+			_, err := fmt.Fprintf(w, "Error: unexpected value of type %T in %s!", val, logger.Name())
+			return err
+		}
+		return fmter.Logf(w, params)
+	}
+}
+
+// ShouldEmitLog returns whether the log with the given SQL query
+// should be emitted or filtered
+func ShouldEmitLog(sql string) bool {
+	if *QueryLogFilterTag == "" {
+		return true
+	}
+	return strings.Contains(sql, *QueryLogFilterTag)
 }

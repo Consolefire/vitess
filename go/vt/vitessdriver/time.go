@@ -1,5 +1,5 @@
 /*
-Copyright 2017 GitHub Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -20,7 +20,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/youtube/vitess/go/sqltypes"
+	"vitess.io/vitess/go/sqltypes"
 )
 
 // ErrInvalidTime is returned when we fail to parse a datetime
@@ -72,15 +72,6 @@ func parseISOTime(tstr string, loc *time.Location, minLen, maxLen int) (t time.T
 	// section, ParseInLocation will initialize the time.Time struct
 	// with the default `loc` we're passing here.
 	return time.ParseInLocation(isoTimeFormat[:tlen], tstr, loc)
-}
-
-func checkTimeFormat(t string) (err error) {
-	// Valid format string offsets for any ISO time from MySQL:
-	//  |DATETIME |10      |19+
-	//  |---------|--------|
-	// "2006-01-02 15:04:05.999999"
-	_, err = parseISOTime(t, time.UTC, 10, isoTimeLength)
-	return
 }
 
 // DatetimeToNative converts a Datetime Value into a time.Time

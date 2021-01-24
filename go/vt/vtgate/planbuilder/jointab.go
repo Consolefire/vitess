@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,14 +19,15 @@ package planbuilder
 import (
 	"strconv"
 
-	"github.com/youtube/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // jointab manages procurement and naming of join
 // variables across primitives.
 type jointab struct {
-	refs map[*column]string
-	vars map[string]struct{}
+	refs     map[*column]string
+	vars     map[string]struct{}
+	varIndex int
 }
 
 // newJointab creates a new jointab for the current plan
@@ -42,18 +43,14 @@ func newJointab(bindvars map[string]struct{}) *jointab {
 
 // Procure requests for the specified column from the plan
 // and returns the join var name for it.
-func (jt *jointab) Procure(bldr builder, col *sqlparser.ColName, to int) string {
+func (jt *jointab) Procure(plan logicalPlan, col *sqlparser.ColName, to int) string {
 	from, joinVar := jt.Lookup(col)
 	// If joinVar is empty, generate a unique name.
 	if joinVar == "" {
 		suffix := ""
 		i := 0
 		for {
-			if !col.Qualifier.IsEmpty() {
-				joinVar = col.Qualifier.Name.CompliantName() + "_" + col.Name.CompliantName() + suffix
-			} else {
-				joinVar = col.Name.CompliantName() + suffix
-			}
+			joinVar = col.CompliantName(suffix)
 			if _, ok := jt.vars[joinVar]; !ok {
 				break
 			}
@@ -63,8 +60,35 @@ func (jt *jointab) Procure(bldr builder, col *sqlparser.ColName, to int) string 
 		jt.vars[joinVar] = struct{}{}
 		jt.refs[col.Metadata.(*column)] = joinVar
 	}
-	bldr.SupplyVar(from, to, col, joinVar)
+	plan.SupplyVar(from, to, col, joinVar)
 	return joinVar
+}
+
+// GenerateSubqueryVars generates substitution variable names for
+// a subquery. It returns two names based on: __sq, __sq_has_values.
+// The appropriate names can be used for substitution
+// depending on the scenario.
+func (jt *jointab) GenerateSubqueryVars() (sq, hasValues string) {
+	for {
+		jt.varIndex++
+		suffix := strconv.Itoa(jt.varIndex)
+		var1 := "__sq" + suffix
+		var2 := "__sq_has_values" + suffix
+		if jt.containsAny(var1, var2) {
+			continue
+		}
+		return var1, var2
+	}
+}
+
+func (jt *jointab) containsAny(names ...string) bool {
+	for _, name := range names {
+		if _, ok := jt.vars[name]; ok {
+			return true
+		}
+		jt.vars[name] = struct{}{}
+	}
+	return false
 }
 
 // Lookup returns the order of the route that supplies the column and

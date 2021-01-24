@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,17 +20,18 @@ import (
 	"fmt"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/mysql/fakesqldb"
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vttablet/faketmclient"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/wrangler"
+	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/faketmclient"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/wrangler"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // This file contains common test helper.
@@ -43,33 +44,17 @@ func runCommand(t *testing.T, wi *Instance, wr *wrangler.Wrangler, args []string
 
 	worker, done, err := wi.RunCommand(ctx, args, wr, false /* runFromCli */)
 	if err != nil {
-		return fmt.Errorf("Worker creation failed: %v", err)
+		return vterrors.Wrap(err, "Worker creation failed")
 	}
 	if err := wi.WaitForCommand(worker, done); err != nil {
-		return fmt.Errorf("Worker failed: %v", err)
+		return vterrors.Wrap(err, "Worker failed")
 	}
 
 	t.Logf("Got status: %v", worker.StatusAsText())
 	if worker.State() != WorkerStateDone {
-		return fmt.Errorf("Worker finished but not successfully: %v", err)
+		return vterrors.Wrap(err, "Worker finished but not successfully")
 	}
 	return nil
-}
-
-// expectBlpCheckpointCreationQueries fakes out the queries which vtworker
-// sends out to create the Binlog Player (BLP) checkpoint.
-func expectBlpCheckpointCreationQueries(f *fakesqldb.DB) {
-	f.AddExpectedQuery("CREATE DATABASE IF NOT EXISTS _vt", nil)
-	f.AddExpectedQuery("CREATE TABLE IF NOT EXISTS _vt.blp_checkpoint (\n"+
-		"  source_shard_uid INT(10) UNSIGNED NOT NULL,\n"+
-		"  pos VARBINARY(64000) DEFAULT NULL,\n"+
-		"  max_tps BIGINT(20) NOT NULL,\n"+
-		"  max_replication_lag BIGINT(20) NOT NULL,\n"+
-		"  time_updated BIGINT(20) UNSIGNED NOT NULL,\n"+
-		"  transaction_timestamp BIGINT(20) UNSIGNED NOT NULL,\n"+
-		"  flags VARBINARY(250) DEFAULT NULL,\n"+
-		"  PRIMARY KEY (source_shard_uid)\n) ENGINE=InnoDB", nil)
-	f.AddExpectedQuery("INSERT INTO _vt.blp_checkpoint (source_shard_uid, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, flags) VALUES (0, 'MariaDB/12-34-5678', *", nil)
 }
 
 // sourceRdonlyFakeDB fakes out the MIN, MAX query on the primary key.
@@ -106,10 +91,10 @@ func sourceRdonlyFakeDB(t *testing.T, dbName, tableName string, min, max int) *f
 // using the provided topo server.
 type fakeTMCTopo struct {
 	tmclient.TabletManagerClient
-	server topo.Server
+	server *topo.Server
 }
 
-func newFakeTMCTopo(ts topo.Server) tmclient.TabletManagerClient {
+func newFakeTMCTopo(ts *topo.Server) tmclient.TabletManagerClient {
 	return &fakeTMCTopo{
 		TabletManagerClient: faketmclient.NewFakeTabletManagerClient(),
 		server:              ts,

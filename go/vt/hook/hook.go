@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ package hook
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,9 +27,10 @@ import (
 	"path"
 	"strings"
 	"syscall"
+	"time"
 
-	log "github.com/golang/glog"
-	vtenv "github.com/youtube/vitess/go/vt/env"
+	vtenv "vitess.io/vitess/go/vt/env"
+	"vitess.io/vitess/go/vt/log"
 )
 
 // Hook is the input structure for this library.
@@ -69,6 +72,10 @@ const (
 
 	// HOOK_GENERIC_ERROR is returned for unknown errors.
 	HOOK_GENERIC_ERROR = -6
+
+	// HOOK_TIMEOUT_ERROR is returned when a CommandContext has its context
+	// become done before the command terminates.
+	HOOK_TIMEOUT_ERROR = -7
 )
 
 // WaitFunc is a return type for the Pipe methods.
@@ -85,8 +92,13 @@ func NewSimpleHook(name string) *Hook {
 	return &Hook{Name: name}
 }
 
-// findHook trie to locate the hook, and returns the exec.Cmd for it.
-func (hook *Hook) findHook() (*exec.Cmd, int, error) {
+// NewHookWithEnv returns a Hook object with the provided name, params and ExtraEnv.
+func NewHookWithEnv(name string, params []string, env map[string]string) *Hook {
+	return &Hook{Name: name, Parameters: params, ExtraEnv: env}
+}
+
+// findHook tries to locate the hook, and returns the exec.Cmd for it.
+func (hook *Hook) findHook(ctx context.Context) (*exec.Cmd, int, error) {
 	// Check the hook path.
 	if strings.Contains(hook.Name, "/") {
 		return nil, HOOK_INVALID_NAME, fmt.Errorf("hook cannot contain '/'")
@@ -111,7 +123,7 @@ func (hook *Hook) findHook() (*exec.Cmd, int, error) {
 
 	// Configure the command.
 	log.Infof("hook: executing hook: %v %v", vthook, strings.Join(hook.Parameters, " "))
-	cmd := exec.Command(vthook, hook.Parameters...)
+	cmd := exec.CommandContext(ctx, vthook, hook.Parameters...)
 	if len(hook.ExtraEnv) > 0 {
 		cmd.Env = os.Environ()
 		for key, value := range hook.ExtraEnv {
@@ -122,12 +134,12 @@ func (hook *Hook) findHook() (*exec.Cmd, int, error) {
 	return cmd, HOOK_SUCCESS, nil
 }
 
-// Execute tries to execute the Hook and returns a HookResult.
-func (hook *Hook) Execute() (result *HookResult) {
+// ExecuteContext tries to execute the Hook with the given context and returns a HookResult.
+func (hook *Hook) ExecuteContext(ctx context.Context) (result *HookResult) {
 	result = &HookResult{}
 
 	// Find the hook.
-	cmd, status, err := hook.findHook()
+	cmd, status, err := hook.findHook(ctx)
 	if err != nil {
 		result.ExitStatus = status
 		result.Stderr = err.Error() + "\n"
@@ -138,23 +150,52 @@ func (hook *Hook) Execute() (result *HookResult) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+
+	start := time.Now()
 	err = cmd.Run()
+	duration := time.Since(start)
+
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
+
+	defer func() {
+		log.Infof("hook: result is %v", result.String())
+	}()
+
 	if err == nil {
 		result.ExitStatus = HOOK_SUCCESS
-	} else {
-		if cmd.ProcessState != nil && cmd.ProcessState.Sys() != nil {
-			result.ExitStatus = cmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
-		} else {
-			result.ExitStatus = HOOK_CANNOT_GET_EXIT_STATUS
-		}
-		result.Stderr += "ERROR: " + err.Error() + "\n"
+		return result
 	}
 
-	log.Infof("hook: result is %v", result.String())
+	if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// When (exec.Cmd).Run hits a context cancelled, the process is killed via SIGTERM.
+		// This means:
+		// 	1. cmd.ProcessState.Exited() is false.
+		//	2. cmd.ProcessState.ExitCode() is -1.
+		// [ref]: https://golang.org/pkg/os/#ProcessState.ExitCode
+		//
+		// Therefore, we need to catch this error specifically, and set result.ExitStatus to
+		// HOOK_TIMEOUT_ERROR, because just using ExitStatus will result in HOOK_DOES_NOT_EXIST,
+		// which would be wrong. Since we're already doing some custom handling, we'll also include
+		// the amount of time the command was running in the error string, in case that is helpful.
+		result.ExitStatus = HOOK_TIMEOUT_ERROR
+		result.Stderr += fmt.Sprintf("ERROR: (after %s) %s\n", duration, err)
+		return result
+	}
+
+	if cmd.ProcessState != nil && cmd.ProcessState.Sys() != nil {
+		result.ExitStatus = cmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
+	} else {
+		result.ExitStatus = HOOK_CANNOT_GET_EXIT_STATUS
+	}
+	result.Stderr += "ERROR: " + err.Error() + "\n"
 
 	return result
+}
+
+// Execute tries to execute the Hook and returns a HookResult.
+func (hook *Hook) Execute() (result *HookResult) {
+	return hook.ExecuteContext(context.Background())
 }
 
 // ExecuteOptional executes an optional hook, logs if it doesn't
@@ -182,7 +223,7 @@ func (hook *Hook) ExecuteOptional() error {
 // - an error code and an error if anything fails.
 func (hook *Hook) ExecuteAsWritePipe(out io.Writer) (io.WriteCloser, WaitFunc, int, error) {
 	// Find the hook.
-	cmd, status, err := hook.findHook()
+	cmd, status, err := hook.findHook(context.Background())
 	if err != nil {
 		return nil, nil, status, err
 	}
@@ -190,7 +231,7 @@ func (hook *Hook) ExecuteAsWritePipe(out io.Writer) (io.WriteCloser, WaitFunc, i
 	// Configure the process's stdin, stdout, and stderr.
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, nil, HOOK_GENERIC_ERROR, fmt.Errorf("Failed to configure stdin: %v", err)
+		return nil, nil, HOOK_GENERIC_ERROR, fmt.Errorf("failed to configure stdin: %v", err)
 	}
 	cmd.Stdout = out
 	var stderr bytes.Buffer
@@ -221,7 +262,7 @@ func (hook *Hook) ExecuteAsWritePipe(out io.Writer) (io.WriteCloser, WaitFunc, i
 // - an error code and an error if anything fails.
 func (hook *Hook) ExecuteAsReadPipe(in io.Reader) (io.Reader, WaitFunc, int, error) {
 	// Find the hook.
-	cmd, status, err := hook.findHook()
+	cmd, status, err := hook.findHook(context.Background())
 	if err != nil {
 		return nil, nil, status, err
 	}
@@ -229,7 +270,7 @@ func (hook *Hook) ExecuteAsReadPipe(in io.Reader) (io.Reader, WaitFunc, int, err
 	// Configure the process's stdin, stdout, and stderr.
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, HOOK_GENERIC_ERROR, fmt.Errorf("Failed to configure stdout: %v", err)
+		return nil, nil, HOOK_GENERIC_ERROR, fmt.Errorf("failed to configure stdout: %v", err)
 	}
 	cmd.Stdin = in
 	var stderr bytes.Buffer

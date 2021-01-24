@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"strings"
 	"testing"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 const (
@@ -257,7 +257,7 @@ func TestIntegralValue(t *testing.T) {
 	}
 }
 
-func TestInerfaceValue(t *testing.T) {
+func TestInterfaceValue(t *testing.T) {
 	testcases := []struct {
 		in  interface{}
 		out Value
@@ -336,6 +336,65 @@ func TestAccessors(t *testing.T) {
 	if v.IsBinary() {
 		t.Error("v.IsBinary: true, want false")
 	}
+	{
+		i, err := v.ToInt64()
+		if err != nil {
+			t.Errorf("v.ToInt64: got error: %+v, want no error", err)
+		}
+		if i != 1 {
+			t.Errorf("v.ToInt64=%+v, want 1", i)
+		}
+	}
+	{
+		i, err := v.ToUint64()
+		if err != nil {
+			t.Errorf("v.ToUint64: got error: %+v, want no error", err)
+		}
+		if i != 1 {
+			t.Errorf("v.ToUint64=%+v, want 1", i)
+		}
+	}
+	{
+		b, err := v.ToBool()
+		if err != nil {
+			t.Errorf("v.ToBool: got error: %+v, want no error", err)
+		}
+		if !b {
+			t.Errorf("v.ToBool=%+v, want true", b)
+		}
+	}
+}
+
+func TestAccessorsNegative(t *testing.T) {
+	v := TestValue(Int64, "-1")
+	if v.ToString() != "-1" {
+		t.Errorf("v.String=%s, want -1", v.ToString())
+	}
+	if v.IsNull() {
+		t.Error("v.IsNull: true, want false")
+	}
+	if !v.IsIntegral() {
+		t.Error("v.IsIntegral: false, want true")
+	}
+	{
+		i, err := v.ToInt64()
+		if err != nil {
+			t.Errorf("v.ToInt64: got error: %+v, want no error", err)
+		}
+		if i != -1 {
+			t.Errorf("v.ToInt64=%+v, want -1", i)
+		}
+	}
+	{
+		if _, err := v.ToUint64(); err == nil {
+			t.Error("v.ToUint64: got no error, want error")
+		}
+	}
+	{
+		if _, err := v.ToBool(); err == nil {
+			t.Error("v.ToUint64: got no error, want error")
+		}
+	}
 }
 
 func TestToBytesAndString(t *testing.T) {
@@ -344,7 +403,7 @@ func TestToBytesAndString(t *testing.T) {
 		TestValue(Int64, "1"),
 		TestValue(Int64, "12"),
 	} {
-		if b := v.ToBytes(); bytes.Compare(b, v.Raw()) != 0 {
+		if b := v.ToBytes(); !bytes.Equal(b, v.Raw()) {
 			t.Errorf("%v.ToBytes: %s, want %s", v, b, v.Raw())
 		}
 		if s := v.ToString(); s != string(v.Raw()) {
@@ -382,6 +441,10 @@ func TestEncode(t *testing.T) {
 		in:       TestValue(VarChar, "\x00'\"\b\n\r\t\x1A\\"),
 		outSQL:   "'\\0\\'\\\"\\b\\n\\r\\t\\Z\\\\'",
 		outASCII: "'ACciCAoNCRpc'",
+	}, {
+		in:       TestValue(Bit, "a"),
+		outSQL:   "b'01100001'",
+		outASCII: "'YQ=='",
 	}}
 	for _, tcase := range testcases {
 		buf := &bytes.Buffer{}

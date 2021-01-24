@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,14 @@ limitations under the License.
 // Package services exposes all the services for the vtgateclienttest binary.
 package services
 
-import "github.com/youtube/vitess/go/vt/vtgate/vtgateservice"
+import (
+	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
+)
 
 // CreateServices creates the implementation chain of all the test cases
 func CreateServices() vtgateservice.VTGateService {
 	var s vtgateservice.VTGateService
 	s = newTerminalClient()
-	s = newSuccessClient(s)
 	s = newErrorClient(s)
 	s = newCallerIDClient(s)
 	s = newEchoClient(s)

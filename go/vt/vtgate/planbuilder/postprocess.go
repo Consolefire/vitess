@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,126 +17,132 @@ limitations under the License.
 package planbuilder
 
 import (
-	"errors"
-	"fmt"
-
-	"github.com/youtube/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // This file has functions to analyze postprocessing
 // clauses like ORDER BY, etc.
 
-// groupByHandler is a primitive that can handle a group by expression.
-type groupByHandler interface {
-	builder
-	// SetGroupBy makes the primitive handle the group by clause.
-	// The primitive may outsource some of its work to an underlying
-	// primitive that is also a groupByHandler (like a route).
-	SetGroupBy(sqlparser.GroupBy) error
-	// MakeDistinct makes the primitive handle the distinct clause.
-	MakeDistinct() error
-}
-
-// pushGroupBy processes the group by clause. It resolves all symbols,
+// pushGroupBy processes the group by clause. It resolves all symbols
 // and ensures that there are no subqueries.
-func pushGroupBy(sel *sqlparser.Select, bldr builder) error {
-	if sel.Distinct != "" {
-		// We can be here only if the builder could handle a group by.
-		if err := bldr.(groupByHandler).MakeDistinct(); err != nil {
+func (pb *primitiveBuilder) pushGroupBy(sel *sqlparser.Select) error {
+	if sel.Distinct {
+		newBuilder, err := planDistinct(pb.plan)
+		if err != nil {
 			return err
 		}
+		pb.plan = newBuilder
 	}
 
-	if len(sel.GroupBy) == 0 {
-		return nil
-	}
-	if err := bldr.Symtab().ResolveSymbols(sel.GroupBy); err != nil {
-		return fmt.Errorf("unsupported: in group by: %v", err)
+	if err := pb.st.ResolveSymbols(sel.GroupBy); err != nil {
+		return err
 	}
 
-	// We can be here only if the builder could handle a group by.
-	return bldr.(groupByHandler).SetGroupBy(sel.GroupBy)
-}
-
-// pushOrderBy pushes the order by clause to the appropriate route.
-// In the case of a join, it's only possible to push down if the
-// order by references columns of the left-most route. Otherwise, the
-// function returns an unsupported error.
-func pushOrderBy(orderBy sqlparser.OrderBy, bldr builder) error {
-	if oa, ok := bldr.(*orderedAggregate); ok {
-		return oa.PushOrderBy(orderBy)
+	newInput, err := planGroupBy(pb, pb.plan, sel.GroupBy)
+	if err != nil {
+		return err
 	}
+	pb.plan = newInput
 
-	switch len(orderBy) {
-	case 0:
-		return nil
-	case 1:
-		// Special handling for ORDER BY NULL. Push it everywhere.
-		if _, ok := orderBy[0].Expr.(*sqlparser.NullVal); ok {
-			bldr.PushOrderByNull()
-			return nil
-		}
-	}
-
-	leftmostRB, ok := bldr.Leftmost().(*route)
-	if !ok {
-		return errors.New("unsupported: cannot order by on a cross-shard subquery")
-	}
-	for _, order := range orderBy {
-		if node, ok := order.Expr.(*sqlparser.SQLVal); ok {
-			// This block handles constructs that use ordinals for 'ORDER BY'. For example:
-			// SELECT a, b, c FROM t1, t2 ORDER BY 1, 2, 3.
-			num, err := ResultFromNumber(bldr.Symtab().ResultColumns, node)
-			if err != nil {
-				return err
-			}
-			target := bldr.Symtab().ResultColumns[num].column.Origin()
-			if target != leftmostRB {
-				return errors.New("unsupported: order by spans across shards")
-			}
-		} else {
-			// Analyze column references within the expression to make sure they all
-			// go to the same route.
-			err := sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
-				switch node := node.(type) {
-				case *sqlparser.ColName:
-					target, _, err := bldr.Symtab().Find(node)
-					if err != nil {
-						return false, err
-					}
-					if target != leftmostRB {
-						return false, errors.New("unsupported: order by spans across shards")
-					}
-				case *sqlparser.Subquery:
-					return false, errors.New("unsupported: order by has subquery")
-				}
-				return true, nil
-			}, order.Expr)
-			if err != nil {
-				return err
-			}
-		}
-
-		// There were no errors. We can push the order by to the left-most route.
-		if err := leftmostRB.PushOrderBy(order); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-func pushLimit(limit *sqlparser.Limit, bldr builder) (builder, error) {
+// pushOrderBy pushes the order by clause into the primitives.
+// It resolves all symbols and ensures that there are no subqueries.
+func (pb *primitiveBuilder) pushOrderBy(orderBy sqlparser.OrderBy) error {
+	if err := pb.st.ResolveSymbols(orderBy); err != nil {
+		return err
+	}
+	plan, err := planOrdering(pb, pb.plan, orderBy)
+	if err != nil {
+		return err
+	}
+	pb.plan = plan
+	pb.plan.Reorder(0)
+	return nil
+}
+
+func (pb *primitiveBuilder) pushLimit(limit *sqlparser.Limit) error {
 	if limit == nil {
-		return bldr, nil
+		return nil
 	}
-	rb, ok := bldr.(*route)
-	if ok && rb.IsSingle() {
+	rb, ok := pb.plan.(*route)
+	if ok && rb.isSingleShard() {
 		rb.SetLimit(limit)
-		return bldr, nil
+		return nil
 	}
-	lb := newLimit(bldr)
-	if err := lb.SetLimit(limit); err != nil {
-		return nil, err
+
+	lb, err := createLimit(pb.plan, limit)
+	if err != nil {
+		return err
 	}
-	return lb, nil
+
+	plan, err := visit(lb, setUpperLimit)
+	if err != nil {
+		return err
+	}
+
+	pb.plan = plan
+	pb.plan.Reorder(0)
+	return nil
+}
+
+// make sure we have the right signature for this function
+var _ planVisitor = setUpperLimit
+
+// setUpperLimit is an optimization hint that tells that primitive
+// that it does not need to return more than the specified number of rows.
+// A primitive that cannot perform this can ignore the request.
+func setUpperLimit(plan logicalPlan) (bool, logicalPlan, error) {
+	arg := sqlparser.NewArgument([]byte(":__upper_limit"))
+	switch node := plan.(type) {
+	case *join:
+		return false, node, nil
+	case *memorySort:
+		pv, err := sqlparser.NewPlanValue(arg)
+		if err != nil {
+			return false, nil, err
+		}
+		node.eMemorySort.UpperLimit = pv
+		// we don't want to go down to the rest of the tree
+		return false, node, nil
+	case *pulloutSubquery:
+		// we control the visitation manually here -
+		// we don't want to visit the subQuery side of this plan
+		newUnderlying, err := visit(node.underlying, setUpperLimit)
+		if err != nil {
+			return false, nil, err
+		}
+
+		node.underlying = newUnderlying
+		return false, node, nil
+	case *route:
+		// The route pushes the limit regardless of the plan.
+		// If it's a scatter query, the rows returned will be
+		// more than the upper limit, but enough for the limit
+		node.Select.SetLimit(&sqlparser.Limit{Rowcount: arg})
+	case *concatenate:
+		return false, node, nil
+	}
+	return true, plan, nil
+}
+
+func createLimit(input logicalPlan, limit *sqlparser.Limit) (logicalPlan, error) {
+	plan := newLimit(input)
+	pv, err := sqlparser.NewPlanValue(limit.Rowcount)
+	if err != nil {
+		return nil, vterrors.Wrap(err, "unexpected expression in LIMIT")
+	}
+	plan.elimit.Count = pv
+
+	if limit.Offset != nil {
+		pv, err = sqlparser.NewPlanValue(limit.Offset)
+		if err != nil {
+			return nil, vterrors.Wrap(err, "unexpected expression in OFFSET")
+		}
+		plan.elimit.Offset = pv
+	}
+
+	return plan, nil
 }

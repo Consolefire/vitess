@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,20 +19,20 @@ package grpcvtworkerclient
 
 import (
 	"flag"
-	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"google.golang.org/grpc"
 
-	"github.com/youtube/vitess/go/vt/grpcclient"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/vterrors"
-	"github.com/youtube/vitess/go/vt/worker/vtworkerclient"
+	"vitess.io/vitess/go/vt/grpcclient"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/worker/vtworkerclient"
 
-	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
-	vtworkerdatapb "github.com/youtube/vitess/go/vt/proto/vtworkerdata"
-	vtworkerservicepb "github.com/youtube/vitess/go/vt/proto/vtworkerservice"
+	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	vtworkerdatapb "vitess.io/vitess/go/vt/proto/vtworkerdata"
+	vtworkerservicepb "vitess.io/vitess/go/vt/proto/vtworkerservice"
 )
 
 var (
@@ -47,13 +47,13 @@ type gRPCVtworkerClient struct {
 	c  vtworkerservicepb.VtworkerClient
 }
 
-func gRPCVtworkerClientFactory(addr string, dialTimeout time.Duration) (vtworkerclient.Client, error) {
+func gRPCVtworkerClientFactory(addr string) (vtworkerclient.Client, error) {
 	// create the RPC client
 	opt, err := grpcclient.SecureDialOption(*cert, *key, *ca, *name)
 	if err != nil {
 		return nil, err
 	}
-	cc, err := grpcclient.Dial(addr, opt, grpc.WithTimeout(dialTimeout))
+	cc, err := grpcclient.Dial(addr, grpcclient.FailFast(false), opt)
 	if err != nil {
 		return nil, vterrors.Errorf(vtrpcpb.Code_DEADLINE_EXCEEDED, "grpcclient.Dial() err: %v", err)
 	}

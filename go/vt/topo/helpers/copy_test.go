@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,27 +19,31 @@ package helpers
 import (
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
 
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
+	"context"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
-func createSetup(ctx context.Context, t *testing.T) (topo.Impl, topo.Impl) {
-	fromTS := memorytopo.New("test_cell")
-	toTS := memorytopo.New("test_cell")
+func createSetup(ctx context.Context, t *testing.T) (*topo.Server, *topo.Server) {
+	// Create a source and destination TS. They will have
+	// different generations, so we test using the Version for
+	// both works as expected.
+	fromTS := memorytopo.NewServer("test_cell")
+	toTS := memorytopo.NewServer("test_cell")
 
 	// create a keyspace and a couple tablets
 	if err := fromTS.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("cannot create keyspace: %v", err)
 	}
-	if err := fromTS.CreateShard(ctx, "test_keyspace", "0", &topodatapb.Shard{Cells: []string{"test_cell"}}); err != nil {
+	if err := fromTS.CreateShard(ctx, "test_keyspace", "0"); err != nil {
 		t.Fatalf("cannot create shard: %v", err)
 	}
-	tts := topo.Server{Impl: fromTS}
 	tablet1 := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
 			Cell: "test_cell",
@@ -57,8 +61,8 @@ func createSetup(ctx context.Context, t *testing.T) (topo.Impl, topo.Impl) {
 		DbNameOverride: "",
 		KeyRange:       nil,
 	}
-	topoproto.SetMysqlPort(tablet1, 3306)
-	if err := tts.CreateTablet(ctx, tablet1); err != nil {
+	tablet1.MysqlPort = 3306
+	if err := fromTS.CreateTablet(ctx, tablet1); err != nil {
 		t.Fatalf("cannot create master tablet: %v", err)
 	}
 	tablet2 := &topodatapb.Tablet{
@@ -70,8 +74,8 @@ func createSetup(ctx context.Context, t *testing.T) (topo.Impl, topo.Impl) {
 			"vt":   8101,
 			"grpc": 8102,
 		},
-		Hostname:      "slavehost",
-		MysqlHostname: "slavehost",
+		Hostname:      "replicahost",
+		MysqlHostname: "replicahost",
 
 		Keyspace:       "test_keyspace",
 		Shard:          "0",
@@ -79,9 +83,18 @@ func createSetup(ctx context.Context, t *testing.T) (topo.Impl, topo.Impl) {
 		DbNameOverride: "",
 		KeyRange:       nil,
 	}
-	topoproto.SetMysqlPort(tablet2, 3306)
-	if err := tts.CreateTablet(ctx, tablet2); err != nil {
-		t.Fatalf("cannot create slave tablet: %v", err)
+	tablet2.MysqlPort = 3306
+	err := fromTS.CreateTablet(ctx, tablet2)
+	require.NoError(t, err, "cannot create tablet: %v", tablet2)
+
+	rr := &vschemapb.RoutingRules{
+		Rules: []*vschemapb.RoutingRule{{
+			FromTable: "t1",
+			ToTables:  []string{"t2", "t3"},
+		}},
+	}
+	if err := fromTS.SaveRoutingRules(ctx, rr); err != nil {
+		t.Fatalf("cannot save routing rules: %v", err)
 	}
 
 	return fromTS, toTS
@@ -112,21 +125,14 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("unexpected shards: %v", shards)
 	}
 	CopyShards(ctx, fromTS, toTS)
-	s, _, err := toTS.GetShard(ctx, "test_keyspace", "0")
-	if err != nil {
-		t.Fatalf("cannot read shard: %v", err)
-	}
-	if len(s.Cells) != 1 || s.Cells[0] != "test_cell" {
-		t.Fatalf("bad shard data: %v", *s)
-	}
 
 	// check ShardReplication copy
-	sr, err := fromTS.GetShardReplication(ctx, "test_cell", "test_keyspace", "0")
+	_, err = fromTS.GetShardReplication(ctx, "test_cell", "test_keyspace", "0")
 	if err != nil {
 		t.Fatalf("fromTS.GetShardReplication failed: %v", err)
 	}
 	CopyShardReplications(ctx, fromTS, toTS)
-	sr, err = toTS.GetShardReplication(ctx, "test_cell", "test_keyspace", "0")
+	sr, err := toTS.GetShardReplication(ctx, "test_cell", "test_keyspace", "0")
 	if err != nil {
 		t.Fatalf("toTS.GetShardReplication failed: %v", err)
 	}

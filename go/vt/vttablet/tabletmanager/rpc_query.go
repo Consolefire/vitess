@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,19 @@ limitations under the License.
 package tabletmanager
 
 import (
-	"github.com/youtube/vitess/go/sqltypes"
-	"golang.org/x/net/context"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/sqlescape"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/log"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 // ExecuteFetchAsDba will execute the given query, possibly disabling binlogs and reload schema.
-func (agent *ActionAgent) ExecuteFetchAsDba(ctx context.Context, query []byte, dbName string, maxrows int, disableBinlogs bool, reloadSchema bool) (*querypb.QueryResult, error) {
+func (tm *TabletManager) ExecuteFetchAsDba(ctx context.Context, query []byte, dbName string, maxrows int, disableBinlogs bool, reloadSchema bool) (*querypb.QueryResult, error) {
 	// get a connection
-	conn, err := agent.MysqlDaemon.GetDbaConnection()
+	conn, err := tm.MysqlDaemon.GetDbaConnection(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +46,7 @@ func (agent *ActionAgent) ExecuteFetchAsDba(ctx context.Context, query []byte, d
 	if dbName != "" {
 		// This execute might fail if db does not exist.
 		// Error is ignored because given query might create this database.
-		conn.ExecuteFetch("USE "+dbName, 1, false)
+		conn.ExecuteFetch("USE "+sqlescape.EscapeID(dbName), 1, false)
 	}
 
 	// run the query
@@ -60,15 +63,18 @@ func (agent *ActionAgent) ExecuteFetchAsDba(ctx context.Context, query []byte, d
 	}
 
 	if err == nil && reloadSchema {
-		agent.QueryServiceControl.ReloadSchema(ctx)
+		reloadErr := tm.QueryServiceControl.ReloadSchema(ctx)
+		if reloadErr != nil {
+			log.Errorf("failed to reload the schema %v", reloadErr)
+		}
 	}
 	return sqltypes.ResultToProto3(result), err
 }
 
 // ExecuteFetchAsAllPrivs will execute the given query, possibly reloading schema.
-func (agent *ActionAgent) ExecuteFetchAsAllPrivs(ctx context.Context, query []byte, dbName string, maxrows int, reloadSchema bool) (*querypb.QueryResult, error) {
+func (tm *TabletManager) ExecuteFetchAsAllPrivs(ctx context.Context, query []byte, dbName string, maxrows int, reloadSchema bool) (*querypb.QueryResult, error) {
 	// get a connection
-	conn, err := agent.MysqlDaemon.GetAllPrivsConnection()
+	conn, err := tm.MysqlDaemon.GetAllPrivsConnection(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -77,22 +83,25 @@ func (agent *ActionAgent) ExecuteFetchAsAllPrivs(ctx context.Context, query []by
 	if dbName != "" {
 		// This execute might fail if db does not exist.
 		// Error is ignored because given query might create this database.
-		conn.ExecuteFetch("USE "+dbName, 1, false)
+		conn.ExecuteFetch("USE "+sqlescape.EscapeID(dbName), 1, false)
 	}
 
 	// run the query
 	result, err := conn.ExecuteFetch(string(query), maxrows, true /*wantFields*/)
 
 	if err == nil && reloadSchema {
-		agent.QueryServiceControl.ReloadSchema(ctx)
+		reloadErr := tm.QueryServiceControl.ReloadSchema(ctx)
+		if reloadErr != nil {
+			log.Errorf("failed to reload the schema %v", reloadErr)
+		}
 	}
 	return sqltypes.ResultToProto3(result), err
 }
 
 // ExecuteFetchAsApp will execute the given query.
-func (agent *ActionAgent) ExecuteFetchAsApp(ctx context.Context, query []byte, maxrows int) (*querypb.QueryResult, error) {
+func (tm *TabletManager) ExecuteFetchAsApp(ctx context.Context, query []byte, maxrows int) (*querypb.QueryResult, error) {
 	// get a connection
-	conn, err := agent.MysqlDaemon.GetAppConnection(ctx)
+	conn, err := tm.MysqlDaemon.GetAppConnection(ctx)
 	if err != nil {
 		return nil, err
 	}

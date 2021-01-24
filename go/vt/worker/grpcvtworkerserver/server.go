@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,16 +21,18 @@ of the remote execution of vtworker commands.
 package grpcvtworkerserver
 
 import (
+	"sync"
+
 	"google.golang.org/grpc"
 
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/vterrors"
-	"github.com/youtube/vitess/go/vt/worker"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/worker"
 
-	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
-	vtworkerdatapb "github.com/youtube/vitess/go/vt/proto/vtworkerdata"
-	vtworkerservicepb "github.com/youtube/vitess/go/vt/proto/vtworkerservice"
+	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
+	vtworkerdatapb "vitess.io/vitess/go/vt/proto/vtworkerdata"
+	vtworkerservicepb "vitess.io/vitess/go/vt/proto/vtworkerservice"
 )
 
 // VtworkerServer is our RPC server
@@ -45,16 +47,22 @@ func NewVtworkerServer(wi *worker.Instance) *VtworkerServer {
 
 // ExecuteVtworkerCommand is part of the vtworkerdatapb.VtworkerServer interface
 func (s *VtworkerServer) ExecuteVtworkerCommand(args *vtworkerdatapb.ExecuteVtworkerCommandRequest, stream vtworkerservicepb.Vtworker_ExecuteVtworkerCommandServer) (err error) {
-	// Please note that this panic handler catches only panics occuring in the code below.
+	// Please note that this panic handler catches only panics occurring in the code below.
 	// The actual execution of the vtworker command takes place in a new go routine
 	// (started in Instance.setAndStartWorker()) which has its own panic handler.
 	defer servenv.HandlePanic("vtworker", &err)
 
 	// Stream everything back what the Wrangler is logging.
+	// We may execute this in parallel (inside multiple go routines),
+	// but the stream.Send() method is not thread safe in gRPC.
+	// So use a mutex to protect it.
+	mu := sync.Mutex{}
 	logstream := logutil.NewCallbackLogger(func(e *logutilpb.Event) {
+		mu.Lock()
 		stream.Send(&vtworkerdatapb.ExecuteVtworkerCommandResponse{
 			Event: e,
 		})
+		mu.Unlock()
 	})
 	// Let the Wrangler also log everything to the console (and thereby
 	// effectively to a logfile) to make sure that any information or errors

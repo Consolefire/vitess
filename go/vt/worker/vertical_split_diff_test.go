@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,20 +22,22 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/mysqlctl/tmutils"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/vttablet/grpcqueryservice"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice/fakes"
-	"github.com/youtube/vitess/go/vt/wrangler"
-	"github.com/youtube/vitess/go/vt/wrangler/testlib"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vttablet/grpcqueryservice"
+	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
+	"vitess.io/vitess/go/vt/wrangler"
+	"vitess.io/vitess/go/vt/wrangler/testlib"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // verticalDiffTabletServer is a local QueryService implementation to
@@ -46,7 +48,7 @@ type verticalDiffTabletServer struct {
 	*fakes.StreamHealthQueryService
 }
 
-func (sq *verticalDiffTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error {
+func (sq *verticalDiffTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error {
 	if !strings.Contains(sql, "moving1") {
 		sq.t.Errorf("Vertical Split Diff operation should only operate on the 'moving1' table. query: %v", sql)
 	}
@@ -92,6 +94,12 @@ func (sq *verticalDiffTabletServer) StreamExecute(ctx context.Context, target *q
 // TODO(aaijazi): Create a test in which source and destination data does not match
 
 func TestVerticalSplitDiff(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ts := memorytopo.NewServer("cell1", "cell2")
 	ctx := context.Background()
 	wi := NewInstance(ts, "cell1", time.Second)
@@ -132,10 +140,10 @@ func TestVerticalSplitDiff(t *testing.T) {
 	wi.wr.SetSourceShards(ctx, "destination_ks", "0", []*topodatapb.TabletAlias{sourceRdonly1.Tablet.Alias}, []string{"moving.*", "view1"})
 
 	// add the topo and schema data we'll need
-	if err := wi.wr.RebuildKeyspaceGraph(ctx, "source_ks", nil); err != nil {
+	if err := wi.wr.RebuildKeyspaceGraph(ctx, "source_ks", nil, false); err != nil {
 		t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
-	if err := wi.wr.RebuildKeyspaceGraph(ctx, "destination_ks", nil); err != nil {
+	if err := wi.wr.RebuildKeyspaceGraph(ctx, "destination_ks", nil, false); err != nil {
 		t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
 
@@ -172,6 +180,7 @@ func TestVerticalSplitDiff(t *testing.T) {
 		qs.AddDefaultHealthResponse()
 		grpcqueryservice.Register(rdonly.RPCServer, &verticalDiffTabletServer{
 			t: t,
+
 			StreamHealthQueryService: qs,
 		})
 	}

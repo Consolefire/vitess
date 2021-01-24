@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,19 +26,25 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vtctl"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/wrangler"
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/cmd"
+
+	"context"
+
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtctl"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/workflow"
+	"vitess.io/vitess/go/vt/wrangler"
 )
 
 var (
-	waitTime = flag.Duration("wait-time", 24*time.Hour, "time to wait on an action")
+	waitTime     = flag.Duration("wait-time", 24*time.Hour, "time to wait on an action")
+	detachedMode = flag.Bool("detach", false, "detached mode - run vtcl detached from the terminal")
 )
 
 func init() {
@@ -68,19 +74,12 @@ func main() {
 	defer exit.RecoverAll()
 	defer logutil.Flush()
 
-	flag.Parse()
-	args := flag.Args()
-
-	if *servenv.Version {
-		servenv.AppVersion.Print()
-		os.Exit(0)
+	if *detachedMode {
+		// this method will call os.Exit and kill this process
+		cmd.DetachFromTerminalAndExit()
 	}
 
-	if len(args) == 0 {
-		flag.Usage()
-		exit.Return(1)
-	}
-
+	args := servenv.ParseFlagsWithArgs("vtctl")
 	action := args[0]
 
 	startMsg := fmt.Sprintf("USER=%v SUDO_USER=%v %v", os.Getenv("USER"), os.Getenv("SUDO_USER"), strings.Join(os.Args, " "))
@@ -91,10 +90,15 @@ func main() {
 		log.Warningf("cannot connect to syslog: %v", err)
 	}
 
+	closer := trace.StartTracing("vtctl")
+	defer trace.LogErrorsWhenClosing(closer)
+
 	servenv.FireRunHooks()
 
 	ts := topo.Open()
 	defer ts.Close()
+
+	vtctl.WorkflowManager = workflow.NewManager(ts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())

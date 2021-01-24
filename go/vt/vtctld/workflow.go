@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -20,17 +20,19 @@ import (
 	"flag"
 	"time"
 
-	log "github.com/golang/glog"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/flagutil"
-	"github.com/youtube/vitess/go/vt/schemamanager/schemaswap"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vtctl"
-	"github.com/youtube/vitess/go/vt/workflow"
-	"github.com/youtube/vitess/go/vt/workflow/resharding"
-	"github.com/youtube/vitess/go/vt/workflow/topovalidator"
+	"vitess.io/vitess/go/trace"
+
+	"vitess.io/vitess/go/flagutil"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtctl"
+	"vitess.io/vitess/go/vt/workflow"
+	"vitess.io/vitess/go/vt/workflow/resharding"
+	"vitess.io/vitess/go/vt/workflow/reshardingworkflowgen"
+	"vitess.io/vitess/go/vt/workflow/topovalidator"
 )
 
 var (
@@ -43,7 +45,7 @@ func init() {
 	flag.Var(&workflowManagerDisable, "workflow_manager_disable", "comma separated list of workflow types to disable")
 }
 
-func initWorkflowManager(ts topo.Server) {
+func initWorkflowManager(ts *topo.Server) {
 	if *workflowManagerInit {
 		// Uncomment this line to register the UI test validator.
 		// topovalidator.RegisterUITestValidator()
@@ -53,11 +55,11 @@ func initWorkflowManager(ts topo.Server) {
 		topovalidator.RegisterShardValidator()
 		topovalidator.Register()
 
-		// Register the Schema Swap workflow.
-		schemaswap.RegisterWorkflowFactory()
-
 		// Register the Horizontal Resharding workflow.
 		resharding.Register()
+
+		// Register workflow that generates Horizontal Resharding workflows.
+		reshardingworkflowgen.Register()
 
 		// Unregister the blacklisted workflows.
 		for _, name := range workflowManagerDisable {
@@ -89,14 +91,22 @@ func runWorkflowManagerAlone() {
 	servenv.OnTermSync(cancel)
 }
 
-func runWorkflowManagerElection(ts topo.Server) {
+func runWorkflowManagerElection(ts *topo.Server) {
 	var mp topo.MasterParticipation
 
 	// We use servenv.ListeningURL which is only populated during Run,
 	// so we have to start this with OnRun.
 	servenv.OnRun(func() {
-		var err error
-		mp, err = ts.NewMasterParticipation("vtctld", servenv.ListeningURL.Host)
+		span, ctx := trace.NewSpan(context.Background(), "WorkflowManagerElection")
+		defer span.Finish()
+
+		conn, err := ts.ConnForCell(ctx, topo.GlobalCell)
+		if err != nil {
+			log.Errorf("Cannot get global cell topo connection, disabling workflow manager: %v", err)
+			return
+		}
+
+		mp, err = conn.NewMasterParticipation("vtctld", servenv.ListeningURL.Host)
 		if err != nil {
 			log.Errorf("Cannot start MasterParticipation, disabling workflow manager: %v", err)
 			return
@@ -112,10 +122,10 @@ func runWorkflowManagerElection(ts topo.Server) {
 		go func() {
 			for {
 				ctx, err := mp.WaitForMastership()
-				switch err {
-				case nil:
+				switch {
+				case err == nil:
 					vtctl.WorkflowManager.Run(ctx)
-				case topo.ErrInterrupted:
+				case topo.IsErrType(err, topo.Interrupted):
 					return
 				default:
 					log.Errorf("Got error while waiting for master, will retry in 5s: %v", err)

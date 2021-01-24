@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,17 +19,17 @@ package throttler
 import (
 	"time"
 
-	"github.com/youtube/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/discovery"
 )
 
 // replicationLagRecord stores the tablet health data for a given point in time.
-// This data is obtained via the HealthCheck module.
+// This data is obtained via the LegacyHealthCheck module.
 type replicationLagRecord struct {
 	// time is the time at which "value" was observed.
 	time time.Time
 
-	// TabletStats holds a copy of the current health data of the tablet.
-	discovery.TabletStats
+	// LegacyTabletStats holds a copy of the current health data of the tablet.
+	discovery.LegacyTabletStats
 }
 
 func (r replicationLagRecord) isZero() bool {

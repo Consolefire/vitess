@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,16 +20,15 @@ import (
 	"fmt"
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/key"
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
-	vschemapb "github.com/youtube/vitess/go/vt/proto/vschema"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
-// ExplainTopo satisfies the SrvTopoServer interface.
+// ExplainTopo satisfies the srvtopo.Server interface.
 // Modeled after the vtgate test sandboxTopo
 type ExplainTopo struct {
 	// Map of keyspace name to vschema
@@ -38,11 +37,15 @@ type ExplainTopo struct {
 	// Map of ks/shard to test tablet connection
 	TabletConns map[string]*explainTablet
 
+	KeyspaceShards map[string]map[string]*topodatapb.ShardReference
+
 	// Synchronization lock
 	Lock sync.Mutex
 
 	// Number of shards for sharded keyspaces
 	NumShards int
+
+	TopoServer *topo.Server
 }
 
 func (et *ExplainTopo) getSrvVSchema() *vschemapb.SrvVSchema {
@@ -54,8 +57,13 @@ func (et *ExplainTopo) getSrvVSchema() *vschemapb.SrvVSchema {
 	}
 }
 
-// GetSrvKeyspaceNames is part of SrvTopoServer.
-func (et *ExplainTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error) {
+// GetTopoServer is part of the srvtopo.Server interface
+func (et *ExplainTopo) GetTopoServer() (*topo.Server, error) {
+	return et.TopoServer, nil
+}
+
+// GetSrvKeyspaceNames is part of the srvtopo.Server interface.
+func (et *ExplainTopo) GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error) {
 	et.Lock.Lock()
 	defer et.Lock.Unlock()
 
@@ -66,7 +74,7 @@ func (et *ExplainTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([]
 	return keyspaces, nil
 }
 
-// GetSrvKeyspace is part of SrvTopoServer.
+// GetSrvKeyspace is part of the srvtopo.Server interface.
 func (et *ExplainTopo) GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error) {
 	et.Lock.Lock()
 	defer et.Lock.Unlock()
@@ -76,76 +84,37 @@ func (et *ExplainTopo) GetSrvKeyspace(ctx context.Context, cell, keyspace string
 		return nil, fmt.Errorf("no vschema for keyspace %s", keyspace)
 	}
 
-	var srvKeyspace *topodatapb.SrvKeyspace
+	shards := make([]*topodatapb.ShardReference, 0, len(et.KeyspaceShards[keyspace]))
+	for _, shard := range et.KeyspaceShards[keyspace] {
+		shards = append(shards, shard)
+	}
+
+	srvKeyspace := &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType:      topodatapb.TabletType_MASTER,
+				ShardReferences: shards,
+			},
+			{
+				ServedType:      topodatapb.TabletType_REPLICA,
+				ShardReferences: shards,
+			},
+			{
+				ServedType:      topodatapb.TabletType_RDONLY,
+				ShardReferences: shards,
+			},
+		},
+	}
+
 	if vschema.Sharded {
-		shards := make([]*topodatapb.ShardReference, 0, et.NumShards)
-		for i := 0; i < et.NumShards; i++ {
-			kr, err := key.EvenShardsKeyRange(i, et.NumShards)
-			if err != nil {
-				return nil, err
-			}
-
-			shard := &topodatapb.ShardReference{
-				Name:     key.KeyRangeString(kr),
-				KeyRange: kr,
-			}
-			shards = append(shards, shard)
-		}
-
-		srvKeyspace = &topodatapb.SrvKeyspace{
-			ShardingColumnName: "", // exact value is ignored
-			ShardingColumnType: 0,
-			Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
-				{
-					ServedType:      topodatapb.TabletType_MASTER,
-					ShardReferences: shards,
-				},
-				{
-					ServedType:      topodatapb.TabletType_REPLICA,
-					ShardReferences: shards,
-				},
-				{
-					ServedType:      topodatapb.TabletType_RDONLY,
-					ShardReferences: shards,
-				},
-			},
-		}
-
-	} else {
-		// unsharded
-		kr, err := key.EvenShardsKeyRange(0, 1)
-		if err != nil {
-			return nil, err
-		}
-
-		shard := &topodatapb.ShardReference{
-			Name: key.KeyRangeString(kr),
-		}
-
-		srvKeyspace = &topodatapb.SrvKeyspace{
-			Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
-				{
-					ServedType:      topodatapb.TabletType_MASTER,
-					ShardReferences: []*topodatapb.ShardReference{shard},
-				},
-				{
-					ServedType:      topodatapb.TabletType_REPLICA,
-					ShardReferences: []*topodatapb.ShardReference{shard},
-				},
-				{
-					ServedType:      topodatapb.TabletType_RDONLY,
-					ShardReferences: []*topodatapb.ShardReference{shard},
-				},
-			},
-		}
+		srvKeyspace.ShardingColumnName = "" // exact value is ignored
+		srvKeyspace.ShardingColumnType = 0
 	}
 
 	return srvKeyspace, nil
 }
 
-// WatchSrvVSchema is part of SrvTopoServer.
-func (et *ExplainTopo) WatchSrvVSchema(ctx context.Context, cell string) (*topo.WatchSrvVSchemaData, <-chan *topo.WatchSrvVSchemaData, topo.CancelFunc) {
-	return &topo.WatchSrvVSchemaData{
-		Value: et.getSrvVSchema(),
-	}, make(chan *topo.WatchSrvVSchemaData), func() {}
+// WatchSrvVSchema is part of the srvtopo.Server interface.
+func (et *ExplainTopo) WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error)) {
+	callback(et.getSrvVSchema(), nil)
 }

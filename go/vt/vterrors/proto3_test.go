@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,11 @@ limitations under the License.
 package vterrors
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
 
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 func TestFromVtRPCError(t *testing.T) {
@@ -54,8 +53,8 @@ func TestFromVtRPCError(t *testing.T) {
 	}}
 	for _, tcase := range testcases {
 		got := FromVTRPC(tcase.in)
-		if !reflect.DeepEqual(got, tcase.want) {
-			t.Errorf("FromVtRPCError(%v): %v, want %v", tcase.in, got, tcase.want)
+		if !Equals(got, tcase.want) {
+			t.Errorf("FromVtRPCError(%v): [%v], want [%v]", tcase.in, got, tcase.want)
 		}
 	}
 }

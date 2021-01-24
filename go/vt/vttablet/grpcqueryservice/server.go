@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,15 +19,17 @@ package grpcqueryservice
 import (
 	"google.golang.org/grpc"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/callerid"
-	"github.com/youtube/vitess/go/vt/callinfo"
-	"github.com/youtube/vitess/go/vt/vterrors"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice"
-	"golang.org/x/net/context"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	queryservicepb "github.com/youtube/vitess/go/vt/proto/queryservice"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/callinfo"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/queryservice"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	queryservicepb "vitess.io/vitess/go/vt/proto/queryservice"
 )
 
 // query is the gRPC query service implementation.
@@ -36,6 +38,8 @@ type query struct {
 	server queryservice.QueryService
 }
 
+var _ queryservicepb.QueryServer = (*query)(nil)
+
 // Execute is part of the queryservice.QueryServer interface
 func (q *query) Execute(ctx context.Context, request *querypb.ExecuteRequest) (response *querypb.ExecuteResponse, err error) {
 	defer q.server.HandlePanic(&err)
@@ -43,7 +47,7 @@ func (q *query) Execute(ctx context.Context, request *querypb.ExecuteRequest) (r
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-	result, err := q.server.Execute(ctx, request.Target, request.Query.Sql, request.Query.BindVariables, request.TransactionId, request.Options)
+	result, err := q.server.Execute(ctx, request.Target, request.Query.Sql, request.Query.BindVariables, request.TransactionId, request.ReservedId, request.Options)
 	if err != nil {
 		return nil, vterrors.ToGRPC(err)
 	}
@@ -75,14 +79,12 @@ func (q *query) StreamExecute(request *querypb.StreamExecuteRequest, stream quer
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-	if err := q.server.StreamExecute(ctx, request.Target, request.Query.Sql, request.Query.BindVariables, request.Options, func(reply *sqltypes.Result) error {
+	err = q.server.StreamExecute(ctx, request.Target, request.Query.Sql, request.Query.BindVariables, request.TransactionId, request.Options, func(reply *sqltypes.Result) error {
 		return stream.Send(&querypb.StreamExecuteResponse{
 			Result: sqltypes.ResultToProto3(reply),
 		})
-	}); err != nil {
-		return vterrors.ToGRPC(err)
-	}
-	return nil
+	})
+	return vterrors.ToGRPC(err)
 }
 
 // Begin is part of the queryservice.QueryServer interface
@@ -92,13 +94,14 @@ func (q *query) Begin(ctx context.Context, request *querypb.BeginRequest) (respo
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-	transactionID, err := q.server.Begin(ctx, request.Target, request.Options)
+	transactionID, alias, err := q.server.Begin(ctx, request.Target, request.Options)
 	if err != nil {
 		return nil, vterrors.ToGRPC(err)
 	}
 
 	return &querypb.BeginResponse{
 		TransactionId: transactionID,
+		TabletAlias:   alias,
 	}, nil
 }
 
@@ -109,10 +112,11 @@ func (q *query) Commit(ctx context.Context, request *querypb.CommitRequest) (res
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-	if err := q.server.Commit(ctx, request.Target, request.TransactionId); err != nil {
+	rID, err := q.server.Commit(ctx, request.Target, request.TransactionId)
+	if err != nil {
 		return nil, vterrors.ToGRPC(err)
 	}
-	return &querypb.CommitResponse{}, nil
+	return &querypb.CommitResponse{ReservedId: rID}, nil
 }
 
 // Rollback is part of the queryservice.QueryServer interface
@@ -122,11 +126,12 @@ func (q *query) Rollback(ctx context.Context, request *querypb.RollbackRequest) 
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-	if err := q.server.Rollback(ctx, request.Target, request.TransactionId); err != nil {
+	rID, err := q.server.Rollback(ctx, request.Target, request.TransactionId)
+	if err != nil {
 		return nil, vterrors.ToGRPC(err)
 	}
 
-	return &querypb.RollbackResponse{}, nil
+	return &querypb.RollbackResponse{ReservedId: rID}, nil
 }
 
 // Prepare is part of the queryservice.QueryServer interface
@@ -249,14 +254,14 @@ func (q *query) BeginExecute(ctx context.Context, request *querypb.BeginExecuteR
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-
-	result, transactionID, err := q.server.BeginExecute(ctx, request.Target, request.Query.Sql, request.Query.BindVariables, request.Options)
+	result, transactionID, alias, err := q.server.BeginExecute(ctx, request.Target, request.PreQueries, request.Query.Sql, request.Query.BindVariables, request.ReservedId, request.Options)
 	if err != nil {
 		// if we have a valid transactionID, return the error in-band
 		if transactionID != 0 {
 			return &querypb.BeginExecuteResponse{
 				Error:         vterrors.ToVTRPC(err),
 				TransactionId: transactionID,
+				TabletAlias:   alias,
 			}, nil
 		}
 		return nil, vterrors.ToGRPC(err)
@@ -264,6 +269,7 @@ func (q *query) BeginExecute(ctx context.Context, request *querypb.BeginExecuteR
 	return &querypb.BeginExecuteResponse{
 		Result:        sqltypes.ResultToProto3(result),
 		TransactionId: transactionID,
+		TabletAlias:   alias,
 	}, nil
 }
 
@@ -274,14 +280,14 @@ func (q *query) BeginExecuteBatch(ctx context.Context, request *querypb.BeginExe
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-
-	results, transactionID, err := q.server.BeginExecuteBatch(ctx, request.Target, request.Queries, request.AsTransaction, request.Options)
+	results, transactionID, alias, err := q.server.BeginExecuteBatch(ctx, request.Target, request.Queries, request.AsTransaction, request.Options)
 	if err != nil {
 		// if we have a valid transactionID, return the error in-band
 		if transactionID != 0 {
 			return &querypb.BeginExecuteBatchResponse{
 				Error:         vterrors.ToVTRPC(err),
 				TransactionId: transactionID,
+				TabletAlias:   alias,
 			}, nil
 		}
 		return nil, vterrors.ToGRPC(err)
@@ -289,6 +295,7 @@ func (q *query) BeginExecuteBatch(ctx context.Context, request *querypb.BeginExe
 	return &querypb.BeginExecuteBatchResponse{
 		Results:       sqltypes.ResultsToProto3(results),
 		TransactionId: transactionID,
+		TabletAlias:   alias,
 	}, nil
 }
 
@@ -299,14 +306,12 @@ func (q *query) MessageStream(request *querypb.MessageStreamRequest, stream quer
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-	if err := q.server.MessageStream(ctx, request.Target, request.Name, func(qr *sqltypes.Result) error {
+	err = q.server.MessageStream(ctx, request.Target, request.Name, func(qr *sqltypes.Result) error {
 		return stream.Send(&querypb.MessageStreamResponse{
 			Result: sqltypes.ResultToProto3(qr),
 		})
-	}); err != nil {
-		return vterrors.ToGRPC(err)
-	}
-	return nil
+	})
+	return vterrors.ToGRPC(err)
 }
 
 // MessageAck is part of the queryservice.QueryServer interface
@@ -327,52 +332,116 @@ func (q *query) MessageAck(ctx context.Context, request *querypb.MessageAckReque
 	}, nil
 }
 
-// SplitQuery is part of the queryservice.QueryServer interface
-func (q *query) SplitQuery(ctx context.Context, request *querypb.SplitQueryRequest) (response *querypb.SplitQueryResponse, err error) {
-	defer q.server.HandlePanic(&err)
-	ctx = callerid.NewContext(callinfo.GRPCCallInfo(ctx),
-		request.EffectiveCallerId,
-		request.ImmediateCallerId,
-	)
-	splits := []*querypb.QuerySplit{}
-	splits, err = q.server.SplitQuery(
-		ctx,
-		request.Target,
-		request.Query,
-		request.SplitColumn,
-		request.SplitCount,
-		request.NumRowsPerQueryPart,
-		request.Algorithm)
-	if err != nil {
-		return nil, vterrors.ToGRPC(err)
-	}
-	return &querypb.SplitQueryResponse{Queries: splits}, nil
-}
-
 // StreamHealth is part of the queryservice.QueryServer interface
 func (q *query) StreamHealth(request *querypb.StreamHealthRequest, stream queryservicepb.Query_StreamHealthServer) (err error) {
 	defer q.server.HandlePanic(&err)
-	if err = q.server.StreamHealth(stream.Context(), stream.Send); err != nil {
-		return vterrors.ToGRPC(err)
-	}
-	return nil
+	err = q.server.StreamHealth(stream.Context(), stream.Send)
+	return vterrors.ToGRPC(err)
 }
 
-// UpdateStream is part of the queryservice.QueryServer interface
-func (q *query) UpdateStream(request *querypb.UpdateStreamRequest, stream queryservicepb.Query_UpdateStreamServer) (err error) {
+// VStream is part of the queryservice.QueryServer interface
+func (q *query) VStream(request *binlogdatapb.VStreamRequest, stream queryservicepb.Query_VStreamServer) (err error) {
 	defer q.server.HandlePanic(&err)
 	ctx := callerid.NewContext(callinfo.GRPCCallInfo(stream.Context()),
 		request.EffectiveCallerId,
 		request.ImmediateCallerId,
 	)
-	if err := q.server.UpdateStream(ctx, request.Target, request.Position, request.Timestamp, func(reply *querypb.StreamEvent) error {
-		return stream.Send(&querypb.UpdateStreamResponse{
-			Event: reply,
+	err = q.server.VStream(ctx, request.Target, request.Position, request.TableLastPKs, request.Filter, func(events []*binlogdatapb.VEvent) error {
+		return stream.Send(&binlogdatapb.VStreamResponse{
+			Events: events,
 		})
-	}); err != nil {
-		return vterrors.ToGRPC(err)
+	})
+	return vterrors.ToGRPC(err)
+}
+
+// VStreamRows is part of the queryservice.QueryServer interface
+func (q *query) VStreamRows(request *binlogdatapb.VStreamRowsRequest, stream queryservicepb.Query_VStreamRowsServer) (err error) {
+	defer q.server.HandlePanic(&err)
+	ctx := callerid.NewContext(callinfo.GRPCCallInfo(stream.Context()),
+		request.EffectiveCallerId,
+		request.ImmediateCallerId,
+	)
+	err = q.server.VStreamRows(ctx, request.Target, request.Query, request.Lastpk, stream.Send)
+	return vterrors.ToGRPC(err)
+}
+
+// VStreamResults is part of the queryservice.QueryServer interface
+func (q *query) VStreamResults(request *binlogdatapb.VStreamResultsRequest, stream queryservicepb.Query_VStreamResultsServer) (err error) {
+	defer q.server.HandlePanic(&err)
+	ctx := callerid.NewContext(callinfo.GRPCCallInfo(stream.Context()),
+		request.EffectiveCallerId,
+		request.ImmediateCallerId,
+	)
+	err = q.server.VStreamResults(ctx, request.Target, request.Query, stream.Send)
+	return vterrors.ToGRPC(err)
+}
+
+//ReserveExecute implements the QueryServer interface
+func (q *query) ReserveExecute(ctx context.Context, request *querypb.ReserveExecuteRequest) (response *querypb.ReserveExecuteResponse, err error) {
+	defer q.server.HandlePanic(&err)
+	ctx = callerid.NewContext(callinfo.GRPCCallInfo(ctx),
+		request.EffectiveCallerId,
+		request.ImmediateCallerId,
+	)
+	result, reservedID, alias, err := q.server.ReserveExecute(ctx, request.Target, request.PreQueries, request.Query.Sql, request.Query.BindVariables, request.TransactionId, request.Options)
+	if err != nil {
+		// if we have a valid reservedID, return the error in-band
+		if reservedID != 0 {
+			return &querypb.ReserveExecuteResponse{
+				Error:       vterrors.ToVTRPC(err),
+				ReservedId:  reservedID,
+				TabletAlias: alias,
+			}, nil
+		}
+		return nil, vterrors.ToGRPC(err)
 	}
-	return nil
+	return &querypb.ReserveExecuteResponse{
+		Result:      sqltypes.ResultToProto3(result),
+		ReservedId:  reservedID,
+		TabletAlias: alias,
+	}, nil
+}
+
+//ReserveBeginExecute implements the QueryServer interface
+func (q *query) ReserveBeginExecute(ctx context.Context, request *querypb.ReserveBeginExecuteRequest) (response *querypb.ReserveBeginExecuteResponse, err error) {
+	defer q.server.HandlePanic(&err)
+	ctx = callerid.NewContext(callinfo.GRPCCallInfo(ctx),
+		request.EffectiveCallerId,
+		request.ImmediateCallerId,
+	)
+	result, transactionID, reservedID, alias, err := q.server.ReserveBeginExecute(ctx, request.Target, request.PreQueries, request.Query.Sql, request.Query.BindVariables, request.Options)
+	if err != nil {
+		// if we have a valid reservedID, return the error in-band
+		if reservedID != 0 {
+			return &querypb.ReserveBeginExecuteResponse{
+				Error:         vterrors.ToVTRPC(err),
+				TransactionId: transactionID,
+				ReservedId:    reservedID,
+				TabletAlias:   alias,
+			}, nil
+		}
+		return nil, vterrors.ToGRPC(err)
+	}
+	return &querypb.ReserveBeginExecuteResponse{
+		Result:        sqltypes.ResultToProto3(result),
+		TransactionId: transactionID,
+		ReservedId:    reservedID,
+		TabletAlias:   alias,
+	}, nil
+}
+
+//Release implements the QueryServer interface
+func (q *query) Release(ctx context.Context, request *querypb.ReleaseRequest) (response *querypb.ReleaseResponse, err error) {
+	defer q.server.HandlePanic(&err)
+	ctx = callerid.NewContext(callinfo.GRPCCallInfo(ctx),
+		request.EffectiveCallerId,
+		request.ImmediateCallerId,
+	)
+	err = q.server.Release(ctx, request.Target, request.TransactionId, request.ReservedId)
+	if err != nil {
+		return nil, vterrors.ToGRPC(err)
+	}
+	return &querypb.ReleaseResponse{}, nil
 }
 
 // Register registers the implementation on the provide gRPC Server.

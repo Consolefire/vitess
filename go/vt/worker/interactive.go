@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,11 @@ import (
 	"html/template"
 	"net/http"
 
-	"golang.org/x/net/context"
+	"context"
 
-	log "github.com/golang/glog"
-
-	"github.com/youtube/vitess/go/acl"
-	"github.com/youtube/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/acl"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 const indexHTML = `
@@ -58,8 +57,8 @@ const subIndexHTML = `
 `
 
 func httpError(w http.ResponseWriter, format string, args ...interface{}) {
-	log.Errorf(format, args)
-	http.Error(w, fmt.Sprintf(format, args), http.StatusInternalServerError)
+	log.Errorf(format, args...)
+	http.Error(w, fmt.Sprintf(format, args...), http.StatusInternalServerError)
 }
 
 func mustParseTemplate(name, contents string) *template.Template {
@@ -73,7 +72,7 @@ func mustParseTemplate(name, contents string) *template.Template {
 
 func executeTemplate(w http.ResponseWriter, t *template.Template, data interface{}) {
 	if err := t.Execute(w, data); err != nil {
-		httpError(w, "error executing template", err)
+		httpError(w, "error executing template: %v", err)
 	}
 }
 

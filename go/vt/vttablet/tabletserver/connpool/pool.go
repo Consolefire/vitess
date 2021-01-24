@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,34 +20,23 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/pools"
-	"github.com/youtube/vitess/go/stats"
-	"github.com/youtube/vitess/go/vt/callerid"
-	"github.com/youtube/vitess/go/vt/dbconnpool"
-	"github.com/youtube/vitess/go/vt/vterrors"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/pools"
+	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/dbconnpool"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 // ErrConnPoolClosed is returned when the connection pool is closed.
 var ErrConnPoolClosed = vterrors.New(vtrpcpb.Code_INTERNAL, "internal error: unexpected: conn pool is closed")
-
-// usedNames is for preventing expvar from panicking. Tests
-// create pool objects multiple time. If a name was previously
-// used, expvar initialization is skipped.
-// TODO(sougou): Find a way to still crash if this happened
-// through non-test code.
-var usedNames = make(map[string]bool)
-
-// MySQLChecker defines the CheckMySQL interface that lower
-// level objects can use to call back into TabletServer.
-type MySQLChecker interface {
-	CheckMySQL()
-}
 
 // Pool implements a custom connection pool for tabletserver.
 // It's similar to dbconnpool.ConnPool, but the connections it creates
@@ -56,38 +45,47 @@ type MySQLChecker interface {
 // Other than the connection type, ConnPool maintains an additional
 // pool of dba connections that are used to kill connections.
 type Pool struct {
-	mu             sync.Mutex
-	connections    *pools.ResourcePool
-	capacity       int
-	idleTimeout    time.Duration
-	dbaPool        *dbconnpool.ConnectionPool
-	checker        MySQLChecker
-	appDebugParams *mysql.ConnParams
+	env                tabletenv.Env
+	name               string
+	mu                 sync.Mutex
+	connections        *pools.ResourcePool
+	capacity           int
+	prefillParallelism int
+	timeout            time.Duration
+	idleTimeout        time.Duration
+	waiterCap          int64
+	waiterCount        sync2.AtomicInt64
+	dbaPool            *dbconnpool.ConnectionPool
+	appDebugParams     dbconfigs.Connector
 }
 
-// New creates a new Pool. The name is used
+// NewPool creates a new Pool. The name is used
 // to publish stats only.
-func New(
-	name string,
-	capacity int,
-	idleTimeout time.Duration,
-	checker MySQLChecker) *Pool {
+func NewPool(env tabletenv.Env, name string, cfg tabletenv.ConnPoolConfig) *Pool {
+	idleTimeout := cfg.IdleTimeoutSeconds.Get()
 	cp := &Pool{
-		capacity:    capacity,
-		idleTimeout: idleTimeout,
-		dbaPool:     dbconnpool.NewConnectionPool("", 1, idleTimeout),
-		checker:     checker,
+		env:                env,
+		name:               name,
+		capacity:           cfg.Size,
+		prefillParallelism: cfg.PrefillParallelism,
+		timeout:            cfg.TimeoutSeconds.Get(),
+		idleTimeout:        idleTimeout,
+		waiterCap:          int64(cfg.MaxWaiters),
+		dbaPool:            dbconnpool.NewConnectionPool("", 1, idleTimeout, 0),
 	}
-	if name == "" || usedNames[name] {
+	if name == "" {
 		return cp
 	}
-	usedNames[name] = true
-	stats.Publish(name+"Capacity", stats.IntFunc(cp.Capacity))
-	stats.Publish(name+"Available", stats.IntFunc(cp.Available))
-	stats.Publish(name+"MaxCap", stats.IntFunc(cp.MaxCap))
-	stats.Publish(name+"WaitCount", stats.IntFunc(cp.WaitCount))
-	stats.Publish(name+"WaitTime", stats.DurationFunc(cp.WaitTime))
-	stats.Publish(name+"IdleTimeout", stats.DurationFunc(cp.IdleTimeout))
+	env.Exporter().NewGaugeFunc(name+"Capacity", "Tablet server conn pool capacity", cp.Capacity)
+	env.Exporter().NewGaugeFunc(name+"Available", "Tablet server conn pool available", cp.Available)
+	env.Exporter().NewGaugeFunc(name+"Active", "Tablet server conn pool active", cp.Active)
+	env.Exporter().NewGaugeFunc(name+"InUse", "Tablet server conn pool in use", cp.InUse)
+	env.Exporter().NewGaugeFunc(name+"MaxCap", "Tablet server conn pool max cap", cp.MaxCap)
+	env.Exporter().NewCounterFunc(name+"WaitCount", "Tablet server conn pool wait count", cp.WaitCount)
+	env.Exporter().NewCounterDurationFunc(name+"WaitTime", "Tablet server wait time", cp.WaitTime)
+	env.Exporter().NewGaugeDurationFunc(name+"IdleTimeout", "Tablet server idle timeout", cp.IdleTimeout)
+	env.Exporter().NewCounterFunc(name+"IdleClosed", "Tablet server conn pool idle closed", cp.IdleClosed)
+	env.Exporter().NewCounterFunc(name+"Exhausted", "Number of times pool had zero available slots", cp.Exhausted)
 	return cp
 }
 
@@ -99,17 +97,31 @@ func (cp *Pool) pool() (p *pools.ResourcePool) {
 }
 
 // Open must be called before starting to use the pool.
-func (cp *Pool) Open(appParams, dbaParams, appDebugParams *mysql.ConnParams) {
+func (cp *Pool) Open(appParams, dbaParams, appDebugParams dbconfigs.Connector) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
-	f := func() (pools.Resource, error) {
-		return NewDBConn(cp, appParams)
+	if cp.prefillParallelism != 0 {
+		log.Infof("Opening pool: '%s'", cp.name)
+		defer log.Infof("Done opening pool: '%s'", cp.name)
 	}
-	cp.connections = pools.NewResourcePool(f, cp.capacity, cp.capacity, cp.idleTimeout)
+
+	f := func(ctx context.Context) (pools.Resource, error) {
+		return NewDBConn(ctx, cp, appParams)
+	}
+	cp.connections = pools.NewResourcePool(f, cp.capacity, cp.capacity, cp.idleTimeout, cp.prefillParallelism, cp.getLogWaitCallback())
 	cp.appDebugParams = appDebugParams
 
-	cp.dbaPool.Open(dbaParams, tabletenv.MySQLStats)
+	cp.dbaPool.Open(dbaParams)
+}
+
+func (cp *Pool) getLogWaitCallback() func(time.Time) {
+	if cp.name == "" {
+		return func(start time.Time) {} // no op
+	}
+	return func(start time.Time) {
+		cp.env.Stats().WaitTimings.Record(cp.name+"ResourceWaitTime", start)
+	}
 }
 
 // Close will close the pool and wait for connections to be returned before
@@ -131,12 +143,33 @@ func (cp *Pool) Close() {
 // Get returns a connection.
 // You must call Recycle on DBConn once done.
 func (cp *Pool) Get(ctx context.Context) (*DBConn, error) {
+	span, ctx := trace.NewSpan(ctx, "Pool.Get")
+	defer span.Finish()
+
+	if cp.waiterCap > 0 {
+		waiterCount := cp.waiterCount.Add(1)
+		defer cp.waiterCount.Add(-1)
+		if waiterCount > cp.waiterCap {
+			return nil, vterrors.Errorf(vtrpcpb.Code_RESOURCE_EXHAUSTED, "pool %s waiter count exceeded", cp.name)
+		}
+	}
+
 	if cp.isCallerIDAppDebug(ctx) {
-		return NewDBConnNoPool(cp.appDebugParams)
+		return NewDBConnNoPool(ctx, cp.appDebugParams, cp.dbaPool)
 	}
 	p := cp.pool()
 	if p == nil {
 		return nil, ErrConnPoolClosed
+	}
+	span.Annotate("capacity", p.Capacity())
+	span.Annotate("in_use", p.InUse())
+	span.Annotate("available", p.Available())
+	span.Annotate("active", p.Active())
+
+	if cp.timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cp.timeout)
+		defer cancel()
 	}
 	r, err := p.Get(ctx)
 	if err != nil {
@@ -210,6 +243,24 @@ func (cp *Pool) Available() int64 {
 	return p.Available()
 }
 
+// Active returns the number of active connections in the pool
+func (cp *Pool) Active() int64 {
+	p := cp.pool()
+	if p == nil {
+		return 0
+	}
+	return p.Active()
+}
+
+// InUse returns the number of in-use connections in the pool
+func (cp *Pool) InUse() int64 {
+	p := cp.pool()
+	if p == nil {
+		return 0
+	}
+	return p.InUse()
+}
+
 // MaxCap returns the maximum size of the pool
 func (cp *Pool) MaxCap() int64 {
 	p := cp.pool()
@@ -246,10 +297,32 @@ func (cp *Pool) IdleTimeout() time.Duration {
 	return p.IdleTimeout()
 }
 
+// IdleClosed returns the number of closed connections for the pool.
+func (cp *Pool) IdleClosed() int64 {
+	p := cp.pool()
+	if p == nil {
+		return 0
+	}
+	return p.IdleClosed()
+}
+
+// Exhausted returns the number of times available went to zero for the pool.
+func (cp *Pool) Exhausted() int64 {
+	p := cp.pool()
+	if p == nil {
+		return 0
+	}
+	return p.Exhausted()
+}
+
 func (cp *Pool) isCallerIDAppDebug(ctx context.Context) bool {
-	callerID := callerid.ImmediateCallerIDFromContext(ctx)
-	if cp.appDebugParams.Uname == "" {
+	params, err := cp.appDebugParams.MysqlParams()
+	if err != nil {
 		return false
 	}
-	return callerID != nil && callerID.Username == cp.appDebugParams.Uname
+	if params == nil || params.Uname == "" {
+		return false
+	}
+	callerID := callerid.ImmediateCallerIDFromContext(ctx)
+	return callerID != nil && callerID.Username == params.Uname
 }

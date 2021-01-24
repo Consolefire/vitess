@@ -6,7 +6,7 @@ The goal of this document is to describe the guiding principles that will be use
 
 ### Prerequisites
 
-Before reading this doc you must be familiar with [vindexes](https://github.com/youtube/vitess/blob/master/doc/V3VindexDesign.md), which is used as foundation for the arguments presented here.
+Before reading this doc you must be familiar with [vindexes](https://github.com/vitessio/vitess/blob/master/doc/V3VindexDesign.md), which is used as foundation for the arguments presented here.
 
 # Background
 
@@ -301,7 +301,7 @@ You’ll see how these operands are used in the description of the operators.
 
 ## The operators
 
-If one were to ask what are the minimal set of primitives needed to serve SQL queries, we can use [relational algebra](http://www.tutorialspoint.com/dbms/relational_algebra.htm) as starting point. But databases have extended beyond those basic operations. They allow duplicate tuples and ordering. So, here’s a more practical set:
+If one were to ask what are the minimal set of primitives needed to serve SQL queries, we can use [relational algebra](https://www.tutorialspoint.com/dbms/relational_algebra.htm) as starting point. But databases have extended beyond those basic operations. They allow duplicate tuples and ordering. So, here’s a more practical set:
 
 1. Scan (FROM).
 2. Join: Join two results as cross-product (JOIN).
@@ -641,7 +641,7 @@ All other operations are considered ‘cheap’ because they can be applied as t
 
 ## Preserving the original representation
 
-In the case of VTGate, the ‘Route’ operation is capable of performing all 9 functions, as long as all the rows needed to fulfil the query reside in a single database. However, those functions have to be expressed as an SQL query. Most often, the original query could just be passed-through to a single shard. So, the one important question is: If we converted a query to its relational representation, can we then convert it back to the original query? The answer is no, or at least not trivially; The relational operators don’t always map one-to-one with the constructs of an SQL statement. Here’s a specific example:
+In the case of VTGate, the ‘Route’ operation is capable of performing all 9 functions, as long as all the rows needed to fulfill the query reside in a single database. However, those functions have to be expressed as an SQL query. Most often, the original query could just be passed-through to a single shard. So, the one important question is: If we converted a query to its relational representation, can we then convert it back to the original query? The answer is no, or at least not trivially; The relational operators don’t always map one-to-one with the constructs of an SQL statement. Here’s a specific example:
 
 `select count(*), a+1, b from t group by a+1, b`
 
@@ -782,7 +782,7 @@ Recapitulating what we’ve covered so far:
 
 Once we start allowing joins and subqueries, we have a whole bunch of table aliases and relationships to deal with. We have to contend with name clashes, self-joins, as well as scoping rules. In a way, the vschema has acted as a static symbol table so far. But that’s not going to be enough any more.
 
-The core of the symbol table will contain a map whose key will be a table alias, and the elements will be [similar to the table in vschema](https://github.com/youtube/vitess/blob/master/go/vt/vtgate/planbuilder/schema.go#L22). However, it will also contain a column list that will be built as the query is parsed.
+The core of the symbol table will contain a map whose key will be a table alias, and the elements will be [similar to the table in vschema](https://github.com/vitessio/vitess/blob/0b3de7c4a2de8daec545f040639b55a835361685/go/vt/vtgate/vindexes/vschema.go#L82). However, it will also contain a column list that will be built as the query is parsed.
 
 ### A simple example
 
@@ -1135,7 +1135,7 @@ The scoping rule works in our favor here because this type of name generation co
 
 For the sake of simplicity, we’ll not allow dependencies to use non-standard column names. For example, we’ll fail a query like this:
 
-`select * from (select a, count(*) from t1) t where t.`count(*)` > 0`
+`select * from (select a, count(*) from t1) t where t.count(*) > 0`
 
 This should instead be rewritten as:
 
@@ -1194,7 +1194,7 @@ The overall strategy is as follows:
 
 In order to align ourselves with our priorities, we’ll start off with a limited set of primitives, and then we can expand from there.
 
-VTGate already has `Route` and `RouteMerge` as primitives. To this list, let’s add `Join` and `LeftJoin`. Using these primitives, we should be able to cover priorities 1-3 (mentioned in the [Prioritization](https://github.com/youtube/vitess/blob/sugudoc/doc/V3HighLevelDesign.md#prioritization) section). So, any constructs that will require VTGate to do additional work will not be supported. Here’s a recap of what each primitive must do:
+VTGate already has `Route` and `RouteMerge` as primitives. To this list, let’s add `Join` and `LeftJoin`. Using these primitives, we should be able to cover priorities 1-3 (mentioned in the [Prioritization](https://github.com/vitessio/vitess/blob/master/doc/V3HighLevelDesign.md#prioritization) section). So, any constructs that will require VTGate to do additional work will not be supported. Here’s a recap of what each primitive must do:
 
 * `Route`: Sends a query to a single shard or unsharded keyspace.
 * `RouteMerge`: Sends a (mostly) identical query to multiple shards and returns the combined results in no particular order.
@@ -1311,7 +1311,7 @@ When two nodes are grouped, the current join condition becomes the root of the n
 * If it’s a JOIN, the new property is the more restrictive of the two nodes. So, if one of them is a Route, then the new node is also a Route.
 * For a LEFT JOIN, the new property is the same as the LHS node.
 
-If the grouping conditions are not met, then the node remains a join node. In this case, we have to see if the ON clause conditions can be pushed down into the left and/or right nodes. By the fact that the current join is split into two, the ON clause cannot be be pushed as is. Instead, we use associativity rules to our benefit and merge the ON clause conditions into the WHERE clauses of the underlying nodes. The rules are the same as the ones described for a normal WHERE clause.
+If the grouping conditions are not met, then the node remains a join node. In this case, we have to see if the ON clause conditions can be pushed down into the left and/or right nodes. By the fact that the current join is split into two, the ON clause cannot be pushed as is. Instead, we use associativity rules to our benefit and merge the ON clause conditions into the WHERE clauses of the underlying nodes. The rules are the same as the ones described for a normal WHERE clause.
 
 But left joins are slightly different, because the join condition is applied *to the RHS only*. Also, the condition cannot be further pushed into other nested left joins, because they will change the meaning of the statement. For example:
 
@@ -1491,7 +1491,7 @@ If a, b and c where in different groups, the output would be:
 a   b where (b.id=a.id) and (cond1(a.col, b.col))
 ```
 
-The cond2 expression gets pushed into the the where clause for table ‘c’ because it’s the right-most group that’s referenced by the condition. External references will be changed to appropriate bind variables by the rewiring phase.
+The cond2 expression gets pushed into the where clause for table ‘c’ because it’s the right-most group that’s referenced by the condition. External references will be changed to appropriate bind variables by the rewiring phase.
 
 *Once VTGate acquires the ability to perform its own filters, should we stop pushing these conditions into the dependent queries and do it ourselves instead? The answer will usually be no. You almost always want to push down filters. This is because it will let the underlying database scan fewer rows, or choose better indexes. The more restrictive the query is, the better.*
 

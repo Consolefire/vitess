@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,12 +24,13 @@ import (
 	"sort"
 	"sync"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/concurrency"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"golang.org/x/net/context"
+	"context"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var getVersionFromTabletDebugVars = func(tabletAddr string) (string, error) {
@@ -87,14 +88,14 @@ func (wr *Wrangler) GetVersion(ctx context.Context, tabletAlias *topodatapb.Tabl
 func (wr *Wrangler) diffVersion(ctx context.Context, masterVersion string, masterAlias *topodatapb.TabletAlias, alias *topodatapb.TabletAlias, wg *sync.WaitGroup, er concurrency.ErrorRecorder) {
 	defer wg.Done()
 	log.Infof("Gathering version for %v", topoproto.TabletAliasString(alias))
-	slaveVersion, err := wr.GetVersion(ctx, alias)
+	replicaVersion, err := wr.GetVersion(ctx, alias)
 	if err != nil {
 		er.RecordError(err)
 		return
 	}
 
-	if masterVersion != slaveVersion {
-		er.RecordError(fmt.Errorf("Master %v version %v is different than slave %v version %v", topoproto.TabletAliasString(masterAlias), masterVersion, topoproto.TabletAliasString(alias), slaveVersion))
+	if masterVersion != replicaVersion {
+		er.RecordError(fmt.Errorf("master %v version %v is different than replica %v version %v", topoproto.TabletAliasString(masterAlias), masterVersion, topoproto.TabletAliasString(alias), replicaVersion))
 	}
 }
 
@@ -108,7 +109,7 @@ func (wr *Wrangler) ValidateVersionShard(ctx context.Context, keyspace, shard st
 
 	// get version from the master, or error
 	if !si.HasMaster() {
-		return fmt.Errorf("No master in shard %v/%v", keyspace, shard)
+		return fmt.Errorf("no master in shard %v/%v", keyspace, shard)
 	}
 	log.Infof("Gathering version for master %v", topoproto.TabletAliasString(si.MasterAlias))
 	masterVersion, err := wr.GetVersion(ctx, si.MasterAlias)
@@ -123,7 +124,7 @@ func (wr *Wrangler) ValidateVersionShard(ctx context.Context, keyspace, shard st
 		return err
 	}
 
-	// then diff with all slaves
+	// then diff with all replicas
 	er := concurrency.AllErrorRecorder{}
 	wg := sync.WaitGroup{}
 	for _, alias := range aliases {
@@ -136,7 +137,7 @@ func (wr *Wrangler) ValidateVersionShard(ctx context.Context, keyspace, shard st
 	}
 	wg.Wait()
 	if er.HasErrors() {
-		return fmt.Errorf("Version diffs: %v", er.Error().Error())
+		return fmt.Errorf("version diffs: %v", er.Error().Error())
 	}
 	return nil
 }
@@ -152,7 +153,7 @@ func (wr *Wrangler) ValidateVersionKeyspace(ctx context.Context, keyspace string
 
 	// corner cases
 	if len(shards) == 0 {
-		return fmt.Errorf("No shards in keyspace %v", keyspace)
+		return fmt.Errorf("no shards in keyspace %v", keyspace)
 	}
 	sort.Strings(shards)
 	if len(shards) == 1 {
@@ -165,7 +166,7 @@ func (wr *Wrangler) ValidateVersionKeyspace(ctx context.Context, keyspace string
 		return err
 	}
 	if !si.HasMaster() {
-		return fmt.Errorf("No master in shard %v/%v", keyspace, shards[0])
+		return fmt.Errorf("no master in shard %v/%v", keyspace, shards[0])
 	}
 	referenceAlias := si.MasterAlias
 	log.Infof("Gathering version for reference master %v", topoproto.TabletAliasString(referenceAlias))
@@ -195,7 +196,7 @@ func (wr *Wrangler) ValidateVersionKeyspace(ctx context.Context, keyspace string
 	}
 	wg.Wait()
 	if er.HasErrors() {
-		return fmt.Errorf("Version diffs: %v", er.Error().Error())
+		return fmt.Errorf("version diffs: %v", er.Error().Error())
 	}
 	return nil
 }

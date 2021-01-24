@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,18 +20,23 @@ package sqlparser
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"unicode"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
-	"github.com/youtube/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/vterrors"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
+// StatementType encodes the type of a SQL statement
+type StatementType int
+
 // These constants are used to identify the SQL statement type.
+// Changing this list will require reviewing all calls to Preview.
 const (
-	StmtSelect = iota
+	StmtSelect StatementType = iota
+	StmtStream
 	StmtInsert
 	StmtReplace
 	StmtUpdate
@@ -45,23 +50,116 @@ const (
 	StmtUse
 	StmtOther
 	StmtUnknown
+	StmtComment
+	StmtPriv
+	StmtExplain
+	StmtSavepoint
+	StmtSRollback
+	StmtRelease
+	StmtVStream
+	StmtLockTables
+	StmtUnlockTables
+	StmtFlush
 )
+
+//ASTToStatementType returns a StatementType from an AST stmt
+func ASTToStatementType(stmt Statement) StatementType {
+	switch stmt.(type) {
+	case *Select, *Union:
+		return StmtSelect
+	case *Insert:
+		return StmtInsert
+	case *Update:
+		return StmtUpdate
+	case *Delete:
+		return StmtDelete
+	case *Set:
+		return StmtSet
+	case *Show:
+		return StmtShow
+	case DDLStatement, DBDDLStatement, *AlterVschema:
+		return StmtDDL
+	case *Use:
+		return StmtUse
+	case *OtherRead, *OtherAdmin, *Load:
+		return StmtOther
+	case *Explain:
+		return StmtExplain
+	case *Begin:
+		return StmtBegin
+	case *Commit:
+		return StmtCommit
+	case *Rollback:
+		return StmtRollback
+	case *Savepoint:
+		return StmtSavepoint
+	case *SRollback:
+		return StmtSRollback
+	case *Release:
+		return StmtRelease
+	case *LockTables:
+		return StmtLockTables
+	case *UnlockTables:
+		return StmtUnlockTables
+	case *Flush:
+		return StmtFlush
+	default:
+		return StmtUnknown
+	}
+}
+
+//CanNormalize takes Statement and returns if the statement can be normalized.
+func CanNormalize(stmt Statement) bool {
+	switch stmt.(type) {
+	case *Select, *Union, *Insert, *Update, *Delete, *Set:
+		return true
+	}
+	return false
+}
+
+// CachePlan takes Statement and returns true if the query plan should be cached
+func CachePlan(stmt Statement) bool {
+	switch stmt.(type) {
+	case *Select, *Union, *ParenSelect,
+		*Insert, *Update, *Delete:
+		return true
+	}
+	return false
+}
+
+//IsSetStatement takes Statement and returns if the statement is set statement.
+func IsSetStatement(stmt Statement) bool {
+	switch stmt.(type) {
+	case *Set:
+		return true
+	}
+	return false
+}
 
 // Preview analyzes the beginning of the query using a simpler and faster
 // textual comparison to identify the statement type.
-func Preview(sql string) int {
+func Preview(sql string) StatementType {
 	trimmed := StripLeadingComments(sql)
 
-	firstWord := trimmed
-	if end := strings.IndexFunc(trimmed, unicode.IsSpace); end != -1 {
-		firstWord = trimmed[:end]
+	if strings.Index(trimmed, "/*!") == 0 {
+		return StmtComment
 	}
 
+	isNotLetter := func(r rune) bool { return !unicode.IsLetter(r) }
+	firstWord := strings.TrimLeftFunc(trimmed, isNotLetter)
+
+	if end := strings.IndexFunc(firstWord, unicode.IsSpace); end != -1 {
+		firstWord = firstWord[:end]
+	}
 	// Comparison is done in order of priority.
 	loweredFirstWord := strings.ToLower(firstWord)
 	switch loweredFirstWord {
 	case "select":
 		return StmtSelect
+	case "stream":
+		return StmtStream
+	case "vstream":
+		return StmtVStream
 	case "insert":
 		return StmtInsert
 	case "replace":
@@ -70,8 +168,20 @@ func Preview(sql string) int {
 		return StmtUpdate
 	case "delete":
 		return StmtDelete
+	case "savepoint":
+		return StmtSavepoint
+	case "lock":
+		return StmtLockTables
+	case "unlock":
+		return StmtUnlockTables
 	}
-	switch strings.ToLower(trimmed) {
+	// For the following statements it is not sufficient to rely
+	// on loweredFirstWord. This is because they are not statements
+	// in the grammar and we are relying on Preview to parse them.
+	// For instance, we don't want: "BEGIN JUNK" to be parsed
+	// as StmtBegin.
+	trimmedNoComments, _ := SplitMarginComments(trimmed)
+	switch strings.ToLower(trimmedNoComments) {
 	case "begin", "start transaction":
 		return StmtBegin
 	case "commit":
@@ -80,18 +190,81 @@ func Preview(sql string) int {
 		return StmtRollback
 	}
 	switch loweredFirstWord {
-	case "create", "alter", "rename", "drop":
+	case "create", "alter", "rename", "drop", "truncate":
 		return StmtDDL
+	case "flush":
+		return StmtFlush
 	case "set":
 		return StmtSet
 	case "show":
 		return StmtShow
 	case "use":
 		return StmtUse
-	case "analyze", "describe", "desc", "explain", "repair", "optimize", "truncate":
+	case "describe", "desc", "explain":
+		return StmtExplain
+	case "analyze", "repair", "optimize":
 		return StmtOther
+	case "grant", "revoke":
+		return StmtPriv
+	case "release":
+		return StmtRelease
+	case "rollback":
+		return StmtSRollback
 	}
 	return StmtUnknown
+}
+
+func (s StatementType) String() string {
+	switch s {
+	case StmtSelect:
+		return "SELECT"
+	case StmtStream:
+		return "STREAM"
+	case StmtVStream:
+		return "VSTREAM"
+	case StmtInsert:
+		return "INSERT"
+	case StmtReplace:
+		return "REPLACE"
+	case StmtUpdate:
+		return "UPDATE"
+	case StmtDelete:
+		return "DELETE"
+	case StmtDDL:
+		return "DDL"
+	case StmtBegin:
+		return "BEGIN"
+	case StmtCommit:
+		return "COMMIT"
+	case StmtRollback:
+		return "ROLLBACK"
+	case StmtSet:
+		return "SET"
+	case StmtShow:
+		return "SHOW"
+	case StmtUse:
+		return "USE"
+	case StmtOther:
+		return "OTHER"
+	case StmtPriv:
+		return "PRIV"
+	case StmtExplain:
+		return "EXPLAIN"
+	case StmtSavepoint:
+		return "SAVEPOINT"
+	case StmtSRollback:
+		return "SAVEPOINT_ROLLBACK"
+	case StmtRelease:
+		return "RELEASE"
+	case StmtLockTables:
+		return "LOCK_TABLES"
+	case StmtUnlockTables:
+		return "UNLOCK_TABLES"
+	case StmtFlush:
+		return "FLUSH"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 // IsDML returns true if the query is an INSERT, UPDATE or DELETE statement.
@@ -101,6 +274,56 @@ func IsDML(sql string) bool {
 		return true
 	}
 	return false
+}
+
+//IsDMLStatement returns true if the query is an INSERT, UPDATE or DELETE statement.
+func IsDMLStatement(stmt Statement) bool {
+	switch stmt.(type) {
+	case *Insert, *Update, *Delete:
+		return true
+	}
+
+	return false
+}
+
+// SplitAndExpression breaks up the Expr into AND-separated conditions
+// and appends them to filters. Outer parenthesis are removed. Precedence
+// should be taken into account if expressions are recombined.
+func SplitAndExpression(filters []Expr, node Expr) []Expr {
+	if node == nil {
+		return filters
+	}
+	switch node := node.(type) {
+	case *AndExpr:
+		filters = SplitAndExpression(filters, node.Left)
+		return SplitAndExpression(filters, node.Right)
+	}
+	return append(filters, node)
+}
+
+// TableFromStatement returns the qualified table name for the query.
+// This works only for select statements.
+func TableFromStatement(sql string) (TableName, error) {
+	stmt, err := Parse(sql)
+	if err != nil {
+		return TableName{}, err
+	}
+	sel, ok := stmt.(*Select)
+	if !ok {
+		return TableName{}, fmt.Errorf("unrecognized statement: %s", sql)
+	}
+	if len(sel.From) != 1 {
+		return TableName{}, fmt.Errorf("table expression is complex")
+	}
+	aliased, ok := sel.From[0].(*AliasedTableExpr)
+	if !ok {
+		return TableName{}, fmt.Errorf("table expression is complex")
+	}
+	tableName, ok := aliased.Expr.(TableName)
+	if !ok {
+		return TableName{}, fmt.Errorf("table expression is complex")
+	}
+	return tableName, nil
 }
 
 // GetTableName returns the table name from the SimpleTableExpr
@@ -123,9 +346,11 @@ func IsColName(node Expr) bool {
 // NULL is not considered to be a value.
 func IsValue(node Expr) bool {
 	switch v := node.(type) {
-	case *SQLVal:
+	case Argument:
+		return true
+	case *Literal:
 		switch v.Type {
-		case StrVal, HexVal, IntVal, ValArg:
+		case StrVal, HexVal, IntVal:
 			return true
 		}
 	}
@@ -162,22 +387,24 @@ func IsSimpleTuple(node Expr) bool {
 // NewPlanValue builds a sqltypes.PlanValue from an Expr.
 func NewPlanValue(node Expr) (sqltypes.PlanValue, error) {
 	switch node := node.(type) {
-	case *SQLVal:
+	case Argument:
+		return sqltypes.PlanValue{Key: string(node[1:])}, nil
+	case *Literal:
 		switch node.Type {
-		case ValArg:
-			return sqltypes.PlanValue{Key: string(node.Val[1:])}, nil
 		case IntVal:
 			n, err := sqltypes.NewIntegral(string(node.Val))
 			if err != nil {
-				return sqltypes.PlanValue{}, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "%v", err)
+				return sqltypes.PlanValue{}, err
 			}
 			return sqltypes.PlanValue{Value: n}, nil
+		case FloatVal:
+			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.Float64, node.Val)}, nil
 		case StrVal:
 			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.VarBinary, node.Val)}, nil
 		case HexVal:
 			v, err := node.HexDecode()
 			if err != nil {
-				return sqltypes.PlanValue{}, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "%v", err)
+				return sqltypes.PlanValue{}, err
 			}
 			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.VarBinary, v)}, nil
 		}
@@ -200,62 +427,29 @@ func NewPlanValue(node Expr) (sqltypes.PlanValue, error) {
 		return pv, nil
 	case *NullVal:
 		return sqltypes.PlanValue{}, nil
+	case *UnaryExpr:
+		switch node.Operator {
+		case UBinaryOp, Utf8mb4Op, Utf8Op, Latin1Op: // for some charset introducers, we can just ignore them
+			return NewPlanValue(node.Expr)
+		}
 	}
 	return sqltypes.PlanValue{}, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "expression is too complex '%v'", String(node))
 }
 
-// StringIn is a convenience function that returns
-// true if str matches any of the values.
-func StringIn(str string, values ...string) bool {
-	for _, val := range values {
-		if str == val {
-			return true
-		}
+//IsLockingFunc returns true for all functions that are used to work with mysql advisory locks
+func IsLockingFunc(node Expr) bool {
+	switch p := node.(type) {
+	case *FuncExpr:
+		_, found := lockingFunctions[p.Name.Lowered()]
+		return found
 	}
 	return false
 }
 
-// ExtractSetValues returns a map of key-value pairs
-// if the query is a SET statement. Values can be int64 or string.
-// Since set variable names are case insensitive, all keys are returned
-// as lower case.
-func ExtractSetValues(sql string) (keyValues map[string]interface{}, charset string, err error) {
-	stmt, err := Parse(sql)
-	if err != nil {
-		return nil, "", err
-	}
-	setStmt, ok := stmt.(*Set)
-	if !ok {
-		return nil, "", fmt.Errorf("ast did not yield *sqlparser.Set: %T", stmt)
-	}
-	result := make(map[string]interface{})
-	for _, expr := range setStmt.Exprs {
-		if !expr.Name.Qualifier.IsEmpty() {
-			return nil, "", fmt.Errorf("invalid syntax: %v", String(expr.Name))
-		}
-		key := expr.Name.Name.Lowered()
-
-		switch expr := expr.Expr.(type) {
-		case *SQLVal:
-			switch expr.Type {
-			case StrVal:
-				result[key] = string(expr.Val)
-			case IntVal:
-				num, err := strconv.ParseInt(string(expr.Val), 0, 64)
-				if err != nil {
-					return nil, "", err
-				}
-				result[key] = num
-			default:
-				return nil, "", fmt.Errorf("invalid value type: %v", String(expr))
-			}
-		case *NullVal:
-			result[key] = nil
-		case *Default:
-			result[key] = "default"
-		default:
-			return nil, "", fmt.Errorf("invalid syntax: %s", String(expr))
-		}
-	}
-	return result, setStmt.Charset.Lowered(), nil
+var lockingFunctions = map[string]interface{}{
+	"get_lock":          nil,
+	"is_free_lock":      nil,
+	"is_used_lock":      nil,
+	"release_all_locks": nil,
+	"release_lock":      nil,
 }

@@ -1,12 +1,12 @@
 /*
- * Copyright 2017 Google Inc.
- * 
+ * Copyright 2019 The Vitess Authors.
+
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,12 +20,16 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.collect.ImmutableList;
-import java.util.List;
-import java.util.Map;
-import javax.annotation.Nullable;
-import org.apache.commons.collections4.map.CaseInsensitiveMap;
 
 import io.vitess.proto.Query.Field;
+
+import org.apache.commons.collections4.map.CaseInsensitiveMap;
+
+import java.util.List;
+import java.util.Map;
+
+import javax.annotation.Nullable;
+
 
 /**
  * A wrapper for {@code List<Field>} that also facilitates lookup by field name.
@@ -37,6 +41,7 @@ import io.vitess.proto.Query.Field;
  * index is also used to find the value in a separate list.
  */
 public class FieldMap {
+
   private final List<Field> fields;
   private final Map<String, Integer> labelMap;
   private final Map<String, Integer> nameMap;
@@ -58,11 +63,11 @@ public class FieldMap {
         labelMap.put(columnLabel, columnIndex);
       }
       String origName = field.getOrgName();
-      if (origName != null && !"".equals(origName) && !nameMap.containsKey(origName)) {
+      if (!"".equals(origName) && !nameMap.containsKey(origName)) {
         nameMap.put(origName, columnIndex);
       }
       String tableName = field.getTable();
-      if (tableName != null && !"".equals(tableName)) {
+      if (!"".equals(tableName)) {
         StringBuilder fullNameBuf = new StringBuilder();
         fullNameBuf.append(tableName);
         fullNameBuf.append('.');

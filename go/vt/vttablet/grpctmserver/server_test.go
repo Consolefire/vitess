@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,13 @@ import (
 	"net"
 	"testing"
 
-	"github.com/youtube/vitess/go/vt/vttablet/agentrpctest"
-	"github.com/youtube/vitess/go/vt/vttablet/grpctmclient"
 	"google.golang.org/grpc"
 
-	tabletmanagerservicepb "github.com/youtube/vitess/go/vt/proto/tabletmanagerservice"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/vttablet/grpctmclient"
+	"vitess.io/vitess/go/vt/vttablet/tmrpctest"
+
+	tabletmanagerservicepb "vitess.io/vitess/go/vt/proto/tabletmanagerservice"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // TestGRPCTMServer creates a fake server implementation, a fake client
@@ -41,8 +42,8 @@ func TestGRPCTMServer(t *testing.T) {
 
 	// Create a gRPC server and listen on the port.
 	s := grpc.NewServer()
-	fakeAgent := agentrpctest.NewFakeRPCAgent(t)
-	tabletmanagerservicepb.RegisterTabletManagerServer(s, &server{agent: fakeAgent})
+	fakeTM := tmrpctest.NewFakeRPCTM(t)
+	tabletmanagerservicepb.RegisterTabletManagerServer(s, &server{tm: fakeTM})
 	go s.Serve(listener)
 
 	// Create a gRPC client to talk to the fake tablet.
@@ -59,5 +60,5 @@ func TestGRPCTMServer(t *testing.T) {
 	}
 
 	// and run the test suite
-	agentrpctest.Run(t, client, tablet, fakeAgent)
+	tmrpctest.Run(t, client, tablet, fakeTM)
 }

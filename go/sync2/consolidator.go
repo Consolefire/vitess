@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/youtube/vitess/go/cache"
+	"vitess.io/vitess/go/cache"
 )
 
 // Consolidator consolidates duplicate queries from executing simulaneously
@@ -117,7 +117,7 @@ type ConsolidatorCacheItem struct {
 // Items returns the items in the cache as an array of String, int64 structs
 func (cc *ConsolidatorCache) Items() []ConsolidatorCacheItem {
 	items := cc.LRUCache.Items()
-	ret := make([]ConsolidatorCacheItem, len(items), len(items))
+	ret := make([]ConsolidatorCacheItem, len(items))
 	for i, v := range items {
 		ret[i] = ConsolidatorCacheItem{Query: v.Key, Count: v.Value.(*ccount).get()}
 	}

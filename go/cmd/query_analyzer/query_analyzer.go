@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,9 +25,9 @@ import (
 	"os"
 	"sort"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 var (
@@ -113,7 +113,7 @@ func analyze(line []byte) {
 }
 
 func formatWithBind(buf *sqlparser.TrackedBuffer, node sqlparser.SQLNode) {
-	v, ok := node.(*sqlparser.SQLVal)
+	v, ok := node.(*sqlparser.Literal)
 	if !ok {
 		node.Format(buf)
 		return

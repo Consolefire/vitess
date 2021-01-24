@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,16 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/youtube/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 var (
-	_ Functional = (*Numeric)(nil)
-	_ Reversible = (*Numeric)(nil)
+	_ SingleColumn = (*Numeric)(nil)
+	_ Reversible   = (*Numeric)(nil)
 )
 
 // Numeric defines a bit-pattern mapping of a uint64 to the KeyspaceId.
@@ -50,33 +54,43 @@ func (*Numeric) Cost() int {
 	return 0
 }
 
+// IsUnique returns true since the Vindex is unique.
+func (*Numeric) IsUnique() bool {
+	return true
+}
+
+// NeedsVCursor satisfies the Vindex interface.
+func (*Numeric) NeedsVCursor() bool {
+	return false
+}
+
 // Verify returns true if ids and ksids match.
 func (*Numeric) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, len(ids))
 	for i := range ids {
 		var keybytes [8]byte
-		num, err := sqltypes.ToUint64(ids[i])
+		num, err := evalengine.ToUint64(ids[i])
 		if err != nil {
-			return nil, fmt.Errorf("Numeric.Verify: %v", err)
+			return nil, vterrors.Wrap(err, "Numeric.Verify")
 		}
 		binary.BigEndian.PutUint64(keybytes[:], num)
-		out[i] = (bytes.Compare(keybytes[:], ksids[i]) == 0)
+		out[i] = bytes.Equal(keybytes[:], ksids[i])
 	}
 	return out, nil
 }
 
-// Map returns the associated keyspace ids for the given ids.
-func (*Numeric) Map(_ VCursor, ids []sqltypes.Value) ([][]byte, error) {
-	out := make([][]byte, 0, len(ids))
+// Map can map ids to key.Destination objects.
+func (*Numeric) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
-		num, err := sqltypes.ToUint64(id)
+		num, err := evalengine.ToUint64(id)
 		if err != nil {
-			out = append(out, nil)
+			out = append(out, key.DestinationNone{})
 			continue
 		}
 		var keybytes [8]byte
 		binary.BigEndian.PutUint64(keybytes[:], num)
-		out = append(out, keybytes[:])
+		out = append(out, key.DestinationKeyspaceID(keybytes[:]))
 	}
 	return out, nil
 }

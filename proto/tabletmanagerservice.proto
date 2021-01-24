@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,6 +18,7 @@ limitations under the License.
 // calls to VtTablet.
 
 syntax = "proto3";
+option go_package = "vitess.io/vitess/go/vt/proto/tabletmanagerservice";
 
 package tabletmanagerservice;
 
@@ -67,6 +68,10 @@ service TabletManager {
 
   rpc ApplySchema(tabletmanagerdata.ApplySchemaRequest) returns (tabletmanagerdata.ApplySchemaResponse) {};
 
+  rpc LockTables(tabletmanagerdata.LockTablesRequest) returns (tabletmanagerdata.LockTablesResponse) {};
+
+  rpc UnlockTables(tabletmanagerdata.UnlockTablesRequest) returns (tabletmanagerdata.UnlockTablesResponse) {};
+
   rpc ExecuteFetchAsDba(tabletmanagerdata.ExecuteFetchAsDbaRequest) returns (tabletmanagerdata.ExecuteFetchAsDbaResponse) {};
 
   rpc ExecuteFetchAsAllPrivs(tabletmanagerdata.ExecuteFetchAsAllPrivsRequest) returns (tabletmanagerdata.ExecuteFetchAsAllPrivsResponse) {};
@@ -77,66 +82,38 @@ service TabletManager {
   // Replication related methods
   //
 
-  // SlaveStatus returns the current slave status.
-  rpc SlaveStatus(tabletmanagerdata.SlaveStatusRequest) returns (tabletmanagerdata.SlaveStatusResponse) {};
+  // ReplicationStatus returns the current replication status.
+  rpc ReplicationStatus(tabletmanagerdata.ReplicationStatusRequest) returns (tabletmanagerdata.ReplicationStatusResponse) {};
+
+  // MasterStatus returns the current master status.
+  rpc MasterStatus(tabletmanagerdata.MasterStatusRequest) returns (tabletmanagerdata.MasterStatusResponse) {};
 
   // MasterPosition returns the current master position
   rpc MasterPosition(tabletmanagerdata.MasterPositionRequest) returns (tabletmanagerdata.MasterPositionResponse) {};
 
-  // StopSlave makes mysql stop its replication
-  rpc StopSlave(tabletmanagerdata.StopSlaveRequest) returns (tabletmanagerdata.StopSlaveResponse) {};
+  // WaitForPosition waits for the position to be reached
+  rpc WaitForPosition(tabletmanagerdata.WaitForPositionRequest) returns (tabletmanagerdata.WaitForPositionResponse) {};
 
-  // StopSlaveMinimum stops the mysql replication after it reaches
+  // StopReplication makes mysql stop its replication
+  rpc StopReplication(tabletmanagerdata.StopReplicationRequest) returns (tabletmanagerdata.StopReplicationResponse) {};
+
+  // StopReplicationMinimum stops the mysql replication after it reaches
   // the provided minimum point
-  rpc StopSlaveMinimum(tabletmanagerdata.StopSlaveMinimumRequest) returns (tabletmanagerdata.StopSlaveMinimumResponse) {};
+  rpc StopReplicationMinimum(tabletmanagerdata.StopReplicationMinimumRequest) returns (tabletmanagerdata.StopReplicationMinimumResponse) {};
 
-  // StartSlave starts the mysql replication
-  rpc StartSlave(tabletmanagerdata.StartSlaveRequest) returns (tabletmanagerdata.StartSlaveResponse) {};
+  // StartReplication starts the mysql replication
+  rpc StartReplication(tabletmanagerdata.StartReplicationRequest) returns (tabletmanagerdata.StartReplicationResponse) {};
 
-  // TabletExternallyReparented tells a tablet that its underlying MySQL is
-  // currently the master. It is only used in environments (tabletmanagerdata.such as Vitess+MoB)
-  // in which MySQL is reparented by some agent external to Vitess, and then
-  // that agent simply notifies Vitess.
-  //
-  // This call is idempotent with respect to a single target tablet.
-  // However, the tablet assumes there is a cooling-off period following the
-  // initial external reparent from A to B, before this call is repeated on any
-  // tablet other than B. This assumption is configurable with the vttablet flag
-  // "finalize_external_reparent_timeout".
-  //
-  // For more information, see the design doc at go/vt-fast-failover.
-  rpc TabletExternallyReparented(tabletmanagerdata.TabletExternallyReparentedRequest) returns (tabletmanagerdata.TabletExternallyReparentedResponse) {};
+  // StartReplicationUnitAfter starts the mysql replication until and including
+  // the provided position
+  rpc StartReplicationUntilAfter(tabletmanagerdata.StartReplicationUntilAfterRequest) returns (tabletmanagerdata.StartReplicationUntilAfterResponse) {};
 
-  // TabletExternallyElected is an notification that may be sent in
-  // anticipation of potentially later sending TabletExternallyReparented.
-  // The tablet can use this extra lead time to prepare to react quickly if
-  // TabletExternallyReparented does follow.
-  //
-  // This call is effectively a no-op if it is not followed by a call to
-  // TabletExternallyReparented, so the external agent doing the reparent can
-  // still change its mind.
-  //
-  // The agent does not need to wait for this call or cancel it before calling
-  // TabletExternallyReparented if the external reparent operation finishes
-  // before TabletExternallyElected returns.
-  rpc TabletExternallyElected(tabletmanagerdata.TabletExternallyElectedRequest) returns (tabletmanagerdata.TabletExternallyElectedResponse) {};
+  // GetReplicas asks for the list of mysql replicas
+  rpc GetReplicas(tabletmanagerdata.GetReplicasRequest) returns (tabletmanagerdata.GetReplicasResponse) {};
 
-  // GetSlaves asks for the list of mysql slaves
-  rpc GetSlaves(tabletmanagerdata.GetSlavesRequest) returns (tabletmanagerdata.GetSlavesResponse) {};
-
-  // WaitBlpPosition tells the remote tablet to wait until it reaches
-  // the specified binolg player position
-  rpc WaitBlpPosition(tabletmanagerdata.WaitBlpPositionRequest) returns (tabletmanagerdata.WaitBlpPositionResponse) {};
-
-  // StopBlp asks the tablet to stop all its binlog players,
-  // and returns the current position for all of them
-  rpc StopBlp(tabletmanagerdata.StopBlpRequest) returns (tabletmanagerdata.StopBlpResponse) {};
-
-  // StartBlp asks the tablet to restart its binlog players
-  rpc StartBlp(tabletmanagerdata.StartBlpRequest) returns (tabletmanagerdata.StartBlpResponse) {};
-
-  // RunBlpUntil asks the tablet to restart its binlog players
-  rpc RunBlpUntil(tabletmanagerdata.RunBlpUntilRequest) returns (tabletmanagerdata.RunBlpUntilResponse) {};
+  // VReplication API
+  rpc VReplicationExec(tabletmanagerdata.VReplicationExecRequest) returns(tabletmanagerdata.VReplicationExecResponse) {};
+  rpc VReplicationWaitForPos(tabletmanagerdata.VReplicationWaitForPosRequest) returns(tabletmanagerdata.VReplicationWaitForPosResponse) {};
 
   //
   // Reparenting related functions
@@ -152,31 +129,30 @@ service TabletManager {
   // reparent journal
   rpc PopulateReparentJournal(tabletmanagerdata.PopulateReparentJournalRequest) returns (tabletmanagerdata.PopulateReparentJournalResponse) {};
 
-  // InitSlave tells the tablet to reparent to the master unconditionnally
-  rpc InitSlave(tabletmanagerdata.InitSlaveRequest) returns (tabletmanagerdata.InitSlaveResponse) {};
+  // InitReplica tells the tablet to reparent to the master unconditionally
+  rpc InitReplica(tabletmanagerdata.InitReplicaRequest) returns (tabletmanagerdata.InitReplicaResponse) {};
 
   // DemoteMaster tells the soon-to-be-former master it's gonna change
   rpc DemoteMaster(tabletmanagerdata.DemoteMasterRequest) returns (tabletmanagerdata.DemoteMasterResponse) {};
 
-  // PromoteSlaveWhenCaughtUp tells the remote tablet to catch up,
-  // and then be the master
-  rpc PromoteSlaveWhenCaughtUp(tabletmanagerdata.PromoteSlaveWhenCaughtUpRequest) returns (tabletmanagerdata.PromoteSlaveWhenCaughtUpResponse) {};
+  // UndoDemoteMaster reverts all changes made by DemoteMaster
+  rpc UndoDemoteMaster(tabletmanagerdata.UndoDemoteMasterRequest) returns (tabletmanagerdata.UndoDemoteMasterResponse) {};
 
-  // SlaveWasPromoted tells the remote tablet it is now the master
-  rpc SlaveWasPromoted(tabletmanagerdata.SlaveWasPromotedRequest) returns (tabletmanagerdata.SlaveWasPromotedResponse) {};
+  // ReplicaWasPromoted tells the remote tablet it is now the master
+  rpc ReplicaWasPromoted(tabletmanagerdata.ReplicaWasPromotedRequest) returns (tabletmanagerdata.ReplicaWasPromotedResponse) {};
 
-  // SetMaster tells the slave to reparent
+  // SetMaster tells the replica to reparent
   rpc SetMaster(tabletmanagerdata.SetMasterRequest) returns (tabletmanagerdata.SetMasterResponse) {};
 
-  // SlaveWasRestarted tells the remote tablet its master has changed
-  rpc SlaveWasRestarted(tabletmanagerdata.SlaveWasRestartedRequest) returns (tabletmanagerdata.SlaveWasRestartedResponse) {};
+  // ReplicaWasRestarted tells the remote tablet its master has changed
+  rpc ReplicaWasRestarted(tabletmanagerdata.ReplicaWasRestartedRequest) returns (tabletmanagerdata.ReplicaWasRestartedResponse) {};
 
   // StopReplicationAndGetStatus stops MySQL replication, and returns the
   // replication status
   rpc StopReplicationAndGetStatus(tabletmanagerdata.StopReplicationAndGetStatusRequest) returns (tabletmanagerdata.StopReplicationAndGetStatusResponse) {};
 
-  // PromoteSlave makes the slave the new master
-  rpc PromoteSlave(tabletmanagerdata.PromoteSlaveRequest) returns (tabletmanagerdata.PromoteSlaveResponse) {};
+  // PromoteReplica makes the replica the new master
+  rpc PromoteReplica(tabletmanagerdata.PromoteReplicaRequest) returns (tabletmanagerdata.PromoteReplicaResponse) {};
 
   //
   // Backup related methods
@@ -186,4 +162,7 @@ service TabletManager {
 
   // RestoreFromBackup deletes all local data and restores it from the latest backup.
   rpc RestoreFromBackup(tabletmanagerdata.RestoreFromBackupRequest) returns (stream tabletmanagerdata.RestoreFromBackupResponse) {};
+
+  // Generic VExec request. Can be used for various purposes
+  rpc VExec(tabletmanagerdata.VExecRequest) returns(tabletmanagerdata.VExecResponse) {};
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,10 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/youtube/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 // SQLError is the error structure returned from calling a db library function
@@ -35,6 +38,7 @@ type SQLError struct {
 
 // NewSQLError creates a new SQLError.
 // If sqlState is left empty, it will default to "HY000" (general error).
+// TODO: Should be aligned with vterrors, stack traces and wrapping
 func NewSQLError(number int, sqlState string, format string, args ...interface{}) *SQLError {
 	if sqlState == "" {
 		sqlState = SSUnknownSQLState
@@ -90,11 +94,52 @@ func NewSQLErrorFromError(err error) error {
 	msg := err.Error()
 	match := errExtract.FindStringSubmatch(msg)
 	if len(match) < 2 {
+		// Map vitess error codes into the mysql equivalent
+		code := vterrors.Code(err)
+		num := ERUnknownError
+		switch code {
+		case vtrpcpb.Code_CANCELED:
+			num = ERQueryInterrupted
+		case vtrpcpb.Code_UNKNOWN:
+			num = ERUnknownError
+		case vtrpcpb.Code_INVALID_ARGUMENT:
+			// TODO/demmer there are several more appropriate mysql error
+			// codes for the various invalid argument cases.
+			// it would be better to change the call sites to use
+			// the mysql style "(errno X) (sqlstate Y)" format rather than
+			// trying to add vitess error codes for all these cases
+			num = ERUnknownError
+		case vtrpcpb.Code_DEADLINE_EXCEEDED:
+			num = ERQueryInterrupted
+		case vtrpcpb.Code_NOT_FOUND:
+			num = ERUnknownError
+		case vtrpcpb.Code_ALREADY_EXISTS:
+			num = ERUnknownError
+		case vtrpcpb.Code_PERMISSION_DENIED:
+			num = ERAccessDeniedError
+		case vtrpcpb.Code_UNAUTHENTICATED:
+			num = ERAccessDeniedError
+		case vtrpcpb.Code_RESOURCE_EXHAUSTED:
+			num = demuxResourceExhaustedErrors(err.Error())
+		case vtrpcpb.Code_FAILED_PRECONDITION:
+			num = ERUnknownError
+		case vtrpcpb.Code_ABORTED:
+			num = ERQueryInterrupted
+		case vtrpcpb.Code_OUT_OF_RANGE:
+			num = ERUnknownError
+		case vtrpcpb.Code_UNIMPLEMENTED:
+			num = ERNotSupportedYet
+		case vtrpcpb.Code_INTERNAL:
+			num = ERUnknownError
+		case vtrpcpb.Code_UNAVAILABLE:
+			num = ERUnknownError
+		case vtrpcpb.Code_DATA_LOSS:
+			num = ERUnknownError
+		}
+
 		// Not found, build a generic SQLError.
-		// TODO(alainjobart) maybe we can also check the canonical
-		// error code, and translate that into the right error.
 		return &SQLError{
-			Num:     ERUnknownError,
+			Num:     num,
 			State:   SSUnknownSQLState,
 			Message: msg,
 		}
@@ -115,4 +160,15 @@ func NewSQLErrorFromError(err error) error {
 		Message: msg,
 	}
 	return serr
+}
+
+var isGRPCOverflowRE = regexp.MustCompile(`.*grpc: received message larger than max \(\d+ vs. \d+\)`)
+
+func demuxResourceExhaustedErrors(msg string) int {
+	switch {
+	case isGRPCOverflowRE.Match([]byte(msg)):
+		return ERNetPacketTooLarge
+	default:
+		return ERTooManyUserConnections
+	}
 }

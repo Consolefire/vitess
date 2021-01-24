@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,30 +17,34 @@ limitations under the License.
 package main
 
 import (
-	"github.com/youtube/vitess/go/vt/discovery"
-	"github.com/youtube/vitess/go/vt/servenv"
-	_ "github.com/youtube/vitess/go/vt/status"
-	"github.com/youtube/vitess/go/vt/vtgate"
-	"github.com/youtube/vitess/go/vt/vtgate/gateway"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/srvtopo"
+	_ "vitess.io/vitess/go/vt/status"
+	"vitess.io/vitess/go/vt/vtgate"
 )
 
-// For use by plugins which wish to avoid racing when registering status page parts.
-var onStatusRegistered func()
-
 func addStatusParts(vtg *vtgate.VTGate) {
+	servenv.AddStatusPart("Executor", vtgate.ExecutorTemplate, func() interface{} {
+		return nil
+	})
 	servenv.AddStatusPart("VSchema", vtgate.VSchemaTemplate, func() interface{} {
 		return vtg.VSchemaStats()
 	})
-	servenv.AddStatusPart("Topology Cache", vtgate.TopoTemplate, func() interface{} {
-		return resilientSrvTopoServer.CacheStatus()
+	servenv.AddStatusFuncs(srvtopo.StatusFuncs)
+	servenv.AddStatusPart("Topology Cache", srvtopo.TopoTemplate, func() interface{} {
+		return resilientServer.CacheStatus()
 	})
-	servenv.AddStatusPart("Gateway Status", gateway.StatusTemplate, func() interface{} {
+	servenv.AddStatusPart("Gateway Status", vtgate.StatusTemplate, func() interface{} {
 		return vtg.GetGatewayCacheStatus()
 	})
-	servenv.AddStatusPart("Health Check Cache", discovery.HealthCheckTemplate, func() interface{} {
-		return healthCheck.CacheStatus()
-	})
-	if onStatusRegistered != nil {
-		onStatusRegistered()
+	if vtgate.UsingLegacyGateway() {
+		servenv.AddStatusPart("Health Check Cache", discovery.LegacyHealthCheckTemplate, func() interface{} {
+			return legacyHealthCheck.CacheStatus()
+		})
+	} else {
+		servenv.AddStatusPart("Health Check Cache", discovery.HealthCheckTemplate, func() interface{} {
+			return vtg.Gateway().TabletsCacheStatus()
+		})
 	}
 }

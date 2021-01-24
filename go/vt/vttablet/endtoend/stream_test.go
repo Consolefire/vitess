@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
-	"github.com/youtube/vitess/go/vt/vterrors"
-	"github.com/youtube/vitess/go/vt/vttablet/endtoend/framework"
+	"vitess.io/vitess/go/sqltypes"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
 )
 
 func TestStreamUnion(t *testing.T) {
@@ -101,10 +101,10 @@ func TestStreamTerminate(t *testing.T) {
 		nil,
 		func(*sqltypes.Result) error {
 			if !called {
-				queries := framework.StreamQueryz()
+				queries := framework.LiveQueryz()
 				if l := len(queries); l != 1 {
 					t.Errorf("len(queries): %d, want 1", l)
-					return errors.New("no queries from StreamQueryz")
+					return errors.New("no queries from LiveQueryz")
 				}
 				err := framework.StreamTerminate(queries[0].ConnID)
 				if err != nil {
@@ -116,8 +116,8 @@ func TestStreamTerminate(t *testing.T) {
 			return nil
 		},
 	)
-	if code := vterrors.Code(err); code != vtrpcpb.Code_DEADLINE_EXCEEDED {
-		t.Errorf("Errorcode: %v, want %v", code, vtrpcpb.Code_DEADLINE_EXCEEDED)
+	if code := vterrors.Code(err); code != vtrpcpb.Code_CANCELED {
+		t.Errorf("Errorcode: %v, want %v", code, vtrpcpb.Code_CANCELED)
 	}
 }
 

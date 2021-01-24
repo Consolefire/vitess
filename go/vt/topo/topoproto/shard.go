@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import (
 	"html/template"
 	"strings"
 
-	"github.com/youtube/vitess/go/vt/key"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/key"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // KeyspaceShardString returns a "keyspace/shard" string taking
@@ -32,12 +32,15 @@ func KeyspaceShardString(keyspace, shard string) string {
 	return fmt.Sprintf("%v/%v", keyspace, shard)
 }
 
-// ParseKeyspaceShard parse a "keyspace/shard" string and extract
-// both keyspace and shard
+// ParseKeyspaceShard parse a "keyspace/shard" or "keyspace:shard"
+// string and extract both keyspace and shard
 func ParseKeyspaceShard(param string) (string, string, error) {
 	keySpaceShard := strings.Split(param, "/")
 	if len(keySpaceShard) != 2 {
-		return "", "", fmt.Errorf("Invalid shard path: %v", param)
+		keySpaceShard = strings.Split(param, ":")
+		if len(keySpaceShard) != 2 {
+			return "", "", fmt.Errorf("invalid shard path: %v", param)
+		}
 	}
 	return keySpaceShard[0], keySpaceShard[1], nil
 }
@@ -60,14 +63,4 @@ func SourceShardAsHTML(source *topodatapb.Shard_SourceShard) template.HTML {
 			strings.Join(source.Tables, " "))
 	}
 	return template.HTML(result)
-}
-
-// ShardHasCell returns true if the cell is listed in the Cells for the shard.
-func ShardHasCell(shard *topodatapb.Shard, cell string) bool {
-	for _, c := range shard.Cells {
-		if c == cell {
-			return true
-		}
-	}
-	return false
 }

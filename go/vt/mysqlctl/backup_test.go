@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -39,7 +39,9 @@ func TestFindFilesToBackup(t *testing.T) {
 	dataDbDir := path.Join(dataDir, "vt_db")
 	extraDir := path.Join(dataDir, "extra_dir")
 	outsideDbDir := path.Join(root, "outside_db")
-	for _, s := range []string{innodbDataDir, innodbLogDir, dataDbDir, extraDir, outsideDbDir} {
+	rocksdbDir := path.Join(dataDir, ".rocksdb")
+	sdiOnlyDir := path.Join(dataDir, "sdi_dir")
+	for _, s := range []string{innodbDataDir, innodbLogDir, dataDbDir, extraDir, outsideDbDir, rocksdbDir, sdiOnlyDir} {
 		if err := os.MkdirAll(s, os.ModePerm); err != nil {
 			t.Fatalf("failed to create directory %v: %v", s, err)
 		}
@@ -62,6 +64,12 @@ func TestFindFilesToBackup(t *testing.T) {
 	if err := os.Symlink(outsideDbDir, path.Join(dataDir, "vt_symlink")); err != nil {
 		t.Fatalf("failed to symlink vt_symlink: %v", err)
 	}
+	if err := ioutil.WriteFile(path.Join(rocksdbDir, "000011.sst"), []byte("rocksdb file"), os.ModePerm); err != nil {
+		t.Fatalf("failed to write file 000011.sst: %v", err)
+	}
+	if err := ioutil.WriteFile(path.Join(sdiOnlyDir, "table1.sdi"), []byte("sdi file"), os.ModePerm); err != nil {
+		t.Fatalf("failed to write file table1.sdi: %v", err)
+	}
 
 	cnf := &Mycnf{
 		InnodbDataHomeDir:     innodbDataDir,
@@ -69,13 +77,21 @@ func TestFindFilesToBackup(t *testing.T) {
 		DataDir:               dataDir,
 	}
 
-	result, err := findFilesToBackup(cnf)
+	result, totalSize, err := findFilesToBackup(cnf)
 	if err != nil {
 		t.Fatalf("findFilesToBackup failed: %v", err)
 	}
 	sort.Sort(forTest(result))
 	t.Logf("findFilesToBackup returned: %v", result)
 	expected := []FileEntry{
+		{
+			Base: "Data",
+			Name: ".rocksdb/000011.sst",
+		},
+		{
+			Base: "Data",
+			Name: "sdi_dir/table1.sdi",
+		},
 		{
 			Base: "Data",
 			Name: "vt_db/db.opt",
@@ -95,6 +111,9 @@ func TestFindFilesToBackup(t *testing.T) {
 	}
 	if !reflect.DeepEqual(result, expected) {
 		t.Fatalf("got wrong list of FileEntry %v, expected %v", result, expected)
+	}
+	if totalSize <= 0 {
+		t.Fatalf("backup size should be > 0, got %v", totalSize)
 	}
 }
 

@@ -1,12 +1,12 @@
 /*
- * Copyright 2017 Google Inc.
- * 
+ * Copyright 2019 The Vitess Authors.
+
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+
 import org.apache.commons.io.FileUtils;
 import vttest.Vttest.VTTestTopology;
 
@@ -28,6 +29,7 @@ import vttest.Vttest.VTTestTopology;
  * Helper class to hold the configurations for VtGate setup used in integration tests
  */
 public class TestEnv {
+
   private VTTestTopology topology;
   private String keyspace;
   private String outputPath;
@@ -70,13 +72,13 @@ public class TestEnv {
    * Get setup command to launch a cluster.
    */
   public List<String> getSetupCommand(int port) {
-    String vtTop = System.getenv("VTTOP");
-    if (vtTop == null) {
-      throw new RuntimeException("cannot find env variable: VTTOP");
+    String vtRoot = System.getenv("VTROOT");
+    if (vtRoot == null) {
+      throw new RuntimeException("cannot find env variable: VTROOT");
     }
     String schemaDir = getTestDataPath() + "/schema";
     List<String> command = new ArrayList<String>();
-    command.add(vtTop + "/py/vttest/run_local_database.py");
+    command.add(vtRoot + "/py-vtdb/vttest/run_local_database.py");
     command.add("--port");
     command.add(Integer.toString(port));
     command.add("--proto_topo");
@@ -87,11 +89,11 @@ public class TestEnv {
   }
 
   public String getTestDataPath() {
-    String vtTop = System.getenv("VTTOP");
-    if (vtTop == null) {
-      throw new RuntimeException("cannot find env variable: VTTOP");
+    String vtRoot = System.getenv("VTROOT");
+    if (vtRoot == null) {
+      throw new RuntimeException("cannot find env variable: VTROOT");
     }
-    return vtTop + "/data/test";
+    return vtRoot + "/data/test";
   }
 
   public String getTestOutputPath() {

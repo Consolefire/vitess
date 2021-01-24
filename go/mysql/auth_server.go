@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,12 +17,16 @@ limitations under the License.
 package mysql
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
-	"fmt"
+	"encoding/hex"
 	"net"
+	"strings"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // AuthServer is the interface that servers must implement to validate
@@ -86,11 +90,11 @@ func RegisterAuthServerImpl(name string, authServer AuthServer) {
 	authServers[name] = authServer
 }
 
-// GetAuthServer returns an AuthServer by name, or log.Fatalf.
+// GetAuthServer returns an AuthServer by name, or log.Exitf.
 func GetAuthServer(name string) AuthServer {
 	authServer, ok := authServers[name]
 	if !ok {
-		log.Fatalf("no AuthServer name %v registered", name)
+		log.Exitf("no AuthServer name %v registered", name)
 	}
 	return authServer
 }
@@ -113,8 +117,8 @@ func NewSalt() ([]byte, error) {
 	return salt, nil
 }
 
-// scramblePassword computes the hash of the password using 4.1+ method.
-func scramblePassword(salt, password []byte) []byte {
+// ScramblePassword computes the hash of the password using 4.1+ method.
+func ScramblePassword(salt, password []byte) []byte {
 	if len(password) == 0 {
 		return nil
 	}
@@ -140,6 +144,49 @@ func scramblePassword(salt, password []byte) []byte {
 		scramble[i] ^= stage1[i]
 	}
 	return scramble
+}
+
+func isPassScrambleMysqlNativePassword(reply, salt []byte, mysqlNativePassword string) bool {
+	/*
+		SERVER:  recv(reply)
+				 hash_stage1=xor(reply, sha1(salt,hash))
+				 candidate_hash2=sha1(hash_stage1)
+				 check(candidate_hash2==hash)
+	*/
+	if len(reply) == 0 {
+		return false
+	}
+
+	if mysqlNativePassword == "" {
+		return false
+	}
+
+	if strings.Contains(mysqlNativePassword, "*") {
+		mysqlNativePassword = mysqlNativePassword[1:]
+	}
+
+	hash, err := hex.DecodeString(mysqlNativePassword)
+	if err != nil {
+		return false
+	}
+
+	// scramble = SHA1(salt+hash)
+	crypt := sha1.New()
+	crypt.Write(salt)
+	crypt.Write(hash)
+	scramble := crypt.Sum(nil)
+
+	// token = scramble XOR stage1Hash
+	for i := range scramble {
+		scramble[i] ^= reply[i]
+	}
+	hashStage1 := scramble
+
+	crypt.Reset()
+	crypt.Write(hashStage1)
+	candidateHash2 := crypt.Sum(nil)
+
+	return bytes.Equal(candidateHash2, hash)
 }
 
 // Constants for the dialog plugin.
@@ -177,7 +224,7 @@ func AuthServerReadPacketString(c *Conn) (string, error) {
 		return "", err
 	}
 	if len(data) == 0 || data[len(data)-1] != 0 {
-		return "", fmt.Errorf("received invalid response packet, datalen=%v", len(data))
+		return "", vterrors.Errorf(vtrpc.Code_INTERNAL, "received invalid response packet, datalen=%v", len(data))
 	}
 	return string(data[:len(data)-1]), nil
 }
@@ -195,6 +242,6 @@ func AuthServerNegotiateClearOrDialog(c *Conn, method string) (string, error) {
 		return AuthServerReadPacketString(c)
 
 	default:
-		return "", fmt.Errorf("unrecognized method: %v", method)
+		return "", vterrors.Errorf(vtrpc.Code_INTERNAL, "unrecognized method: %v", method)
 	}
 }

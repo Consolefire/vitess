@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,15 +20,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/vterrors"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/planbuilder"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 //-----------------------------------------------
@@ -41,6 +44,19 @@ type Rules struct {
 // New creates a new Rules.
 func New() *Rules {
 	return &Rules{}
+}
+
+// Equal returns true if other is equal to this object, otherwise false.
+func (qrs *Rules) Equal(other *Rules) bool {
+	if len(qrs.rules) != len(other.rules) {
+		return false
+	}
+	for i := 0; i < len(qrs.rules); i++ {
+		if !qrs.rules[i].Equal(other.rules[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // Copy performs a deep copy of Rules.
@@ -58,9 +74,7 @@ func (qrs *Rules) Copy() (newqrs *Rules) {
 
 // Append merges the rules from another Rules into the receiver
 func (qrs *Rules) Append(otherqrs *Rules) {
-	for _, qr := range otherqrs.rules {
-		qrs.rules = append(qrs.rules, qr)
-	}
+	qrs.rules = append(qrs.rules, otherqrs.rules...)
 }
 
 // Add adds a Rule to Rules. It does not check
@@ -193,10 +207,34 @@ func (nr namedRegexp) MarshalJSON() ([]byte, error) {
 	return json.Marshal(nr.name)
 }
 
+// Equal returns true if other is equal to this namedRegexp, otherwise false.
+func (nr namedRegexp) Equal(other namedRegexp) bool {
+	if nr.Regexp == nil || other.Regexp == nil {
+		return nr.Regexp == nil && other.Regexp == nil && nr.name == other.name
+	}
+	return nr.name == other.name && nr.String() == other.String()
+}
+
 // NewQueryRule creates a new Rule.
 func NewQueryRule(description, name string, act Action) (qr *Rule) {
 	// We ignore act because there's only one action right now
 	return &Rule{Description: description, Name: name, act: act}
+}
+
+// Equal returns true if other is equal to this Rule, otherwise false.
+func (qr *Rule) Equal(other *Rule) bool {
+	if qr == nil || other == nil {
+		return qr == nil && other == nil
+	}
+	return (qr.Description == other.Description &&
+		qr.Name == other.Name &&
+		qr.requestIP.Equal(other.requestIP) &&
+		qr.user.Equal(other.user) &&
+		qr.query.Equal(other.query) &&
+		reflect.DeepEqual(qr.plans, other.plans) &&
+		reflect.DeepEqual(qr.tableNames, other.tableNames) &&
+		reflect.DeepEqual(qr.bindVarConds, other.bindVarConds) &&
+		qr.act == other.act)
 }
 
 // Copy performs a deep copy of a Rule.
@@ -696,7 +734,7 @@ func getuint64(val *querypb.BindVariable) (uv uint64, status int) {
 	if err != nil {
 		return 0, QROutOfRange
 	}
-	v, err := sqltypes.ToUint64(bv)
+	v, err := evalengine.ToUint64(bv)
 	if err != nil {
 		return 0, QROutOfRange
 	}
@@ -709,7 +747,7 @@ func getint64(val *querypb.BindVariable) (iv int64, status int) {
 	if err != nil {
 		return 0, QROutOfRange
 	}
-	v, err := sqltypes.ToInt64(bv)
+	v, err := evalengine.ToInt64(bv)
 	if err != nil {
 		return 0, QROutOfRange
 	}

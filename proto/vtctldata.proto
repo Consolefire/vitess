@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,10 +18,17 @@ limitations under the License.
 // you to use vtctld as a server for vt commands.
 
 syntax = "proto3";
+option go_package = "vitess.io/vitess/go/vt/proto/vtctldata";
 
 package vtctldata;
 
+import "google/protobuf/duration.proto";
+
 import "logutil.proto";
+import "mysqlctl.proto";
+import "tabletmanagerdata.proto";
+import "topodata.proto";
+import "vschema.proto";
 
 // ExecuteVtctlCommandRequest is the payload for ExecuteVtctlCommand.
 // timeouts are in nanoseconds.
@@ -33,4 +40,168 @@ message ExecuteVtctlCommandRequest {
 // ExecuteVtctlCommandResponse is streamed back by ExecuteVtctlCommand.
 message ExecuteVtctlCommandResponse {
   logutil.Event event = 1;
+}
+
+message GetBackupsRequest {
+  string keyspace = 1;
+  string shard = 2;
+}
+
+message GetBackupsResponse {
+  repeated mysqlctl.BackupInfo backups = 1;
+}
+
+message GetCellInfoNamesRequest {
+}
+
+message GetCellInfoNamesResponse {
+  repeated string names = 1;
+}
+
+message GetCellInfoRequest {
+  string cell = 1;
+}
+
+message GetCellInfoResponse {
+  topodata.CellInfo cell_info = 1;
+}
+
+message GetCellsAliasesRequest {
+}
+
+message GetCellsAliasesResponse {
+  map<string,topodata.CellsAlias> aliases = 1;
+}
+
+message GetKeyspacesRequest {
+}
+
+message GetKeyspacesResponse {
+  repeated Keyspace keyspaces = 1; 
+}
+
+message GetKeyspaceRequest {
+  string keyspace = 1;
+}
+
+message GetKeyspaceResponse {
+  Keyspace keyspace = 1;
+}
+
+message GetSchemaRequest {
+  topodata.TabletAlias tablet_alias = 1;
+  // Tables is a list of tables for which we should gather information. Each is
+  // either an exact match, or a regular expression of the form /regexp/.
+  repeated string tables = 2;
+  // ExcludeTables is a list of tables to exclude from the result. Each is
+  // either an exact match, or a regular expression of the form /regexp/.
+  repeated string exclude_tables = 3;
+  // IncludeViews specifies whether to include views in the result.
+  bool include_views = 4;
+  // TableNamesOnly specifies whether to limit the results to just table names,
+  // rather than full schema information for each table.
+  bool table_names_only = 5;
+  // TableSizesOnly specifies whether to limit the results to just table sizes,
+  // rather than full schema information for each table. It is ignored if
+  // TableNamesOnly is set to true.
+  bool table_sizes_only = 6;
+}
+
+message GetSchemaResponse {
+  tabletmanagerdata.SchemaDefinition schema = 1;
+}
+
+message GetSrvVSchemaRequest {
+  string cell = 1;
+}
+
+message GetSrvVSchemaResponse {
+  vschema.SrvVSchema srv_v_schema = 1;
+}
+
+message GetTabletRequest {
+  topodata.TabletAlias tablet_alias = 1;
+}
+
+message GetTabletResponse {
+  topodata.Tablet tablet = 1;
+}
+
+message GetTabletsRequest {
+  // Keyspace is the name of the keyspace to return tablets for. Omit to return
+  // all tablets.
+  string keyspace = 1;
+  // Shard is the name of the shard to return tablets for. This field is ignored
+  // if Keyspace is not set.
+  string shard = 2;
+  // Cells is an optional set of cells to return tablets for.
+  repeated string cells = 3;
+}
+
+message GetTabletsResponse {
+  repeated topodata.Tablet tablets = 1;
+}
+
+message GetVSchemaRequest {
+  string keyspace = 1;
+}
+
+message GetVSchemaResponse {
+  vschema.Keyspace v_schema = 1;
+}
+
+message InitShardPrimaryRequest {
+  string keyspace = 1;
+  string shard = 2;
+  topodata.TabletAlias primary_elect_tablet_alias = 3;
+  bool force = 4;
+  google.protobuf.Duration wait_replicas_timeout = 5;
+}
+
+message InitShardPrimaryResponse {
+  repeated logutil.Event events = 1;
+}
+
+message Keyspace {
+  string name = 1;
+  topodata.Keyspace keyspace = 2;
+}
+
+message FindAllShardsInKeyspaceRequest {
+  string keyspace = 1;
+}
+
+message FindAllShardsInKeyspaceResponse {
+  map<string, Shard> shards = 1;
+}
+
+message Shard {
+  string keyspace = 1;
+  string name = 2;
+  topodata.Shard shard = 3;
+}
+
+// TableMaterializeSttings contains the settings for one table.
+message TableMaterializeSettings {
+  string target_table = 1;
+  // source_expression is a select statement.
+  string source_expression = 2;
+  // create_ddl contains the DDL to create the target table.
+  // If empty, the target table must already exist.
+  // if "copy", the target table DDL is the same as the source table.
+  string create_ddl = 3;
+}
+
+// MaterializeSettings contains the settings for the Materialize command.
+message MaterializeSettings {
+  // workflow is the name of the workflow.
+  string workflow = 1;
+  string source_keyspace = 2;
+  string target_keyspace = 3;
+  // stop_after_copy specifies if vreplication should be stopped after copying.
+  bool stop_after_copy = 4;
+  repeated TableMaterializeSettings table_settings = 5;
+  // optional parameters.
+  string cell = 6;
+  string tablet_types = 7;
 }

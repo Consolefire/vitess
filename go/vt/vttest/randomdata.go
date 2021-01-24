@@ -1,5 +1,5 @@
 /*
-Copyright 2017 GitHub Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 
 // FieldGenerator is a callback that generates the value of a random field in
 // when seeding the database with random data. `name` is the name of the column
-// where the field belongs, `t` is its SQL tyoe, and `rng` is the the RNG currently
+// where the field belongs, `t` is its SQL tyoe, and `rng` is the RNG currently
 // being used, as to ensure reproducible generation between runs.
 // A FieldGenerator must return the raw SQL data for the field, ready to be
 // placed into a SQL statement. The returned value will _NOT_ be escaped.

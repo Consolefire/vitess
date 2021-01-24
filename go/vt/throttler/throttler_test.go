@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2020 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ import (
 // BenchmarkThrottlerParallel_10kQPS-4 	  500000	    100060 ns/op
 // BenchmarkThrottlerParallel_100kQPS-4	 5000000	      9999 ns/op
 // BenchmarkThrottlerDisabled-4	500000000	        94.9 ns/op
-// ok  	github.com/youtube/vitess/go/vt/throttler	448.282
+// ok  	vitess.io/vitess/go/vt/throttler	448.282
 
 func BenchmarkThrottler_1kQPS(b *testing.B) {
 	benchmarkThrottler(b, 1*1000)
@@ -134,12 +134,9 @@ func BenchmarkThrottlerDisabled(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		for {
-			backoff := throttler.Throttle(0)
-			if backoff != NotThrottled {
-				b.Fatalf("unthrottled throttler should never have throttled us: %v", backoff)
-			}
-			break
+		backoff := throttler.Throttle(0)
+		if backoff != NotThrottled {
+			b.Fatalf("unthrottled throttler should never have throttled us: %v", backoff)
 		}
 	}
 }

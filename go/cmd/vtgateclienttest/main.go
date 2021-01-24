@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,13 +20,10 @@ limitations under the License.
 package main
 
 import (
-	"flag"
-	"os"
-
-	"github.com/youtube/vitess/go/cmd/vtgateclienttest/services"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/vtgate"
+	"vitess.io/vitess/go/cmd/vtgateclienttest/services"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vtgate"
 )
 
 func init() {
@@ -36,13 +33,8 @@ func init() {
 func main() {
 	defer exit.Recover()
 
-	flag.Parse()
+	servenv.ParseFlags("vtgateclienttest")
 	servenv.Init()
-
-	if *servenv.Version {
-		servenv.AppVersion.Print()
-		os.Exit(0)
-	}
 
 	// The implementation chain.
 	servenv.OnRun(func() {

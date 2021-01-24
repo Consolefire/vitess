@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -20,12 +20,12 @@ import (
 	"fmt"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // This file tests the CellInfo part of the topo.Server API.
@@ -33,14 +33,14 @@ import (
 func TestCellInfo(t *testing.T) {
 	cell := "cell1"
 	ctx := context.Background()
-	ts := topo.Server{Impl: memorytopo.New(cell)}
+	ts := memorytopo.NewServer(cell)
 
 	// Check GetCellInfo returns what memorytopo created.
-	ci, err := ts.GetCellInfo(ctx, cell)
+	ci, err := ts.GetCellInfo(ctx, cell, true /*strongRead*/)
 	if err != nil {
 		t.Fatalf("GetCellInfo failed: %v", err)
 	}
-	if ci.Root != "/" {
+	if ci.Root != "" {
 		t.Fatalf("unexpected CellInfo: %v", ci)
 	}
 
@@ -51,7 +51,7 @@ func TestCellInfo(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpdateCellInfoFields failed: %v", err)
 	}
-	ci, err = ts.GetCellInfo(ctx, cell)
+	ci, err = ts.GetCellInfo(ctx, cell, true /*strongRead*/)
 	if err != nil {
 		t.Fatalf("GetCellInfo failed: %v", err)
 	}
@@ -62,11 +62,11 @@ func TestCellInfo(t *testing.T) {
 	// Test update with no change.
 	if err := ts.UpdateCellInfoFields(ctx, cell, func(ci *topodatapb.CellInfo) error {
 		ci.ServerAddress = "bad address"
-		return topo.ErrNoUpdateNeeded
+		return topo.NewError(topo.NoUpdateNeeded, cell)
 	}); err != nil {
 		t.Fatalf("UpdateCellInfoFields failed: %v", err)
 	}
-	ci, err = ts.GetCellInfo(ctx, cell)
+	ci, err = ts.GetCellInfo(ctx, cell, true /*strongRead*/)
 	if err != nil {
 		t.Fatalf("GetCellInfo failed: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestCellInfo(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpdateCellInfoFields failed: %v", err)
 	}
-	ci, err = ts.GetCellInfo(ctx, newCell)
+	ci, err = ts.GetCellInfo(ctx, newCell, true /*strongRead*/)
 	if err != nil {
 		t.Fatalf("GetCellInfo failed: %v", err)
 	}
@@ -99,11 +99,28 @@ func TestCellInfo(t *testing.T) {
 		t.Fatalf("unexpected CellInfo: %v", ci)
 	}
 
-	// Might as well test DeleteCellInfo.
-	if err := ts.DeleteCellInfo(ctx, newCell); err != nil {
-		t.Fatalf("DeleteCellInfo failed: %v", err)
+	// Add a record that should block CellInfo deletion for safety reasons.
+	if err := ts.UpdateSrvKeyspace(ctx, cell, "keyspace", &topodatapb.SrvKeyspace{}); err != nil {
+		t.Fatalf("UpdateSrvKeyspace failed: %v", err)
 	}
-	if _, err := ts.GetCellInfo(ctx, newCell); err != topo.ErrNoNode {
+	srvKeyspaces, err := ts.GetSrvKeyspaceNames(ctx, cell)
+	if err != nil {
+		t.Fatalf("GetSrvKeyspaceNames failed: %v", err)
+	}
+	if len(srvKeyspaces) == 0 {
+		t.Fatalf("UpdateSrvKeyspace did not add SrvKeyspace.")
+	}
+
+	// Try to delete without force; it should fail.
+	if err := ts.DeleteCellInfo(ctx, cell, false); err == nil {
+		t.Fatalf("DeleteCellInfo should have failed without -force")
+	}
+
+	// Use the force.
+	if err := ts.DeleteCellInfo(ctx, cell, true); err != nil {
+		t.Fatalf("DeleteCellInfo failed even with -force: %v", err)
+	}
+	if _, err := ts.GetCellInfo(ctx, cell, true /*strongRead*/); !topo.IsErrType(err, topo.NoNode) {
 		t.Fatalf("GetCellInfo(non-existing cell) failed: %v", err)
 	}
 }

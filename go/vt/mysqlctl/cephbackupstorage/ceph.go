@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -30,12 +30,13 @@ import (
 
 	"errors"
 
-	log "github.com/golang/glog"
-	minio "github.com/minio/minio-go"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/concurrency"
-	"github.com/youtube/vitess/go/vt/mysqlctl/backupstorage"
+	minio "github.com/minio/minio-go"
+
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 )
 
 var (
@@ -62,6 +63,21 @@ type CephBackupHandle struct {
 	waitGroup sync.WaitGroup
 }
 
+// RecordError is part of the concurrency.ErrorRecorder interface.
+func (bh *CephBackupHandle) RecordError(err error) {
+	bh.errors.RecordError(err)
+}
+
+// HasErrors is part of the concurrency.ErrorRecorder interface.
+func (bh *CephBackupHandle) HasErrors() bool {
+	return bh.errors.HasErrors()
+}
+
+// Error is part of the concurrency.ErrorRecorder interface.
+func (bh *CephBackupHandle) Error() error {
+	return bh.errors.Error()
+}
+
 // Directory implements BackupHandle.
 func (bh *CephBackupHandle) Directory() string {
 	return bh.dir
@@ -73,7 +89,7 @@ func (bh *CephBackupHandle) Name() string {
 }
 
 // AddFile implements BackupHandle.
-func (bh *CephBackupHandle) AddFile(ctx context.Context, filename string) (io.WriteCloser, error) {
+func (bh *CephBackupHandle) AddFile(ctx context.Context, filename string, filesize int64) (io.WriteCloser, error) {
 	if bh.readOnly {
 		return nil, fmt.Errorf("AddFile cannot be called on read-only backup")
 	}
@@ -88,12 +104,13 @@ func (bh *CephBackupHandle) AddFile(ctx context.Context, filename string) (io.Wr
 
 		// Give PutObject() the read end of the pipe.
 		object := objName(bh.dir, bh.name, filename)
-		_, err := bh.client.PutObject(bucket, object, reader, "application/octet-stream")
+		// If filesize is unknown, the caller should pass in -1 and we will pass it through.
+		_, err := bh.client.PutObjectWithContext(ctx, bucket, object, reader, filesize, minio.PutObjectOptions{ContentType: "application/octet-stream"})
 		if err != nil {
 			// Signal the writer that an error occurred, in case it's not done writing yet.
 			reader.CloseWithError(err)
 			// In case the error happened after the writer finished, we need to remember it.
-			bh.errors.RecordError(err)
+			bh.RecordError(err)
 		}
 	}()
 	// Give our caller the write end of the pipe.
@@ -107,7 +124,7 @@ func (bh *CephBackupHandle) EndBackup(ctx context.Context) error {
 	}
 	bh.waitGroup.Wait()
 	// Return the saved PutObject() errors, if any.
-	return bh.errors.Error()
+	return bh.Error()
 }
 
 // AbortBackup implements BackupHandle.
@@ -126,7 +143,7 @@ func (bh *CephBackupHandle) ReadFile(ctx context.Context, filename string) (io.R
 	// ceph bucket name
 	bucket := alterBucketName(bh.dir)
 	object := objName(bh.dir, bh.name, filename)
-	return bh.client.GetObject(bucket, object)
+	return bh.client.GetObjectWithContext(ctx, bucket, object, minio.GetObjectOptions{})
 }
 
 // CephBackupStorage implements BackupStorage for Ceph Cloud Storage.
@@ -154,7 +171,7 @@ func (bs *CephBackupStorage) ListBackups(ctx context.Context, dir string) ([]bac
 	doneCh := make(chan struct{})
 	for object := range c.ListObjects(bucket, searchPrefix, false, doneCh) {
 		if object.Err != nil {
-			err := c.BucketExists(bucket)
+			_, err := c.BucketExists(bucket)
 			if err != nil {
 				return nil, nil
 			}
@@ -190,8 +207,13 @@ func (bs *CephBackupStorage) StartBackup(ctx context.Context, dir, name string) 
 	// ceph bucket name
 	bucket := alterBucketName(dir)
 
-	err = c.BucketExists(bucket)
+	found, err := c.BucketExists(bucket)
+
 	if err != nil {
+		log.Info("Error from BucketExists: %v, quitting", bucket)
+		return nil, errors.New("Error checking whether bucket exists: " + bucket)
+	}
+	if !found {
 		log.Info("Bucket: %v doesn't exist, creating new bucket with the required name", bucket)
 		err = c.MakeBucket(bucket, "")
 		if err != nil {
@@ -263,7 +285,7 @@ func (bs *CephBackupStorage) client() (*minio.Client, error) {
 		defer configFile.Close()
 		jsonParser := json.NewDecoder(configFile)
 		if err = jsonParser.Decode(&storageConfig); err != nil {
-			return nil, fmt.Errorf("Error parsing the json file : %v", err)
+			return nil, fmt.Errorf("error parsing the json file : %v", err)
 		}
 
 		accessKey := storageConfig.AccessKey

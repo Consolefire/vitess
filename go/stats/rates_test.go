@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ func TestRates(t *testing.T) {
 	}
 
 	clear()
-	c := NewCounters("rcounter1")
+	c := NewCountersWithSingleLabel("rcounter1", "rcounter help", "label")
 	r := NewRates("rates1", c, 3, -1*time.Second)
 	r.snapshot()
 	now = now.Add(epsilon)
@@ -90,7 +90,7 @@ func TestRatesConsistency(t *testing.T) {
 	// covered by rates, the sum of the rates reported must be
 	// equal to the count reported by the counter.
 	clear()
-	c := NewCounters("rcounter4")
+	c := NewCountersWithSingleLabel("rcounter4", "rcounter4 help", "label")
 	r := NewRates("rates4", c, 100, -1*time.Second)
 	r.snapshot()
 
@@ -123,7 +123,7 @@ func TestRatesConsistency(t *testing.T) {
 
 func TestRatesHook(t *testing.T) {
 	clear()
-	c := NewCounters("rcounter2")
+	c := NewCountersWithSingleLabel("rcounter2", "rcounter2 help", "label")
 	var gotname string
 	var gotv *Rates
 	clear()

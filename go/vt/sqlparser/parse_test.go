@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,21 +17,35 @@ limitations under the License.
 package sqlparser
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"math/rand"
+	"os"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
 	validSQL = []struct {
-		input  string
-		output string
+		input      string
+		output     string
+		partialDDL bool
 	}{{
 		input:  "select 1",
 		output: "select 1 from dual",
 	}, {
 		input: "select 1 from t",
+	}, {
+		input:  "select * from information_schema.columns",
+		output: "select * from information_schema.`columns`",
+	}, {
+		input:  "select * from information_schema.processlist",
+		output: "select * from information_schema.`processlist`",
 	}, {
 		input: "select .1 from t",
 	}, {
@@ -47,6 +61,12 @@ var (
 	}, {
 		input:  "select - -1 from t",
 		output: "select 1 from t",
+	}, {
+		input: "select a from t",
+	}, {
+		input: "select $ from t",
+	}, {
+		input: "select a.b as a$b from $test$",
 	}, {
 		input:  "select 1 from t // aa\n",
 		output: "select 1 from t",
@@ -96,7 +116,8 @@ var (
 	}, {
 		input: "select /* union all */ 1 from t union all select 1 from t",
 	}, {
-		input: "select /* union distinct */ 1 from t union distinct select 1 from t",
+		input:  "select /* union distinct */ 1 from t union distinct select 1 from t",
+		output: "select /* union distinct */ 1 from t union select 1 from t",
 	}, {
 		input:  "(select /* union parenthesized select */ 1 from t order by a) union select 1 from t",
 		output: "(select /* union parenthesized select */ 1 from t order by a asc) union select 1 from t",
@@ -118,9 +139,28 @@ var (
 	}, {
 		input: "select * from t1 join (select * from t2 union select * from t3) as t",
 	}, {
+		// Ensure this doesn't generate: ""select * from t1 join t2 on a = b join t3 on a = b".
+		input: "select * from t1 join t2 on a = b join t3",
+	}, {
 		input: "select * from t1 where col in (select 1 from dual union select 2 from dual)",
 	}, {
 		input: "select * from t1 where exists (select a from t2 union select b from t3)",
+	}, {
+		input: "select 1 from dual union select 2 from dual union all select 3 from dual union select 4 from dual union all select 5 from dual",
+	}, {
+		input: "(select 1 from dual) order by 1 asc limit 2",
+	}, {
+		input: "(select 1 from dual order by 1 desc) order by 1 asc limit 2",
+	}, {
+		input: "(select 1 from dual)",
+	}, {
+		input: "((select 1 from dual))",
+	}, {
+		input: "select 1 from (select 1 from dual) as t",
+	}, {
+		input: "select 1 from (select 1 from dual union select 2 from dual) as t",
+	}, {
+		input: "select 1 from ((select 1 from dual) union select 2 from dual) as t",
 	}, {
 		input: "select /* distinct */ distinct 1 from t",
 	}, {
@@ -150,6 +190,9 @@ var (
 	}, {
 		input:  "select /* column alias as string without as */ a \"b\" from t",
 		output: "select /* column alias as string without as */ a as b from t",
+	}, {
+		input:  "select /* column alias with non_reserved keyword */ a as auto_increment from t",
+		output: "select /* column alias with non_reserved keyword */ a as `auto_increment` from t",
 	}, {
 		input: "select /* a.* */ a.* from t",
 	}, {
@@ -187,6 +230,8 @@ var (
 	}, {
 		input: "select /* use */ 1 from t1 use index (a) where b = 1",
 	}, {
+		input: "select /* use */ 1 from t1 use index () where b = 1",
+	}, {
 		input: "select /* keyword index */ 1 from t1 use index (`By`) where b = 1",
 	}, {
 		input: "select /* ignore */ 1 from t1 as t2 ignore index (a), t3 use index (b) where b = 1",
@@ -212,6 +257,8 @@ var (
 	}, {
 		input: "select /* join on */ 1 from t1 join t2 on a = b",
 	}, {
+		input: "select /* join on */ 1 from t1 join t2 using (a)",
+	}, {
 		input:  "select /* inner join */ 1 from t1 inner join t2",
 		output: "select /* inner join */ 1 from t1 join t2",
 	}, {
@@ -224,13 +271,23 @@ var (
 	}, {
 		input: "select /* left join */ 1 from t1 left join t2 on a = b",
 	}, {
+		input: "select /* left join */ 1 from t1 left join t2 using (a)",
+	}, {
 		input:  "select /* left outer join */ 1 from t1 left outer join t2 on a = b",
 		output: "select /* left outer join */ 1 from t1 left join t2 on a = b",
 	}, {
+		input:  "select /* left outer join */ 1 from t1 left outer join t2 using (a)",
+		output: "select /* left outer join */ 1 from t1 left join t2 using (a)",
+	}, {
 		input: "select /* right join */ 1 from t1 right join t2 on a = b",
+	}, {
+		input: "select /* right join */ 1 from t1 right join t2 using (a)",
 	}, {
 		input:  "select /* right outer join */ 1 from t1 right outer join t2 on a = b",
 		output: "select /* right outer join */ 1 from t1 right join t2 on a = b",
+	}, {
+		input:  "select /* right outer join */ 1 from t1 right outer join t2 using (a)",
+		output: "select /* right outer join */ 1 from t1 right join t2 using (a)",
 	}, {
 		input: "select /* natural join */ 1 from t1 natural join t2",
 	}, {
@@ -245,6 +302,10 @@ var (
 		output: "select /* natural right outer join */ 1 from t1 natural right join t2",
 	}, {
 		input: "select /* join on */ 1 from t1 join t2 on a = b",
+	}, {
+		input: "select /* join using */ 1 from t1 join t2 using (a)",
+	}, {
+		input: "select /* join using (a, b, c) */ 1 from t1 join t2 using (a, b, c)",
 	}, {
 		input: "select /* s.t */ 1 from s.t",
 	}, {
@@ -283,7 +344,8 @@ var (
 	}, {
 		input: "select /* exists */ 1 from t where exists (select 1 from t)",
 	}, {
-		input: "select /* (boolean) */ 1 from t where not (a = b)",
+		input:  "select /* (boolean) */ 1 from t where not (a = b)",
+		output: "select /* (boolean) */ 1 from t where not a = b",
 	}, {
 		input: "select /* in value list */ 1 from t where a in (b, c)",
 	}, {
@@ -346,11 +408,14 @@ var (
 	}, {
 		input: "select /* select as a value expression */ 1 from t where a = (select a from t)",
 	}, {
-		input: "select /* parenthesised value */ 1 from t where a = (b)",
+		input:  "select /* parenthesised value */ 1 from t where a = (b)",
+		output: "select /* parenthesised value */ 1 from t where a = b",
 	}, {
-		input: "select /* over-parenthesize */ ((1)) from t where ((a)) in (((1))) and ((a, b)) in ((((1, 1))), ((2, 2)))",
+		input:  "select /* over-parenthesize */ ((1)) from t where ((a)) in (((1))) and ((a, b)) in ((((1, 1))), ((2, 2)))",
+		output: "select /* over-parenthesize */ 1 from t where a in (1) and (a, b) in ((1, 1), (2, 2))",
 	}, {
-		input: "select /* dot-parenthesize */ (a.b) from t where (b.c) = 2",
+		input:  "select /* dot-parenthesize */ (a.b) from t where (b.c) = 2",
+		output: "select /* dot-parenthesize */ a.b from t where b.c = 2",
 	}, {
 		input: "select /* & */ 1 from t where a = b & c",
 	}, {
@@ -400,9 +465,54 @@ var (
 	}, {
 		input: "select /* function with distinct */ count(distinct a) from t",
 	}, {
+		input:  "select count(distinctrow(1)) from (select (1) from dual union all select 1 from dual) a",
+		output: "select count(distinct 1) from (select 1 from dual union all select 1 from dual) as a",
+	}, {
 		input: "select /* if as func */ 1 from t where a = if(b)",
 	}, {
+		input: "select /* current_timestamp */ current_timestamp() from t",
+	}, {
 		input: "select /* current_timestamp as func */ current_timestamp() from t",
+	}, {
+		input: "select /* current_timestamp with fsp */ current_timestamp(3) from t",
+	}, {
+		input: "select /* current_date */ current_date() from t",
+	}, {
+		input: "select /* current_date as func */ current_date() from t",
+	}, {
+		input: "select /* current_time */ current_time() from t",
+	}, {
+		input: "select /* current_time as func */ current_time() from t",
+	}, {
+		input: "select /* current_time with fsp */ current_time(1) from t",
+	}, {
+		input: "select /* utc_timestamp */ utc_timestamp() from t",
+	}, {
+		input: "select /* utc_timestamp as func */ utc_timestamp() from t",
+	}, {
+		input: "select /* utc_timestamp with fsp */ utc_timestamp(0) from t",
+	}, {
+		input: "select /* utc_time */ utc_time() from t",
+	}, {
+		input: "select /* utc_time as func */ utc_time() from t",
+	}, {
+		input: "select /* utc_time with fsp */ utc_time(4) from t",
+	}, {
+		input: "select /* utc_date */ utc_date() from t",
+	}, {
+		input: "select /* utc_date as func */ utc_date() from t",
+	}, {
+		input: "select /* localtime */ localtime() from t",
+	}, {
+		input: "select /* localtime as func */ localtime() from t",
+	}, {
+		input: "select /* localtime with fsp */ localtime(5) from t",
+	}, {
+		input: "select /* localtimestamp */ localtimestamp() from t",
+	}, {
+		input: "select /* localtimestamp as func */ localtimestamp() from t",
+	}, {
+		input: "select /* localtimestamp with fsp */ localtimestamp(7) from t",
 	}, {
 		input: "select /* mod as func */ a from tab where mod(b, 2) = 0",
 	}, {
@@ -507,6 +617,14 @@ var (
 	}, {
 		input: "select /* interval */ adddate('2008-01-02', interval 31 day) from t",
 	}, {
+		input: "select /* interval keyword */ adddate('2008-01-02', interval 1 year) from t",
+	}, {
+		input:  "select /* TIMESTAMPADD */ TIMESTAMPADD(MINUTE, 1, '2008-01-04') from t",
+		output: "select /* TIMESTAMPADD */ timestampadd(MINUTE, 1, '2008-01-04') from t",
+	}, {
+		input:  "select /* TIMESTAMPDIFF */ TIMESTAMPDIFF(MINUTE, '2008-01-02', '2008-01-04') from t",
+		output: "select /* TIMESTAMPDIFF */ timestampdiff(MINUTE, '2008-01-02', '2008-01-04') from t",
+	}, {
 		input: "select /* dual */ 1 from dual",
 	}, {
 		input:  "select /* Dual */ 1 from Dual",
@@ -521,7 +639,18 @@ var (
 	}, {
 		input: "select /* OR of mixed columns in where */ * from t where a = 5 or b and c is not null",
 	}, {
-		input: "select /* OR in select columns */ (a or b) from t where c = 5",
+		input:  "select /* OR in select columns */ (a or b) from t where c = 5",
+		output: "select /* OR in select columns */ a or b from t where c = 5",
+	}, {
+		input: "select /* XOR of columns in where */ * from t where a xor b",
+	}, {
+		input: "select /* XOR of mixed columns in where */ * from t where a = 5 xor b and c is not null",
+	}, {
+		input:  "select /* XOR in select columns */ (a xor b) from t where c = 5",
+		output: "select /* XOR in select columns */ a xor b from t where c = 5",
+	}, {
+		input:  "select /* XOR in select columns */ * from t where (1 xor c1 > 0)",
+		output: "select /* XOR in select columns */ * from t where 1 xor c1 > 0",
 	}, {
 		input: "select /* bool as select value */ a, true from t",
 	}, {
@@ -531,9 +660,25 @@ var (
 	}, {
 		input: "select /* string in case statement */ if(max(case a when 'foo' then 1 else 0 end) = 1, 'foo', 'bar') as foobar from t",
 	}, {
-		input: "select /* dual */ 1 from dual",
+		input:  "/*!show databases*/",
+		output: "show databases",
+	}, {
+		input:  "select /*!40101 * from*/ t",
+		output: "select * from t",
+	}, {
+		input:  "select /*! * from*/ t",
+		output: "select * from t",
+	}, {
+		input:  "select /*!* from*/ t",
+		output: "select * from t",
+	}, {
+		input:  "select /*!401011 from*/ t",
+		output: "select 1 from t",
 	}, {
 		input: "select /* dual */ 1 from dual",
+	}, {
+		input:  "select * from (select 'tables') tables",
+		output: "select * from (select 'tables' from dual) as `tables`",
 	}, {
 		input: "insert /* simple */ into a values (1)",
 	}, {
@@ -566,11 +711,12 @@ var (
 	}, {
 		input: "insert /* select */ into a select b, c from d",
 	}, {
-		input:  "insert /* no cols & paren select */ into a(select * from t)",
-		output: "insert /* no cols & paren select */ into a select * from t",
+		input:  "insert /* it accepts columns with keyword action */ into a(action, b) values (1, 2)",
+		output: "insert /* it accepts columns with keyword action */ into a(`action`, b) values (1, 2)",
 	}, {
-		input:  "insert /* cols & paren select */ into a(a,b,c) (select * from t)",
-		output: "insert /* cols & paren select */ into a(a, b, c) select * from t",
+		input: "insert /* no cols & paren select */ into a (select * from t)",
+	}, {
+		input: "insert /* cols & paren select */ into a(a, b, c) (select * from t)",
 	}, {
 		input: "insert /* cols & union with paren select */ into a(b, c) (select d, e from f) union (select g from h)",
 	}, {
@@ -580,7 +726,19 @@ var (
 	}, {
 		input: "insert /* bool in on duplicate */ into a values (1, 2) on duplicate key update b = false, c = d",
 	}, {
+		input: "insert /* bool in on duplicate */ into a values (1, 2, 3) on duplicate key update b = values(b), c = d",
+	}, {
+		input: "insert /* bool in on duplicate */ into a values (1, 2, 3) on duplicate key update b = values(a.b), c = d",
+	}, {
 		input: "insert /* bool expression on duplicate */ into a values (1, 2) on duplicate key update b = func(a), c = a > d",
+	}, {
+		input: "insert into user(username, `status`) values ('Chuck', default(`status`))",
+	}, {
+		input:  "insert into user(format, tree, vitess) values ('Chuck', 42, 'Barry')",
+		output: "insert into user(`format`, `tree`, `vitess`) values ('Chuck', 42, 'Barry')",
+	}, {
+		input:  "insert into customer () values ()",
+		output: "insert into customer values ()",
 	}, {
 		input: "update /* simple */ a set b = 3",
 	}, {
@@ -613,10 +771,12 @@ var (
 		output: "update (select id from foo) as subqalias set id = 4",
 	}, {
 		input:  "update foo f, bar b set f.id = b.id where b.name = 'test'",
-		output: "update foo as f, bar as b set f.id = b.id where b.name = 'test'",
+		output: "update foo as f, bar as b set f.id = b.id where b.`name` = 'test'",
 	}, {
 		input:  "update foo f join bar b on f.name = b.name set f.id = b.id where b.name = 'test'",
-		output: "update foo as f join bar as b on f.name = b.name set f.id = b.id where b.name = 'test'",
+		output: "update foo as f join bar as b on f.`name` = b.`name` set f.id = b.id where b.`name` = 'test'",
+	}, {
+		input: "update /* ignore */ ignore a set b = 3",
 	}, {
 		input: "delete /* simple */ from a",
 	}, {
@@ -628,9 +788,20 @@ var (
 	}, {
 		input: "delete /* limit */ from a limit b",
 	}, {
-		input: "delete a from a join b on a.id = b.id where b.name = 'test'",
+		input:  "delete a from a join b on a.id = b.id where b.name = 'test'",
+		output: "delete a from a join b on a.id = b.id where b.`name` = 'test'",
 	}, {
-		input: "delete a, b from a, b where a.id = b.id and b.name = 'test'",
+		input:  "delete a, b from a, b where a.id = b.id and b.name = 'test'",
+		output: "delete a, b from a, b where a.id = b.id and b.`name` = 'test'",
+	}, {
+		input: "delete /* simple */ ignore from a",
+	}, {
+		input: "delete ignore from a",
+	}, {
+		input: "delete /* limit */ ignore from a",
+	}, {
+		input:  "delete from a1, a2 using t1 as a1 inner join t2 as a2 where a1.id=a2.id",
+		output: "delete a1, a2 from t1 as a1 join t2 as a2 where a1.id = a2.id",
 	}, {
 		input: "set /* simple */ a = 3",
 	}, {
@@ -638,107 +809,303 @@ var (
 	}, {
 		input: "set character_set_results = utf8",
 	}, {
+		input: "set @@session.autocommit = true",
+	}, {
+		input: "set @@session.`autocommit` = true",
+	}, {
+		input: "set @@session.'autocommit' = true",
+	}, {
+		input: "set @@session.\"autocommit\" = true",
+	}, {
+		input:  "set @@session.autocommit = ON",
+		output: "set @@session.autocommit = 'on'",
+	}, {
+		input:  "set @@session.autocommit= OFF",
+		output: "set @@session.autocommit = 'off'",
+	}, {
+		input:  "set autocommit = on",
+		output: "set autocommit = 'on'",
+	}, {
+		input:  "set autocommit = off",
+		output: "set autocommit = 'off'",
+	}, {
 		input:  "set names utf8 collate foo",
-		output: "set ",
+		output: "set names 'utf8'",
+	}, {
+		input:  "set names utf8 collate 'foo'",
+		output: "set names 'utf8'",
 	}, {
 		input:  "set character set utf8",
-		output: "set ",
+		output: "set charset 'utf8'",
 	}, {
 		input:  "set character set 'utf8'",
-		output: "set ",
+		output: "set charset 'utf8'",
 	}, {
 		input:  "set character set \"utf8\"",
-		output: "set ",
+		output: "set charset 'utf8'",
 	}, {
 		input:  "set charset default",
-		output: "set ",
+		output: "set charset default",
+	}, {
+		input:  "set session wait_timeout = 3600",
+		output: "set session wait_timeout = 3600",
+	}, {
+		input:  "set session wait_timeout = 3600, session autocommit = off",
+		output: "set session wait_timeout = 3600, session autocommit = 'off'",
+	}, {
+		input:  "set session wait_timeout = 3600, @@global.autocommit = off",
+		output: "set session wait_timeout = 3600, @@global.autocommit = 'off'",
 	}, {
 		input: "set /* list */ a = 3, b = 4",
 	}, {
-		input:  "alter ignore table a add foo",
-		output: "alter table a",
+		input: "set /* mixed list */ a = 3, names 'utf8', charset 'ascii', b = 4",
 	}, {
-		input:  "alter table a add foo",
-		output: "alter table a",
+		input: "set session transaction isolation level repeatable read",
 	}, {
-		input:  "alter table `By` add foo",
-		output: "alter table `By`",
+		input: "set transaction isolation level repeatable read",
 	}, {
-		input:  "alter table a alter foo",
-		output: "alter table a",
+		input: "set global transaction isolation level repeatable read",
 	}, {
-		input:  "alter table a change foo",
-		output: "alter table a",
+		input: "set transaction isolation level repeatable read",
 	}, {
-		input:  "alter table a modify foo",
-		output: "alter table a",
+		input: "set transaction isolation level read committed",
 	}, {
-		input:  "alter table a drop foo",
-		output: "alter table a",
+		input: "set transaction isolation level read uncommitted",
 	}, {
-		input:  "alter table a disable foo",
-		output: "alter table a",
+		input: "set transaction isolation level serializable",
 	}, {
-		input:  "alter table a enable foo",
-		output: "alter table a",
+		input: "set transaction read write",
 	}, {
-		input:  "alter table a order foo",
-		output: "alter table a",
+		input: "set transaction read only",
 	}, {
-		input:  "alter table a default foo",
-		output: "alter table a",
+		input: "set tx_read_only = 1",
 	}, {
-		input:  "alter table a discard foo",
-		output: "alter table a",
+		input: "set tx_read_only = 0",
 	}, {
-		input:  "alter table a import foo",
-		output: "alter table a",
+		input: "set transaction_read_only = 1",
 	}, {
-		input:  "alter table a rename b",
-		output: "rename table a b",
+		input: "set transaction_read_only = 0",
 	}, {
-		input:  "alter table `By` rename `bY`",
-		output: "rename table `By` `bY`",
+		input: "set tx_isolation = 'repeatable read'",
+	}, {
+		input: "set tx_isolation = 'read committed'",
+	}, {
+		input: "set tx_isolation = 'read uncommitted'",
+	}, {
+		input: "set tx_isolation = 'serializable'",
+	}, {
+		input: "set sql_safe_updates = 0",
+	}, {
+		input: "set sql_safe_updates = 1",
+	}, {
+		input: "set @variable = 42",
+	}, {
+		input: "set @period.variable = 42",
+	}, {
+		input:  "alter table a add foo int first v",
+		output: "alter table a add column foo int first v",
+	}, {
+		input:  "alter table a lock default, lock = none, lock shared, lock exclusive",
+		output: "alter table a lock default, lock none, lock shared, lock exclusive",
+	}, {
+		input:  "alter table a alter x set default NULL, alter column x2 set default 's', alter x3 drop default",
+		output: "alter table a alter column x set default null, alter column x2 set default 's', alter column x3 drop default",
+	}, {
+		input: "alter table a add spatial key foo (column1)",
+	}, {
+		input: "alter table a add fulltext key foo (column1), order by a, b, c",
+	}, {
+		input: "alter table a add unique key foo (column1)",
+	}, {
+		input: "alter table a change column s foo int default 1 after x",
+	}, {
+		input: "alter table a modify column foo int default 1 first x",
+	}, {
+		input:  "alter table a character set utf32 collate = 'utf'",
+		output: "alter table a charset utf32 collate utf",
+	}, {
+		input: "alter table a convert to character set utf32",
+	}, {
+		input: "alter table `By` add column foo int, algorithm = default",
+	}, {
+		input: "alter table a rename b",
+	}, {
+		input: "alter table `By` rename `bY`",
 	}, {
 		input:  "alter table a rename to b",
-		output: "rename table a b",
+		output: "alter table a rename b",
 	}, {
 		input:  "alter table a rename as b",
-		output: "rename table a b",
+		output: "alter table a rename b",
 	}, {
-		input:  "alter table a rename index foo to bar",
-		output: "alter table a",
+		input: "alter table a rename index foo to bar, with validation",
 	}, {
 		input:  "alter table a rename key foo to bar",
-		output: "alter table a",
+		output: "alter table a rename index foo to bar",
 	}, {
-		input:  "alter table e auto_increment = 20",
-		output: "alter table e",
+		input: "alter table e auto_increment 20",
 	}, {
 		input:  "alter table e character set = 'ascii'",
-		output: "alter table e",
+		output: "alter table e charset ascii",
+	}, {
+		input: "alter table e enable keys, discard tablespace, force",
 	}, {
 		input:  "alter table e default character set = 'ascii'",
-		output: "alter table e",
+		output: "alter table e charset ascii",
 	}, {
-		input:  "alter table e comment = 'hello'",
-		output: "alter table e",
+		input: "alter table e comment 'hello' remove partitioning",
 	}, {
 		input:  "alter table a reorganize partition b into (partition c values less than (?), partition d values less than (maxvalue))",
 		output: "alter table a reorganize partition b into (partition c values less than (:v1), partition d values less than (maxvalue))",
 	}, {
+		input: "alter table a algorithm = default, lock none, add partition (partition d values less than (maxvalue))",
+	}, {
+		input: "alter table a discard partition all tablespace",
+	}, {
+		input: "alter table a import partition a, b, v tablespace",
+	}, {
+		input: "alter table a truncate partition a, b, v",
+	}, {
+		input: "alter table a coalesce partition 7",
+	}, {
+		input: "alter table a exchange partition a with table t without validation",
+	}, {
+		input: "alter table a analyze partition all",
+	}, {
+		input: "alter table a analyze partition a, v",
+	}, {
+		input: "alter table a check partition all",
+	}, {
+		input: "alter table a check partition a, v",
+	}, {
+		input: "alter table a optimize partition all",
+	}, {
+		input: "alter table a optimize partition a, v",
+	}, {
+		input: "alter table a rebuild partition all",
+	}, {
+		input: "alter table a rebuild partition a, v",
+	}, {
+		input: "alter table a repair partition all",
+	}, {
+		input: "alter table a repair partition a, v",
+	}, {
+		input: "alter table a remove partitioning",
+	}, {
+		input: "alter table a upgrade partitioning",
+	}, {
 		input:  "alter table a partition by range (id) (partition p0 values less than (10), partition p1 values less than (maxvalue))",
 		output: "alter table a",
 	}, {
+		input: "alter table a add column (id int, id2 char(23))",
+	}, {
+		input: "alter table a add index idx (id)",
+	}, {
+		input: "alter table a add fulltext index idx (id)",
+	}, {
+		input: "alter table a add spatial index idx (id)",
+	}, {
+		input: "alter table a add fulltext index idx (id)",
+	}, {
+		input: "alter table a add foreign key (id) references f (id)",
+	}, {
+		input: "alter table a add primary key (id)",
+	}, {
+		input: "alter table a add constraint b primary key (id)",
+	}, {
+		input: "alter table a add constraint b primary key (id)",
+	}, {
+		input: "alter table a add constraint b unique key (id)",
+	}, {
+		input:  "alter table a add constraint b unique c (id)",
+		output: "alter table a add constraint b unique key c (id)",
+	}, {
+		input:  "alter table a add constraint check (id)",
+		output: "alter table a add check (id) enforced",
+	}, {
+		input:  "alter table a add id int",
+		output: "alter table a add column id int",
+	}, {
+		input: "alter table a add column id int first id2",
+	}, {
+		input: "alter table a add column id int after id2",
+	}, {
+		input: "alter table a drop column id",
+	}, {
+		input: "alter table a drop partition p2712, p123",
+	}, {
+		input:  "alter table a drop index idx",
+		output: "alter table a drop key idx",
+	}, {
+		input: "alter table a add check (ch_1) not enforced",
+	}, {
+		input:  "alter table a drop check ch_1",
+		output: "alter table a",
+	}, {
+		input: "alter table a drop foreign key kx",
+	}, {
+		input: "alter table a drop primary key",
+	}, {
+		input:  "alter table a drop constraint",
+		output: "alter table a",
+	}, {
+		input:  "alter table a drop id",
+		output: "alter table a drop column id",
+	}, {
+		input: "alter database character set geostd8",
+	}, {
+		input: "alter database d character set geostd8",
+	}, {
+		input: "alter database d default collate 'utf8_bin'",
+	}, {
+		input: "alter database default collate 'utf8_bin'",
+	}, {
+		input: "alter database d upgrade data directory name",
+	}, {
+		input:  "alter database d collate = 'utf8_bin'",
+		output: "alter database d collate 'utf8_bin'",
+	}, {
+		input:  "alter schema d default character set = geostd8",
+		output: "alter database d default character set geostd8",
+	}, {
+		input:  "alter schema d character set = geostd8",
+		output: "alter database d character set geostd8",
+	}, {
+		input:  "alter schema d default collate = 'utf8_bin'",
+		output: "alter database d default collate 'utf8_bin'",
+	}, {
+		input:  "alter schema d collate = 'utf8_bin' character set = geostd8 character set = geostd8",
+		output: "alter database d collate 'utf8_bin' character set geostd8 character set geostd8",
+	}, {
 		input: "create table a",
+	}, {
+		input:  "CREATE TABLE a",
+		output: "create table a",
+	}, {
+		input:  "create table `a`",
+		output: "create table a",
 	}, {
 		input:  "create table a (\n\t`a` int\n)",
 		output: "create table a (\n\ta int\n)",
 	}, {
 		input: "create table `by` (\n\t`by` char\n)",
 	}, {
+		input: "create table test (\n\t__year year(4)\n)",
+	}, {
+		input: "create table a (\n\ta int not null\n)",
+	}, {
+		input: "create table a (\n\ta int not null default 0\n)",
+	}, {
+		input:  "create table a (a int not null default 0, primary key(a))",
+		output: "create table a (\n\ta int not null default 0,\n\tprimary key (a)\n)",
+	}, {
+		input:  "create table a (`a column` int)",
+		output: "create table a (\n\t`a column` int\n)",
+	}, {
+		input: "create table a (\n\ta varchar(32) not null default ''\n)",
+	}, {
 		input:  "create table if not exists a (\n\t`a` int\n)",
-		output: "create table a (\n\ta int\n)",
+		output: "create table if not exists a (\n\ta int\n)",
 	}, {
 		input:  "create table a ignore me this is garbage",
 		output: "create table a",
@@ -746,68 +1113,404 @@ var (
 		input:  "create table a (a int, b char, c garbage)",
 		output: "create table a",
 	}, {
-		input:  "create index a on b",
-		output: "alter table b",
+		input:  "create table a (b1 bool not null primary key, b2 boolean not null)",
+		output: "create table a (\n\tb1 bool not null primary key,\n\tb2 boolean not null\n)",
 	}, {
-		input:  "create unique index a on b",
-		output: "alter table b",
+		input:  "create table a (b1 bool NOT NULL PRIMARY KEY, b2 boolean not null, KEY b2_idx(b))",
+		output: "create table a (\n\tb1 bool not null primary key,\n\tb2 boolean not null,\n\tKEY b2_idx (b)\n)",
 	}, {
-		input:  "create unique index a using foo on b",
-		output: "alter table b",
+		input: "alter vschema create vindex hash_vdx using hash",
 	}, {
-		input:  "create fulltext index a using foo on b",
-		output: "alter table b",
+		input: "alter vschema create vindex keyspace.hash_vdx using hash",
 	}, {
-		input:  "create spatial index a using foo on b",
-		output: "alter table b",
+		input: "alter vschema create vindex lookup_vdx using lookup with owner=user, table=name_user_idx, from=name, to=user_id",
 	}, {
-		input:  "create view a",
-		output: "create table a",
+		input: "alter vschema create vindex xyz_vdx using xyz with param1=hello, param2='world', param3=123",
 	}, {
-		input:  "create or replace view a",
-		output: "create table a",
+		input: "alter vschema drop vindex hash_vdx",
 	}, {
-		input:  "alter view a",
-		output: "alter table a",
+		input: "alter vschema drop vindex ks.hash_vdx",
 	}, {
-		input:  "drop view a",
-		output: "drop table a",
+		input: "alter vschema add table a",
+	}, {
+		input: "alter vschema add table ks.a",
+	}, {
+		input: "alter vschema add sequence a_seq",
+	}, {
+		input: "alter vschema add sequence ks.a_seq",
+	}, {
+		input: "alter vschema on a add auto_increment id using a_seq",
+	}, {
+		input: "alter vschema on ks.a add auto_increment id using a_seq",
+	}, {
+		input: "alter vschema drop table a",
+	}, {
+		input: "alter vschema drop table ks.a",
+	}, {
+		input: "alter vschema on a add vindex hash (id)",
+	}, {
+		input: "alter vschema on ks.a add vindex hash (id)",
+	}, {
+		input:  "alter vschema on a add vindex `hash` (`id`)",
+		output: "alter vschema on a add vindex hash (id)",
+	}, {
+		input:  "alter vschema on `ks`.a add vindex `hash` (`id`)",
+		output: "alter vschema on ks.a add vindex hash (id)",
+	}, {
+		input:  "alter vschema on a add vindex hash (id) using `hash`",
+		output: "alter vschema on a add vindex hash (id) using hash",
+	}, {
+		input: "alter vschema on a add vindex `add` (`add`)",
+	}, {
+		input: "alter vschema on a add vindex hash (id) using hash",
+	}, {
+		input:  "alter vschema on a add vindex hash (id) using `hash`",
+		output: "alter vschema on a add vindex hash (id) using hash",
+	}, {
+		input:  "alter vschema on user add vindex name_lookup_vdx (name) using lookup_hash with owner=user, table=name_user_idx, from=name, to=user_id",
+		output: "alter vschema on user add vindex name_lookup_vdx (`name`) using lookup_hash with owner=user, table=name_user_idx, from=name, to=user_id",
+	}, {
+		input:  "alter vschema on user2 add vindex name_lastname_lookup_vdx (name,lastname) using lookup with owner=`user`, table=`name_lastname_keyspace_id_map`, from=`name,lastname`, to=`keyspace_id`",
+		output: "alter vschema on user2 add vindex name_lastname_lookup_vdx (`name`, lastname) using lookup with owner=user, table=name_lastname_keyspace_id_map, from=name,lastname, to=keyspace_id",
+	}, {
+		input: "alter vschema on a drop vindex hash",
+	}, {
+		input: "alter vschema on ks.a drop vindex hash",
+	}, {
+		input:  "alter vschema on a drop vindex `hash`",
+		output: "alter vschema on a drop vindex hash",
+	}, {
+		input:  "alter vschema on a drop vindex hash",
+		output: "alter vschema on a drop vindex hash",
+	}, {
+		input:  "alter vschema on a drop vindex `add`",
+		output: "alter vschema on a drop vindex `add`",
+	}, {
+		input:  "create index a on b (col1)",
+		output: "alter table b add index a (col1)",
+	}, {
+		input:  "create unique index a on b (col1)",
+		output: "alter table b add unique index a (col1)",
+	}, {
+		input:  "create unique index a using foo on b (col1 desc)",
+		output: "alter table b add unique index a (col1 desc) using foo",
+	}, {
+		input:  "create fulltext index a on b (col1) with parser a",
+		output: "alter table b add fulltext index a (col1) with parser a",
+	}, {
+		input:  "create spatial index a on b (col1)",
+		output: "alter table b add spatial index a (col1)",
+	}, {
+		input:  "create fulltext index a on b (col1) key_block_size=12 with parser a comment 'string' algorithm inplace lock none",
+		output: "alter table b add fulltext index a (col1) key_block_size 12 with parser a comment 'string', algorithm = inplace, lock none",
+	}, {
+		input:      "create index a on b ((col1 + col2), (col1*col2))",
+		output:     "alter table b add index a ()",
+		partialDDL: true,
+	}, {
+		input:  "create fulltext index b using btree on A (col1 desc, col2) algorithm = inplace lock = none",
+		output: "alter table A add fulltext index b (col1 desc, col2) using btree, algorithm = inplace, lock none",
+	}, {
+		input: "create algorithm = merge sql security definer view a as select * from e",
+	}, {
+		input: "create view ks.a as select * from e",
+	}, {
+		input:  "create algorithm = merge sql security definer view a (b,c,d) as select * from e",
+		output: "create algorithm = merge sql security definer view a(b, c, d) as select * from e",
+	}, {
+		input:  "create algorithm = merge sql security definer view a (b,c,d) as select * from e with cascaded check option",
+		output: "create algorithm = merge sql security definer view a(b, c, d) as select * from e with cascaded check option",
+	}, {
+		input:  "create algorithm = temptable definer = a@b.c.d view a(b,c,d) as select * from e with local check option",
+		output: "create algorithm = temptable definer = a@b.c.d view a(b, c, d) as select * from e with local check option",
+	}, {
+		input:  "create or replace algorithm = temptable definer = a@b.c.d sql security definer view a(b,c,d) as select * from e with local check option",
+		output: "create or replace algorithm = temptable definer = a@b.c.d sql security definer view a(b, c, d) as select * from e with local check option",
+	}, {
+		input:  "create definer = 'sa'@b.c.d view a(b,c,d) as select * from e",
+		output: "create definer = 'sa'@b.c.d view a(b, c, d) as select * from e",
+	}, {
+		input: "alter view a as select * from t",
+	}, {
+		input: "alter algorithm = merge definer = m@172.0.1.01 sql security definer view a as select * from t with local check option",
+	}, {
+		input:  "rename table a to b",
+		output: "rename table a to b",
+	}, {
+		input:  "rename table x.a to b, b to c",
+		output: "rename table x.a to b, b to c",
+	}, {
+		input:  "drop view a,B,c",
+		output: "drop view a, b, c",
 	}, {
 		input:  "drop table a",
 		output: "drop table a",
 	}, {
-		input:  "drop table if exists a",
-		output: "drop table if exists a",
+		input:  "drop table a, b",
+		output: "drop table a, b",
 	}, {
-		input:  "drop view if exists a",
-		output: "drop table if exists a",
+		input:  "drop table if exists a,b restrict",
+		output: "drop table if exists a, b",
 	}, {
-		input:  "drop index b on a",
-		output: "alter table a",
+		input:  "drop view if exists a cascade",
+		output: "drop view if exists a",
+	}, {
+		input:  "drop index b on a lock = none algorithm default",
+		output: "alter table a drop key b, lock none, algorithm = default",
+	}, {
+		input:  "drop index `PRIMARY` on a lock none",
+		output: "alter table a drop primary key, lock none",
 	}, {
 		input:  "analyze table a",
-		output: "alter table a",
+		output: "otherread",
+	}, {
+		input: "flush tables",
+	}, {
+		input: "flush tables with read lock",
+	}, {
+		input: "flush tables a, c.v, b",
+	}, {
+		input: "flush local tables a, c.v, b with read lock",
+	}, {
+		input: "flush tables a, c.v, b for export",
+	}, {
+		input: "flush local binary logs, engine logs, error logs, general logs, hosts, logs, privileges, optimizer_costs",
+	}, {
+		input:  "flush no_write_to_binlog slow logs, status, user_resources, relay logs, relay logs for channel s",
+		output: "flush local slow logs, status, user_resources, relay logs, relay logs for channel s",
+	}, {
+		input:  "show binary logs",
+		output: "show binary logs",
+	}, {
+		input:  "show binlog events",
+		output: "show binlog",
+	}, {
+		input:  "show character set",
+		output: "show charset",
+	}, {
+		input:  "show character set like '%foo'",
+		output: "show charset like '%foo'",
+	}, {
+		input:  "show charset",
+		output: "show charset",
+	}, {
+		input:  "show charset like '%foo'",
+		output: "show charset like '%foo'",
+	}, {
+		input:  "show charset where 'charset' = 'utf8'",
+		output: "show charset where 'charset' = 'utf8'",
+	}, {
+		input:  "show charset where 'charset' = '%foo'",
+		output: "show charset where 'charset' = '%foo'",
+	}, {
+		input:  "show collation",
+		output: "show collation",
+	}, {
+		input:  "show collation where `Charset` = 'utf8' and `Collation` = 'utf8_bin'",
+		output: "show collation where `Charset` = 'utf8' and `Collation` = 'utf8_bin'",
+	}, {
+		input:  "show create database d",
+		output: "show create database",
+	}, {
+		input:  "show create event e",
+		output: "show create event",
+	}, {
+		input: "show create function f",
+	}, {
+		input:  "show create procedure p",
+		output: "show create procedure",
+	}, {
+		input:  "show create table t",
+		output: "show create table t",
+	}, {
+		input:  "show create trigger t",
+		output: "show create trigger",
+	}, {
+		input:  "show create user u",
+		output: "show create user",
+	}, {
+		input:  "show create view v",
+		output: "show create view",
 	}, {
 		input:  "show databases",
 		output: "show databases",
 	}, {
-		input:  "show tables",
-		output: "show tables",
+		input:  "show databases like '%'",
+		output: "show databases like '%'",
+	}, {
+		input:  "show schemas",
+		output: "show databases",
+	}, {
+		input:  "show schemas like '%'",
+		output: "show databases like '%'",
+	}, {
+		input:  "show engine INNODB",
+		output: "show engine",
+	}, {
+		input: "show engines",
+	}, {
+		input:  "show storage engines",
+		output: "show storage",
+	}, {
+		input: "show errors",
+	}, {
+		input: "show events",
+	}, {
+		input: "show function code func",
+	}, {
+		input: "show function status",
+	}, {
+		input:  "show grants for 'root@localhost'",
+		output: "show grants",
+	}, {
+		input: "show index from t",
+	}, {
+		input: "show indexes from t",
+	}, {
+		input: "show keys from t",
+	}, {
+		input:  "show master status",
+		output: "show master",
+	}, {
+		input:  "show open tables",
+		output: "show open",
+	}, {
+		input:  "show plugins",
+		output: "show plugins",
+	}, {
+		input:  "show privileges",
+		output: "show privileges",
+	}, {
+		input: "show procedure code p",
+	}, {
+		input: "show procedure status",
+	}, {
+		input:  "show processlist",
+		output: "show processlist",
+	}, {
+		input:  "show full processlist",
+		output: "show processlist",
+	}, {
+		input:  "show profile cpu for query 1",
+		output: "show profile",
+	}, {
+		input:  "show profiles",
+		output: "show profiles",
+	}, {
+		input:  "show relaylog events",
+		output: "show relaylog",
+	}, {
+		input:  "show slave hosts",
+		output: "show slave",
+	}, {
+		input:  "show slave status",
+		output: "show slave",
+	}, {
+		input:  "show status",
+		output: "show status",
+	}, {
+		input:  "show global status",
+		output: "show global status",
+	}, {
+		input:  "show session status",
+		output: "show status",
+	}, {
+		input: "show table status",
+	}, {
+		input: "show table status from dbname",
+	}, {
+		input:  "show table status in dbname",
+		output: "show table status from dbname",
+	}, {
+		input:  "show table status in dbname LIKE '%' ",
+		output: "show table status from dbname like '%'",
+	}, {
+		input:  "show table status from dbname Where col=42 ",
+		output: "show table status from dbname where col = 42",
+	}, {
+		input: "show tables",
+	}, {
+		input: "show tables like '%keyspace%'",
+	}, {
+		input: "show tables where 1 = 0",
+	}, {
+		input: "show tables from a",
+	}, {
+		input: "show tables from a where 1 = 0",
+	}, {
+		input: "show tables from a like '%keyspace%'",
+	}, {
+		input: "show full tables",
+	}, {
+		input: "show full tables from a",
+	}, {
+		input:  "show full tables in a",
+		output: "show full tables from a",
+	}, {
+		input: "show full tables from a like '%keyspace%'",
+	}, {
+		input: "show full tables from a where 1 = 0",
+	}, {
+		input: "show full tables like '%keyspace%'",
+	}, {
+		input: "show full tables where 1 = 0",
+	}, {
+		input:  "show full columns in a in b like '%'",
+		output: "show full columns from a from b like '%'",
+	}, {
+		input: "show full columns from messages from test_keyspace like '%'",
+	}, {
+		input:  "show full fields from a like '%'",
+		output: "show full columns from a like '%'",
+	}, {
+		input:  "show fields from a where 1 = 1",
+		output: "show columns from a where 1 = 1",
+	}, {
+		input:  "show triggers",
+		output: "show triggers",
+	}, {
+		input:  "show variables",
+		output: "show variables",
+	}, {
+		input:  "show global variables",
+		output: "show global variables",
+	}, {
+		input:  "show session variables",
+		output: "show variables",
 	}, {
 		input:  "show vitess_keyspaces",
-		output: "show vitess_keyspaces",
+		output: "show keyspaces",
 	}, {
-		input:  "show vitess_shards",
-		output: "show vitess_shards",
+		input:  "show vitess_keyspaces like '%'",
+		output: "show keyspaces like '%'",
 	}, {
-		input:  "show vschema_tables",
-		output: "show vschema_tables",
+		input: "show vitess_shards",
 	}, {
-		input:  "show create database",
-		output: "show unsupported",
+		input: "show vitess_shards like '%'",
+	}, {
+		input: "show vitess_tablets",
+	}, {
+		input: "show vitess_tablets like '%'",
+	}, {
+		input: "show vitess_tablets where hostname = 'some-tablet'",
+	}, {
+		input: "show vschema tables",
+	}, {
+		input: "show vschema vindexes",
+	}, {
+		input: "show vschema vindexes on t",
+	}, {
+		input:  "show warnings",
+		output: "show warnings",
+	}, {
+		input:  "select warnings from t",
+		output: "select `warnings` from t",
 	}, {
 		input:  "show foobar",
-		output: "show unsupported",
+		output: "show foobar",
+	}, {
+		input:  "show foobar like select * from table where syntax is 'ignored'",
+		output: "show foobar",
 	}, {
 		input:  "use db",
 		output: "use db",
@@ -818,14 +1521,47 @@ var (
 		input:  "use `ks:-80@master`",
 		output: "use `ks:-80@master`",
 	}, {
-		input:  "describe foobar",
-		output: "otherread",
+		input:  "use @replica",
+		output: "use `@replica`",
+	}, {
+		input:  "use ks@replica",
+		output: "use `ks@replica`",
+	}, {
+		input:  "describe select * from t",
+		output: "explain select * from t",
+	}, {
+		input:  "desc select * from t",
+		output: "explain select * from t",
 	}, {
 		input:  "desc foobar",
 		output: "otherread",
 	}, {
-		input:  "explain foobar",
+		input:  "explain t1",
 		output: "otherread",
+	}, {
+		input:  "explain t1 col",
+		output: "otherread",
+	}, {
+		input: "explain select * from t",
+	}, {
+		input: "explain format = traditional select * from t",
+	}, {
+		input: "explain analyze select * from t",
+	}, {
+		input: "explain format = tree select * from t",
+	}, {
+		input: "explain format = json select * from t",
+	}, {
+		input: "explain format = vitess select * from t",
+	}, {
+		input:  "describe format = vitess select * from t",
+		output: "explain format = vitess select * from t",
+	}, {
+		input: "explain delete from t",
+	}, {
+		input: "explain insert into t(col1, col2) values (1, 2)",
+	}, {
+		input: "explain update t set col = 2",
 	}, {
 		input:  "truncate table foo",
 		output: "truncate table foo",
@@ -838,6 +1574,21 @@ var (
 	}, {
 		input:  "optimize foo",
 		output: "otheradmin",
+	}, {
+		input:  "lock tables foo read",
+		output: "lock tables foo read",
+	}, {
+		input:  "lock tables foo write",
+		output: "lock tables foo write",
+	}, {
+		input:  "lock tables foo read local",
+		output: "lock tables foo read local",
+	}, {
+		input:  "lock tables foo low_priority write",
+		output: "lock tables foo low_priority write",
+	}, {
+		input:  "unlock tables",
+		output: "unlock tables",
 	}, {
 		input: "select /* EQ true */ 1 from t where a = true",
 	}, {
@@ -890,46 +1641,294 @@ var (
 	}, {
 		input: "select /* cache directive */ sql_no_cache 'foo' from t",
 	}, {
+		input: "select distinct sql_no_cache 'foo' from t",
+	}, {
+		input:  "select sql_no_cache distinct 'foo' from t",
+		output: "select distinct sql_no_cache 'foo' from t",
+	}, {
+		input:  "select sql_no_cache straight_join distinct 'foo' from t",
+		output: "select distinct sql_no_cache straight_join 'foo' from t",
+	}, {
+		input:  "select straight_join distinct sql_no_cache 'foo' from t",
+		output: "select distinct sql_no_cache straight_join 'foo' from t",
+	}, {
+		input:  "select sql_calc_found_rows 'foo' from t",
+		output: "select sql_calc_found_rows 'foo' from t",
+	}, {
 		input: "select binary 'a' = 'A' from t",
 	}, {
 		input: "select 1 from t where foo = _binary 'bar'",
 	}, {
+		input: "select 1 from t where foo = _utf8 'bar' and bar = _latin1 'sjösjuk'",
+	}, {
 		input:  "select 1 from t where foo = _binary'bar'",
 		output: "select 1 from t where foo = _binary 'bar'",
+	}, {
+		input: "select 1 from t where foo = _utf8mb4 'bar'",
+	}, {
+		input:  "select 1 from t where foo = _utf8mb4'bar'",
+		output: "select 1 from t where foo = _utf8mb4 'bar'",
 	}, {
 		input: "select match(a) against ('foo') from t",
 	}, {
 		input: "select match(a1, a2) against ('foo' in natural language mode with query expansion) from t",
 	}, {
+		input:  "select database()",
+		output: "select database() from dual",
+	}, {
+		input:  "select schema()",
+		output: "select schema() from dual",
+	}, {
 		input: "select title from video as v where match(v.title, v.tag) against ('DEMO' in boolean mode)",
 	}, {
-		input: "select name, group_concat(score) from t group by name",
+		input:  "select name, group_concat(score) from t group by name",
+		output: "select `name`, group_concat(score) from t group by `name`",
 	}, {
-		input: "select name, group_concat(distinct id, score order by id desc separator ':') from t group by name",
+		input:  "select name, group_concat(distinct id, score order by id desc separator ':') from t group by name",
+		output: "select `name`, group_concat(distinct id, score order by id desc separator ':') from t group by `name`",
+	}, {
+		input:  "select name, group_concat(distinct id, score order by id desc separator ':' limit 1) from t group by name",
+		output: "select `name`, group_concat(distinct id, score order by id desc separator ':' limit 1) from t group by `name`",
+	}, {
+		input:  "select name, group_concat(distinct id, score order by id desc separator ':' limit 10, 2) from t group by name",
+		output: "select `name`, group_concat(distinct id, score order by id desc separator ':' limit 10, 2) from t group by `name`",
+	}, {
+		input: "select * from t partition (p0)",
+	}, {
+		input: "select * from t partition (p0, p1)",
+	}, {
+		input: "select e.id, s.city from employees as e join stores partition (p1) as s on e.store_id = s.id",
+	}, {
+		input: "select truncate(120.3333, 2) from dual",
+	}, {
+		input: "update t partition (p0) set a = 1",
+	}, {
+		input: "insert into t partition (p0) values (1, 'asdf')",
+	}, {
+		input: "insert into t1 select * from t2 partition (p0)",
+	}, {
+		input: "replace into t partition (p0) values (1, 'asdf')",
+	}, {
+		input: "delete from t partition (p0) where a = 1",
+	}, {
+		input: "stream * from t",
+	}, {
+		input: "vstream * from t",
+	}, {
+		input: "stream /* comment */ * from t",
+	}, {
+		input: "begin",
+	}, {
+		input:  "begin;",
+		output: "begin",
+	}, {
+		input:  "start transaction",
+		output: "begin",
+	}, {
+		input: "commit",
+	}, {
+		input: "rollback",
+	}, {
+		input: "create database test_db",
+	}, {
+		input:  "create schema test_db",
+		output: "create database test_db",
+	}, {
+		input: "create database if not exists test_db",
+	}, {
+		input:  "create schema if not exists test_db",
+		output: "create database if not exists test_db",
+	}, {
+		input: "create database test_db default collate 'utf8mb4_general_ci' collate utf8mb4_general_ci",
+	}, {
+		input: "create database test_db character set geostd8",
+	}, {
+		input:      "create database test_db character set * unparsable",
+		output:     "create database test_db",
+		partialDDL: true,
+	}, {
+		input: "drop database test_db",
+	}, {
+		input:  "drop schema test_db",
+		output: "drop database test_db",
+	}, {
+		input: "drop database if exists test_db",
+	}, {
+		input:  "delete a.*, b.* from tbl_a a, tbl_b b where a.id = b.id and b.name = 'test'",
+		output: "delete a, b from tbl_a as a, tbl_b as b where a.id = b.id and b.`name` = 'test'",
+	}, {
+		input:  "select distinctrow a.* from (select (1) from dual union all select 1 from dual) a",
+		output: "select distinct a.* from (select 1 from dual union all select 1 from dual) as a",
+	}, {
+		input: "select `weird function name`() from t",
+	}, {
+		input: "select status() from t", // should not escape function names that are keywords
+	}, {
+		input: "select * from `weird table name`",
+	}, {
+		input:  "SHOW FULL TABLES FROM `jiradb` LIKE 'AO_E8B6CC_ISSUE_MAPPING'",
+		output: "show full tables from jiradb like 'AO_E8B6CC_ISSUE_MAPPING'",
+	}, {
+		input:  "SHOW FULL COLUMNS FROM AO_E8B6CC_ISSUE_MAPPING FROM jiradb LIKE '%'",
+		output: "show full columns from AO_E8B6CC_ISSUE_MAPPING from jiradb like '%'",
+	}, {
+		input:  "SHOW KEYS FROM `AO_E8B6CC_ISSUE_MAPPING` FROM `jiradb`",
+		output: "show keys from AO_E8B6CC_ISSUE_MAPPING from jiradb",
+	}, {
+		input:  "SHOW CREATE TABLE `jiradb`.`AO_E8B6CC_ISSUE_MAPPING`",
+		output: "show create table jiradb.AO_E8B6CC_ISSUE_MAPPING",
+	}, {
+		input:  "SHOW INDEX FROM `AO_E8B6CC_ISSUE_MAPPING` FROM `jiradb`",
+		output: "show index from AO_E8B6CC_ISSUE_MAPPING from jiradb",
+	}, {
+		input:  "SHOW FULL TABLES FROM `jiradb` LIKE '%'",
+		output: "show full tables from jiradb like '%'",
+	}, {
+		input:  "SHOW EXTENDED INDEX FROM `AO_E8B6CC_PROJECT_MAPPING` FROM `jiradb`",
+		output: "show extended index from AO_E8B6CC_PROJECT_MAPPING from jiradb",
+	}, {
+		input:  "SHOW EXTENDED KEYS FROM `AO_E8B6CC_ISSUE_MAPPING` FROM `jiradb`",
+		output: "show extended keys from AO_E8B6CC_ISSUE_MAPPING from jiradb",
+	}, {
+		input:  "SHOW CREATE TABLE `jiradb`.`AO_E8B6CC_ISSUE_MAPPING`",
+		output: "show create table jiradb.AO_E8B6CC_ISSUE_MAPPING",
+	}, {
+		input: "create table t1 ( check (c1 <> c2), c1 int check (c1 > 10), c2 int constraint c2_positive check (c2 > 0), c3 int check (c3 < 100), constraint c1_nonzero check (c1 <> 0), check (c1 > c3))",
+		output: "create table t1 (\n" +
+			"\tc1 int,\n" +
+			"\tc2 int,\n" +
+			"\tc3 int,\n" +
+			"\tcheck (c1 != c2) enforced,\n" +
+			"\tcheck (c1 > 10) enforced,\n" +
+			"\tconstraint c2_positive check (c2 > 0) enforced,\n" +
+			"\tcheck (c3 < 100) enforced,\n" +
+			"\tconstraint c1_nonzero check (c1 != 0) enforced,\n" +
+			"\tcheck (c1 > c3) enforced\n)",
+	}, {
+		input:  "SHOW INDEXES FROM `AO_E8B6CC_ISSUE_MAPPING` FROM `jiradb`",
+		output: "show indexes from AO_E8B6CC_ISSUE_MAPPING from jiradb",
+	}, {
+		input:  "SHOW FULL TABLES FROM `jiradb` LIKE '%'",
+		output: "show full tables from jiradb like '%'",
+	}, {
+		input:  "SHOW EXTENDED INDEXES FROM `AO_E8B6CC_PROJECT_MAPPING` FROM `jiradb`",
+		output: "show extended indexes from AO_E8B6CC_PROJECT_MAPPING from jiradb",
+	}, {
+		input:  "SHOW EXTENDED INDEXES IN `AO_E8B6CC_PROJECT_MAPPING` IN `jiradb`",
+		output: "show extended indexes from AO_E8B6CC_PROJECT_MAPPING from jiradb",
+	}, {
+		input:  "do 1",
+		output: "otheradmin",
+	}, {
+		input:  "do funcCall(), 2 = 1, 3 + 1",
+		output: "otheradmin",
+	}, {
+		input: "savepoint a",
+	}, {
+		input: "savepoint `@@@;a`",
+	}, {
+		input: "rollback to a",
+	}, {
+		input: "rollback to `@@@;a`",
+	}, {
+		input:  "rollback work to a",
+		output: "rollback to a",
+	}, {
+		input:  "rollback to savepoint a",
+		output: "rollback to a",
+	}, {
+		input:  "rollback work to savepoint a",
+		output: "rollback to a",
+	}, {
+		input: "release savepoint a",
+	}, {
+		input: "release savepoint `@@@;a`",
 	}}
 )
 
 func TestValid(t *testing.T) {
 	for _, tcase := range validSQL {
-		if tcase.output == "" {
-			tcase.output = tcase.input
+		t.Run(tcase.input, func(t *testing.T) {
+			if tcase.output == "" {
+				tcase.output = tcase.input
+			}
+			tree, err := Parse(tcase.input)
+			require.NoError(t, err, tcase.input)
+			out := String(tree)
+			if tcase.output != out {
+				t.Errorf("Parsing failed. \nExpected/Got:\n%s\n%s", tcase.output, out)
+			}
+
+			// Some statements currently only have 5.7 specifications.
+			// For mysql 8.0 syntax, the query is not entirely parsed.
+			// Add more structs as we go on adding full parsing support for DDL constructs for 5.7 syntax.
+			switch x := tree.(type) {
+			case *CreateDatabase:
+				assert.Equal(t, !tcase.partialDDL, x.IsFullyParsed())
+			case *AlterDatabase:
+				assert.Equal(t, !tcase.partialDDL, x.IsFullyParsed())
+			}
+			// This test just exercises the tree walking functionality.
+			// There's no way automated way to verify that a node calls
+			// all its children. But we can examine code coverage and
+			// ensure that all walkSubtree functions were called.
+			Walk(func(node SQLNode) (bool, error) {
+				return true, nil
+			}, tree)
+		})
+	}
+}
+
+// Ensure there is no corruption from using a pooled yyParserImpl in Parse.
+func TestParallelValid(t *testing.T) {
+	parallelism := 100
+	numIters := 1000
+
+	wg := sync.WaitGroup{}
+	wg.Add(parallelism)
+	for i := 0; i < parallelism; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numIters; j++ {
+				tcase := validSQL[rand.Intn(len(validSQL))]
+				if tcase.output == "" {
+					tcase.output = tcase.input
+				}
+				tree, err := Parse(tcase.input)
+				if err != nil {
+					t.Errorf("Parse(%q) err: %v, want nil", tcase.input, err)
+					continue
+				}
+				out := String(tree)
+				if out != tcase.output {
+					t.Errorf("Parse(%q) = %q, want: %q", tcase.input, out, tcase.output)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestInvalid(t *testing.T) {
+	invalidSQL := []struct {
+		input string
+		err   string
+	}{{
+		input: "select a, b from (select * from tbl) sort by a",
+		err:   "syntax error",
+	}, {
+		input: "/*!*/",
+		err:   "empty statement",
+	}}
+
+	for _, tcase := range invalidSQL {
+		_, err := Parse(tcase.input)
+		if err == nil {
+			t.Errorf("Parse invalid query(%q), got: nil, want: %s...", tcase.input, tcase.err)
 		}
-		tree, err := Parse(tcase.input)
-		if err != nil {
-			t.Errorf("Parse(%q) err: %v, want nil", tcase.input, err)
-			continue
+		if err != nil && !strings.Contains(err.Error(), tcase.err) {
+			t.Errorf("Parse invalid query(%q), got: %v, want: %s...", tcase.input, err, tcase.err)
 		}
-		out := String(tree)
-		if out != tcase.output {
-			t.Errorf("Parse(%q) = %q, want: %q", tcase.input, out, tcase.output)
-		}
-		// This test just exercises the tree walking functionality.
-		// There's no way automated way to verify that a node calls
-		// all its children. But we can examine code coverage and
-		// ensure that all WalkSubtree functions were called.
-		Walk(func(node SQLNode) (bool, error) {
-			return true, nil
-		}, tree)
 	}
 }
 
@@ -941,24 +1940,23 @@ func TestCaseSensitivity(t *testing.T) {
 		input:  "create table A (\n\t`B` int\n)",
 		output: "create table A (\n\tB int\n)",
 	}, {
-		input:  "create index b on A",
-		output: "alter table A",
+		input:  "create index b on A (col1 desc)",
+		output: "alter table A add index b (col1 desc)",
 	}, {
 		input:  "alter table A foo",
 		output: "alter table A",
 	}, {
-		input:  "alter table A convert",
+		input:  "alter table A convert unparsable",
 		output: "alter table A",
 	}, {
 		// View names get lower-cased.
-		input:  "alter view A foo",
-		output: "alter table a",
+		input:  "alter view A as select * from t",
+		output: "alter view a as select * from t",
 	}, {
 		input:  "alter table A rename to B",
-		output: "rename table A B",
+		output: "alter table A rename B",
 	}, {
-		input:  "rename table A to B",
-		output: "rename table A B",
+		input: "rename table A to B",
 	}, {
 		input:  "drop table B",
 		output: "drop table B",
@@ -967,7 +1965,7 @@ func TestCaseSensitivity(t *testing.T) {
 		output: "drop table if exists B",
 	}, {
 		input:  "drop index b on A",
-		output: "alter table A",
+		output: "alter table A drop key b",
 	}, {
 		input: "select a from B",
 	}, {
@@ -1002,17 +2000,14 @@ func TestCaseSensitivity(t *testing.T) {
 		input:  "CREATE TABLE A (\n\t`A` int\n)",
 		output: "create table A (\n\tA int\n)",
 	}, {
-		input:  "create view A",
-		output: "create table a",
-	}, {
-		input:  "alter view A",
-		output: "alter table a",
+		input:  "create view A as select * from b",
+		output: "create view a as select * from b",
 	}, {
 		input:  "drop view A",
-		output: "drop table a",
+		output: "drop view a",
 	}, {
 		input:  "drop view if exists A",
-		output: "drop table if exists a",
+		output: "drop view if exists a",
 	}, {
 		input:  "select /* lock in SHARE MODE */ 1 from t lock in SHARE MODE",
 		output: "select /* lock in SHARE MODE */ 1 from t lock in share mode",
@@ -1048,6 +2043,8 @@ func TestKeywords(t *testing.T) {
 	}, {
 		input: "update t set a = current_timestamp()",
 	}, {
+		input: "update t set a = current_timestamp(5)",
+	}, {
 		input:  "select a, current_date from t",
 		output: "select a, current_date() from t",
 	}, {
@@ -1056,17 +2053,25 @@ func TestKeywords(t *testing.T) {
 	}, {
 		input: "select * from t where a > utc_timestmp()",
 	}, {
+		input: "select * from t where a > utc_timestamp(4)",
+	}, {
 		input:  "update t set b = utc_timestamp + 5",
 		output: "update t set b = utc_timestamp() + 5",
 	}, {
-		input:  "select utc_time, utc_date",
-		output: "select utc_time(), utc_date() from dual",
+		input:  "select utc_time, utc_date, utc_time(6)",
+		output: "select utc_time(), utc_date(), utc_time(6) from dual",
 	}, {
 		input:  "select 1 from dual where localtime > utc_time",
 		output: "select 1 from dual where localtime() > utc_time()",
 	}, {
+		input:  "select 1 from dual where localtime(2) > utc_time(1)",
+		output: "select 1 from dual where localtime(2) > utc_time(1)",
+	}, {
 		input:  "update t set a = localtimestamp(), b = utc_timestamp",
 		output: "update t set a = localtimestamp(), b = utc_timestamp()",
+	}, {
+		input:  "update t set a = localtimestamp(10), b = utc_timestamp(13)",
+		output: "update t set a = localtimestamp(10), b = utc_timestamp(13)",
 	}, {
 		input: "insert into t(a) values (unix_timestamp)",
 	}, {
@@ -1095,8 +2100,20 @@ func TestKeywords(t *testing.T) {
 		input:  "select /* share and mode as cols */ share, mode from t where share = 'foo'",
 		output: "select /* share and mode as cols */ `share`, `mode` from t where `share` = 'foo'",
 	}, {
-		input:  "select /* unused keywords as cols */ write, varying from t where trailing = 'foo'",
+		input:  "select /* unused keywords as cols */ `write`, varying from t where trailing = 'foo'",
 		output: "select /* unused keywords as cols */ `write`, `varying` from t where `trailing` = 'foo'",
+	}, {
+		input:  "select status from t",
+		output: "select `status` from t",
+	}, {
+		input:  "select Status from t",
+		output: "select `Status` from t",
+	}, {
+		input:  "select variables from t",
+		output: "select `variables` from t",
+	}, {
+		input:  "select Variables from t",
+		output: "select `Variables` from t",
 	}}
 
 	for _, tcase := range validSQL {
@@ -1205,6 +2222,12 @@ func TestConvert(t *testing.T) {
 	}, {
 		input:  "select convert('abc', decimal(4+9)) from t",
 		output: "syntax error at position 33",
+	}, {
+		input:  "/* a comment */",
+		output: "empty statement",
+	}, {
+		input:  "set transaction isolation level 12345",
+		output: "syntax error at position 38 near '12345'",
 	}}
 
 	for _, tcase := range invalidSQL {
@@ -1212,6 +2235,170 @@ func TestConvert(t *testing.T) {
 		if err == nil || err.Error() != tcase.output {
 			t.Errorf("%s: %v, want %s", tcase.input, err, tcase.output)
 		}
+	}
+}
+
+func TestSelectInto(t *testing.T) {
+	validSQL := []struct {
+		input  string
+		output string
+	}{{
+		input:  "select * from t order by name limit 100 into outfile s3 'out_file_name'",
+		output: "select * from t order by `name` asc limit 100 into outfile s3 'out_file_name'",
+	}, {
+		input: "select * from t into dumpfile 'out_file_name'",
+	}, {
+		input: "select * from t into outfile 'out_file_name' character set binary fields terminated by 'term' optionally enclosed by 'c' escaped by 'e' lines starting by 'a' terminated by '\n'",
+	}, {
+		input: "select * from t into outfile s3 'out_file_name' character set binary format csv header fields terminated by 'term' optionally enclosed by 'c' escaped by 'e' lines starting by 'a' terminated by '\n' manifest on overwrite off",
+	}, {
+		input:  "select * from (select * from t union select * from t2) as t3 where t3.name in (select col from t4) into outfile s3 'out_file_name'",
+		output: "select * from (select * from t union select * from t2) as t3 where t3.`name` in (select col from t4) into outfile s3 'out_file_name'",
+	}, {
+		// Invalid queries but these are parsed and errors caught in planbuilder
+		input: "select * from t limit 100 into outfile s3 'out_file_name' union select * from t2",
+	}, {
+		input: "select * from (select * from t into outfile s3 'inner_outfile') as t2 into outfile s3 'out_file_name'",
+	}}
+
+	for _, tcase := range validSQL {
+		if tcase.output == "" {
+			tcase.output = tcase.input
+		}
+		tree, err := Parse(tcase.input)
+		if err != nil {
+			t.Errorf("input: %s, err: %v", tcase.input, err)
+			continue
+		}
+		out := String(tree)
+		assert.Equal(t, tcase.output, out)
+	}
+
+	invalidSQL := []struct {
+		input  string
+		output string
+	}{{
+		input:  "select convert('abc' as date) from t",
+		output: "syntax error at position 24 near 'as'",
+	}, {
+		input:  "set transaction isolation level 12345",
+		output: "syntax error at position 38 near '12345'",
+	}}
+
+	for _, tcase := range invalidSQL {
+		_, err := Parse(tcase.input)
+		if err == nil || err.Error() != tcase.output {
+			t.Errorf("%s: %v, want %s", tcase.input, err, tcase.output)
+		}
+	}
+}
+
+func TestPositionedErr(t *testing.T) {
+	invalidSQL := []struct {
+		input  string
+		output PositionedErr
+	}{{
+		input:  "select convert('abc' as date) from t",
+		output: PositionedErr{"syntax error", 24, []byte("as")},
+	}, {
+		input:  "select convert from t",
+		output: PositionedErr{"syntax error", 20, []byte("from")},
+	}, {
+		input:  "select cast('foo', decimal) from t",
+		output: PositionedErr{"syntax error", 19, nil},
+	}, {
+		input:  "select convert('abc', datetime(4+9)) from t",
+		output: PositionedErr{"syntax error", 34, nil},
+	}, {
+		input:  "select convert('abc', decimal(4+9)) from t",
+		output: PositionedErr{"syntax error", 33, nil},
+	}, {
+		input:  "set transaction isolation level 12345",
+		output: PositionedErr{"syntax error", 38, []byte("12345")},
+	}, {
+		input:  "select * from a left join b",
+		output: PositionedErr{"syntax error", 28, nil},
+	}, {
+		input:  "select a from (select * from tbl)",
+		output: PositionedErr{"syntax error", 34, nil},
+	}}
+
+	for _, tcase := range invalidSQL {
+		tkn := NewStringTokenizer(tcase.input)
+		_, err := ParseNext(tkn)
+
+		if posErr, ok := err.(PositionedErr); !ok {
+			t.Errorf("%s: %v expected PositionedErr, got (%T) %v", tcase.input, err, err, tcase.output)
+		} else if posErr.Pos != tcase.output.Pos || !bytes.Equal(posErr.Near, tcase.output.Near) || err.Error() != tcase.output.Error() {
+			t.Errorf("%s: %v, want: %v", tcase.input, err, tcase.output)
+		}
+	}
+}
+
+func TestSubStr(t *testing.T) {
+
+	validSQL := []struct {
+		input  string
+		output string
+	}{{
+		input: `select substr('foobar', 1) from t`,
+	}, {
+		input: "select substr(a, 1, 6) from t",
+	}, {
+		input:  "select substring(a, 1) from t",
+		output: "select substr(a, 1) from t",
+	}, {
+		input:  "select substring(a, 1, 6) from t",
+		output: "select substr(a, 1, 6) from t",
+	}, {
+		input:  "select substr(a from 1 for 6) from t",
+		output: "select substr(a, 1, 6) from t",
+	}, {
+		input:  "select substring(a from 1 for 6) from t",
+		output: "select substr(a, 1, 6) from t",
+	}, {
+		input:  `select substr("foo" from 1 for 2) from t`,
+		output: `select substr('foo', 1, 2) from t`,
+	}, {
+		input:  `select substring("foo", 1, 2) from t`,
+		output: `select substr('foo', 1, 2) from t`,
+	}, {
+		input:  `select substr(substr("foo" from 1 for 2), 1, 2) from t`,
+		output: `select substr(substr('foo', 1, 2), 1, 2) from t`,
+	}, {
+		input:  `select substr(substring("foo", 1, 2), 3, 4) from t`,
+		output: `select substr(substr('foo', 1, 2), 3, 4) from t`,
+	}, {
+		input:  `select substring(substr("foo", 1), 2) from t`,
+		output: `select substr(substr('foo', 1), 2) from t`,
+	}}
+
+	for _, tcase := range validSQL {
+		if tcase.output == "" {
+			tcase.output = tcase.input
+		}
+		tree, err := Parse(tcase.input)
+		if err != nil {
+			t.Errorf("input: %s, err: %v", tcase.input, err)
+			continue
+		}
+		out := String(tree)
+		if out != tcase.output {
+			t.Errorf("out: %s, want %s", out, tcase.output)
+		}
+	}
+}
+
+func TestLoadData(t *testing.T) {
+	validSQL := []string{
+		"load data from s3 'x.txt'",
+		"load data from s3 manifest 'x.txt'",
+		"load data from s3 file 'x.txt'",
+		"load data infile 'x.txt' into table 'c'",
+		"load data from s3 'x.txt' into table x"}
+	for _, tcase := range validSQL {
+		_, err := Parse(tcase)
+		require.NoError(t, err)
 	}
 }
 
@@ -1268,28 +2455,30 @@ func TestCreateTable(t *testing.T) {
 			"	col_longtext longtext,\n" +
 			"	col_text text character set ascii collate ascii_bin,\n" +
 			"	col_json json,\n" +
-			"	col_enum enum('a', 'b', 'c', 'd')\n" +
-			")",
-
-		// test defaults
-		"create table t (\n" +
-			"	i1 int default 1,\n" +
-			"	i2 int default null,\n" +
-			"	f1 float default 1.23,\n" +
-			"	s1 varchar default 'c',\n" +
-			"	s2 varchar default 'this is a string',\n" +
-			"	s3 varchar default null,\n" +
-			"	s4 timestamp default current_timestamp\n" +
-			")",
-
-		// test key field options
-		"create table t (\n" +
-			"	id int auto_increment primary key,\n" +
-			"	username varchar unique key,\n" +
-			"	email varchar unique,\n" +
-			"	full_name varchar key,\n" +
-			"	time1 timestamp on update current_timestamp,\n" +
-			"	time2 timestamp default current_timestamp on update current_timestamp\n" +
+			"	col_enum enum('a', 'b', 'c', 'd'),\n" +
+			"	col_enum2 enum('a', 'b', 'c', 'd') character set ascii,\n" +
+			"	col_enum3 enum('a', 'b', 'c', 'd') collate ascii_bin,\n" +
+			"	col_enum4 enum('a', 'b', 'c', 'd') character set ascii collate ascii_bin,\n" +
+			"	col_set set('a', 'b', 'c', 'd'),\n" +
+			"	col_set2 set('a', 'b', 'c', 'd') character set ascii,\n" +
+			"	col_set3 set('a', 'b', 'c', 'd') collate ascii_bin,\n" +
+			"	col_set4 set('a', 'b', 'c', 'd') character set ascii collate ascii_bin,\n" +
+			"	col_geometry1 geometry,\n" +
+			"	col_geometry2 geometry not null,\n" +
+			"	col_point1 point,\n" +
+			"	col_point2 point not null,\n" +
+			"	col_linestring1 linestring,\n" +
+			"	col_linestring2 linestring not null,\n" +
+			"	col_polygon1 polygon,\n" +
+			"	col_polygon2 polygon not null,\n" +
+			"	col_geometrycollection1 geometrycollection,\n" +
+			"	col_geometrycollection2 geometrycollection not null,\n" +
+			"	col_multipoint1 multipoint,\n" +
+			"	col_multipoint2 multipoint not null,\n" +
+			"	col_multilinestring1 multilinestring,\n" +
+			"	col_multilinestring2 multilinestring not null,\n" +
+			"	col_multipolygon1 multipolygon,\n" +
+			"	col_multipolygon2 multipolygon not null\n" +
 			")",
 
 		// test defining indexes separately
@@ -1298,13 +2487,41 @@ func TestCreateTable(t *testing.T) {
 			"	username varchar,\n" +
 			"	email varchar,\n" +
 			"	full_name varchar,\n" +
-			"	status varchar,\n" +
+			"	geom point not null,\n" +
+			"	status_nonkeyword varchar,\n" +
 			"	primary key (id),\n" +
+			"	spatial key geom (geom),\n" +
+			"	fulltext key fts (full_name),\n" +
 			"	unique key by_username (username),\n" +
-			"	unique by_username2 (username),\n" +
+			"	unique key by_username2 (username),\n" +
 			"	unique index by_username3 (username),\n" +
-			"	index by_status (status),\n" +
+			"	index by_status (status_nonkeyword),\n" +
 			"	key by_full_name (full_name)\n" +
+			")",
+
+		// test that indexes support USING <id>
+		"create table t (\n" +
+			"	id int auto_increment,\n" +
+			"	username varchar,\n" +
+			"	email varchar,\n" +
+			"	full_name varchar,\n" +
+			"	status_nonkeyword varchar,\n" +
+			"	primary key (id) using BTREE,\n" +
+			"	unique key by_username (username) using HASH,\n" +
+			"	unique key by_username2 (username) using OTHER,\n" +
+			"	unique index by_username3 (username) using XYZ,\n" +
+			"	index by_status (status_nonkeyword) using PDQ,\n" +
+			"	key by_full_name (full_name) using OTHER\n" +
+			")",
+		// test other index options
+		"create table t (\n" +
+			"	id int auto_increment,\n" +
+			"	username varchar,\n" +
+			"	email varchar,\n" +
+			"	primary key (id) comment 'hi',\n" +
+			"	unique key by_username (username) key_block_size 8,\n" +
+			"	unique index by_username4 (username) comment 'hi' using BTREE,\n" +
+			"	unique index by_username4 (username) using BTREE key_block_size 4 comment 'hi'\n" +
 			")",
 
 		// multi-column indexes
@@ -1318,7 +2535,26 @@ func TestCreateTable(t *testing.T) {
 			"	c int,\n" +
 			"	primary key (id, username),\n" +
 			"	unique key by_abc (a, b, c),\n" +
+			"	unique key (a, b, c),\n" +
 			"	key by_email (email(10), username)\n" +
+			")",
+
+		// foreign keys
+		"create table t (\n" +
+			"	id int auto_increment,\n" +
+			"	username varchar,\n" +
+			"	k int,\n" +
+			"	Z int,\n" +
+			"	primary key (id, username),\n" +
+			"	key by_email (email(10), username),\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b),\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b) on delete restrict,\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b) on delete no action,\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b) on delete cascade on update set default,\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b) on delete set default on update set null,\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b) on delete set null on update restrict,\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b) on update no action,\n" +
+			"	constraint second_ibfk_1 foreign key (k, j) references simple (a, b) on update cascade\n" +
 			")",
 
 		// table options
@@ -1327,10 +2563,10 @@ func TestCreateTable(t *testing.T) {
 			") engine InnoDB,\n" +
 			"  auto_increment 123,\n" +
 			"  avg_row_length 1,\n" +
-			"  default character set utf8mb4,\n" +
-			"  character set latin1,\n" +
+			"  charset utf8mb4,\n" +
+			"  charset latin1,\n" +
 			"  checksum 0,\n" +
-			"  default collate binary,\n" +
+			"  collate binary,\n" +
 			"  collate ascii_bin,\n" +
 			"  comment 'this is a comment',\n" +
 			"  compression 'zlib',\n" +
@@ -1350,7 +2586,15 @@ func TestCreateTable(t *testing.T) {
 			"  stats_persistent 0,\n" +
 			"  stats_sample_pages 1,\n" +
 			"  tablespace tablespace_name storage disk,\n" +
+			"  union (a, b, c),\n" +
 			"  tablespace tablespace_name\n",
+
+		// boolean columns
+		"create table t (\n" +
+			"	bi bigint not null primary key,\n" +
+			"	b1 bool not null,\n" +
+			"	b2 boolean\n" +
+			")",
 	}
 	for _, sql := range validSQL {
 		sql = strings.TrimSpace(sql)
@@ -1359,11 +2603,9 @@ func TestCreateTable(t *testing.T) {
 			t.Errorf("input: %s, err: %v", sql, err)
 			continue
 		}
-		got := String(tree.(*DDL))
-
-		if sql != got {
-			t.Errorf("want:\n%s\ngot:\n%s", sql, got)
-		}
+		got := String(tree.(*CreateTable))
+		assert.True(t, tree.(*CreateTable).FullyParsed)
+		require.Equal(t, sql, got)
 	}
 
 	sql := "create table t garbage"
@@ -1371,10 +2613,248 @@ func TestCreateTable(t *testing.T) {
 	if err != nil {
 		t.Errorf("input: %s, err: %v", sql, err)
 	}
+	assert.True(t, !tree.(*CreateTable).FullyParsed)
 
 	tree, err = ParseStrictDDL(sql)
 	if tree != nil || err == nil {
 		t.Errorf("ParseStrictDDL unexpectedly accepted input %s", sql)
+	}
+
+	testCases := []struct {
+		input  string
+		output string
+	}{{
+		// test key_block_size
+		input: "create table t (\n" +
+			"	id int auto_increment,\n" +
+			"	username varchar,\n" +
+			"	unique key by_username (username) key_block_size 8,\n" +
+			"	unique key by_username2 (username) key_block_size=8,\n" +
+			"	unique by_username3 (username) key_block_size = 4\n" +
+			")",
+		output: "create table t (\n" +
+			"	id int auto_increment,\n" +
+			"	username varchar,\n" +
+			"	unique key by_username (username) key_block_size 8,\n" +
+			"	unique key by_username2 (username) key_block_size 8,\n" +
+			"	unique key by_username3 (username) key_block_size 4\n" +
+			")",
+	}, {
+		// test defaults
+		input: "create table t (\n" +
+			"	i1 int default 1,\n" +
+			"	i2 int default null,\n" +
+			"	f1 float default 1.23,\n" +
+			"	s1 varchar default 'c',\n" +
+			"	s2 varchar default 'this is a string',\n" +
+			"	s3 varchar default null,\n" +
+			"	s4 timestamp default current_timestamp,\n" +
+			"	s5 bit(1) default B'0'\n" +
+			")",
+		output: "create table t (\n" +
+			"	i1 int default 1,\n" +
+			"	i2 int default null,\n" +
+			"	f1 float default 1.23,\n" +
+			"	s1 varchar default 'c',\n" +
+			"	s2 varchar default 'this is a string',\n" +
+			"	`s3` varchar default null,\n" +
+			"	s4 timestamp default current_timestamp(),\n" +
+			"	s5 bit(1) default B'0'\n" +
+			")",
+	}, {
+		// test non_reserved word in column name
+		input: "create table t (\n" +
+			"	repair int\n" +
+			")",
+		output: "create table t (\n" +
+			"	`repair` int\n" +
+			")",
+	}, {
+		// test key field options
+		input: "create table t (\n" +
+			"	id int auto_increment primary key,\n" +
+			"	username varchar unique key,\n" +
+			"	email varchar unique,\n" +
+			"	full_name varchar key,\n" +
+			"	time1 timestamp on update current_timestamp,\n" +
+			"	time2 timestamp default current_timestamp on update current_timestamp\n" +
+			")",
+		output: "create table t (\n" +
+			"	id int auto_increment primary key,\n" +
+			"	username varchar unique key,\n" +
+			"	email varchar unique,\n" +
+			"	full_name varchar key,\n" +
+			"	time1 timestamp on update current_timestamp(),\n" +
+			"	time2 timestamp default current_timestamp() on update current_timestamp()\n" +
+			")",
+	}, {
+		// test current_timestamp with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default current_timestamp,\n" +
+			"	time2 timestamp default current_timestamp(),\n" +
+			"	time3 timestamp default current_timestamp on update current_timestamp,\n" +
+			"	time4 timestamp default current_timestamp() on update current_timestamp(),\n" +
+			"	time5 timestamp(3) default current_timestamp(3) on update current_timestamp(3)\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default current_timestamp(),\n" +
+			"	time2 timestamp default current_timestamp(),\n" +
+			"	time3 timestamp default current_timestamp() on update current_timestamp(),\n" +
+			"	time4 timestamp default current_timestamp() on update current_timestamp(),\n" +
+			"	time5 timestamp(3) default current_timestamp(3) on update current_timestamp(3)\n" +
+			")",
+	}, {
+		// test utc_timestamp with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default utc_timestamp,\n" +
+			"	time2 timestamp default utc_timestamp(),\n" +
+			"	time3 timestamp default utc_timestamp on update utc_timestamp,\n" +
+			"	time4 timestamp default utc_timestamp() on update utc_timestamp(),\n" +
+			"	time5 timestamp(4) default utc_timestamp(4) on update utc_timestamp(4)\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default utc_timestamp(),\n" +
+			"	time2 timestamp default utc_timestamp(),\n" +
+			"	time3 timestamp default utc_timestamp() on update utc_timestamp(),\n" +
+			"	time4 timestamp default utc_timestamp() on update utc_timestamp(),\n" +
+			"	time5 timestamp(4) default utc_timestamp(4) on update utc_timestamp(4)\n" +
+			")",
+	}, {
+		// test utc_time with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default utc_time,\n" +
+			"	time2 timestamp default utc_time(),\n" +
+			"	time3 timestamp default utc_time on update utc_time,\n" +
+			"	time4 timestamp default utc_time() on update utc_time(),\n" +
+			"	time5 timestamp(5) default utc_time(5) on update utc_time(5)\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default utc_time(),\n" +
+			"	time2 timestamp default utc_time(),\n" +
+			"	time3 timestamp default utc_time() on update utc_time(),\n" +
+			"	time4 timestamp default utc_time() on update utc_time(),\n" +
+			"	time5 timestamp(5) default utc_time(5) on update utc_time(5)\n" +
+			")",
+	}, {
+		// test utc_date with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default utc_date,\n" +
+			"	time2 timestamp default utc_date(),\n" +
+			"	time3 timestamp default utc_date on update utc_date,\n" +
+			"	time4 timestamp default utc_date() on update utc_date()\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default utc_date(),\n" +
+			"	time2 timestamp default utc_date(),\n" +
+			"	time3 timestamp default utc_date() on update utc_date(),\n" +
+			"	time4 timestamp default utc_date() on update utc_date()\n" +
+			")",
+	}, {
+		// test localtime with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default localtime,\n" +
+			"	time2 timestamp default localtime(),\n" +
+			"	time3 timestamp default localtime on update localtime,\n" +
+			"	time4 timestamp default localtime() on update localtime(),\n" +
+			"	time5 timestamp(6) default localtime(6) on update localtime(6)\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default localtime(),\n" +
+			"	time2 timestamp default localtime(),\n" +
+			"	time3 timestamp default localtime() on update localtime(),\n" +
+			"	time4 timestamp default localtime() on update localtime(),\n" +
+			"	time5 timestamp(6) default localtime(6) on update localtime(6)\n" +
+			")",
+	}, {
+		// test localtimestamp with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default localtimestamp,\n" +
+			"	time2 timestamp default localtimestamp(),\n" +
+			"	time3 timestamp default localtimestamp on update localtimestamp,\n" +
+			"	time4 timestamp default localtimestamp() on update localtimestamp(),\n" +
+			"	time5 timestamp(1) default localtimestamp(1) on update localtimestamp(1)\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default localtimestamp(),\n" +
+			"	time2 timestamp default localtimestamp(),\n" +
+			"	time3 timestamp default localtimestamp() on update localtimestamp(),\n" +
+			"	time4 timestamp default localtimestamp() on update localtimestamp(),\n" +
+			"	time5 timestamp(1) default localtimestamp(1) on update localtimestamp(1)\n" +
+			")",
+	}, {
+		// test current_date with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default current_date,\n" +
+			"	time2 timestamp default current_date(),\n" +
+			"	time3 timestamp default current_date on update current_date,\n" +
+			"	time4 timestamp default current_date() on update current_date()\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default current_date(),\n" +
+			"	time2 timestamp default current_date(),\n" +
+			"	time3 timestamp default current_date() on update current_date(),\n" +
+			"	time4 timestamp default current_date() on update current_date()\n" +
+			")",
+	}, {
+		// test current_time with and without ()
+		input: "create table t (\n" +
+			"	time1 timestamp default current_time,\n" +
+			"	time2 timestamp default current_time(),\n" +
+			"	time3 timestamp default current_time on update current_time,\n" +
+			"	time4 timestamp default current_time() on update current_time(),\n" +
+			"	time5 timestamp(2) default current_time(2) on update current_time(2)\n" +
+			")",
+		output: "create table t (\n" +
+			"	time1 timestamp default current_time(),\n" +
+			"	time2 timestamp default current_time(),\n" +
+			"	time3 timestamp default current_time() on update current_time(),\n" +
+			"	time4 timestamp default current_time() on update current_time(),\n" +
+			"	time5 timestamp(2) default current_time(2) on update current_time(2)\n" +
+			")",
+	},
+	}
+	for _, tcase := range testCases {
+		tree, err := ParseStrictDDL(tcase.input)
+		if err != nil {
+			t.Errorf("input: %s, err: %v", tcase.input, err)
+			continue
+		}
+		assert.True(t, tree.(*CreateTable).FullyParsed)
+		if got, want := String(tree.(*CreateTable)), tcase.output; got != want {
+			t.Errorf("Parse(%s):\n%s, want\n%s", tcase.input, got, want)
+		}
+	}
+}
+
+func TestCreateTableLike(t *testing.T) {
+	normal := "create table a like b"
+	testCases := []struct {
+		input  string
+		output string
+	}{
+		{
+			"create table a like b",
+			normal,
+		},
+		{
+			"create table a (like b)",
+			normal,
+		},
+		{
+			"create table ks.a like unsharded_ks.b",
+			"create table ks.a like unsharded_ks.b",
+		},
+	}
+	for _, tcase := range testCases {
+		tree, err := ParseStrictDDL(tcase.input)
+		if err != nil {
+			t.Errorf("input: %s, err: %v", tcase.input, err)
+			continue
+		}
+		assert.True(t, tree.(*CreateTable).FullyParsed)
+		if got, want := String(tree.(*CreateTable)), tcase.output; got != want {
+			t.Errorf("Parse(%s):\n%s, want\n%s", tcase.input, got, want)
+		}
 	}
 }
 
@@ -1401,7 +2881,7 @@ func TestCreateTableEscaped(t *testing.T) {
 			t.Errorf("input: %s, err: %v", tcase.input, err)
 			continue
 		}
-		if got, want := String(tree.(*DDL)), tcase.output; got != want {
+		if got, want := String(tree.(*CreateTable)), tcase.output; got != want {
 			t.Errorf("Parse(%s):\n%s, want\n%s", tcase.input, got, want)
 		}
 	}
@@ -1413,9 +2893,6 @@ var (
 		output       string
 		excludeMulti bool // Don't use in the ParseNext multi-statement parsing tests.
 	}{{
-		input:  "select $ from t",
-		output: "syntax error at position 9 near '$'",
-	}, {
 		input:  "select : from t",
 		output: "syntax error at position 9 near ':'",
 	}, {
@@ -1473,6 +2950,9 @@ var (
 		input:  "select * from a natural join b on c = d",
 		output: "syntax error at position 34 near 'on'",
 	}, {
+		input:  "select * from a natural join b using (c)",
+		output: "syntax error at position 37 near 'using'",
+	}, {
 		input:  "select next id from a",
 		output: "expecting value after next at position 15 near 'id'",
 	}, {
@@ -1503,11 +2983,11 @@ var (
 		input:  "select /* vitess-reserved keyword as unqualified column */ * from t where escape = 'test'",
 		output: "syntax error at position 81 near 'escape'",
 	}, {
-		input:  "(select /* parenthesized select */ * from t)",
-		output: "syntax error at position 45",
-	}, {
 		input:  "select * from t where id = ((select a from t1 union select b from t2) order by a limit 1)",
 		output: "syntax error at position 76 near 'order'",
+	}, {
+		input:  "select /* straight_join using */ 1 from t1 straight_join t2 using (a)",
+		output: "syntax error at position 66 near 'using'",
 	}, {
 		input:        "select 'aa",
 		output:       "syntax error at position 11 near 'aa'",
@@ -1520,14 +3000,73 @@ var (
 		input:        "select /* aa",
 		output:       "syntax error at position 13 near '/* aa'",
 		excludeMulti: true,
+	}, {
+		// non_reserved keywords are currently not permitted everywhere
+		input:        "create database repair",
+		output:       "syntax error at position 23 near 'repair'",
+		excludeMulti: true,
 	}}
 )
 
 func TestErrors(t *testing.T) {
 	for _, tcase := range invalidSQL {
+		t.Run(tcase.input, func(t *testing.T) {
+			_, err := Parse(tcase.input)
+			require.Error(t, err, tcase.output)
+			require.Equal(t, err.Error(), tcase.output)
+		})
+	}
+}
+
+// TestSkipToEnd tests that the skip to end functionality
+// does not skip past a ';'. If any tokens exist after that, Parse
+// should return an error.
+func TestSkipToEnd(t *testing.T) {
+	testcases := []struct {
+		input  string
+		output string
+	}{{
+		// This is the case where the partial ddl will be reset
+		// because of a premature ';'.
+		input:  "create table a(id; select * from t",
+		output: "syntax error at position 19",
+	}, {
+		// Partial DDL should get reset for valid DDLs also.
+		input:  "create table a(id int); select * from t",
+		output: "syntax error at position 31 near 'select'",
+	}, {
+		// Partial DDL does not get reset here. But we allow the
+		// DDL only if there are no new tokens after skipping to end.
+		input:  "create table a bb cc; select * from t",
+		output: "extra characters encountered after end of DDL: 'select'",
+	}, {
+		// Test that we don't step at ';' inside strings.
+		input:  "create table a bb 'a;'; select * from t",
+		output: "extra characters encountered after end of DDL: 'select'",
+	}}
+	for _, tcase := range testcases {
 		_, err := Parse(tcase.input)
 		if err == nil || err.Error() != tcase.output {
 			t.Errorf("%s: %v, want %s", tcase.input, err, tcase.output)
+		}
+	}
+}
+
+func TestParseDjangoQueries(t *testing.T) {
+
+	file, err := os.Open("./test_queries/django_queries.txt")
+	if err != nil {
+		t.Errorf(" Error: %v", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+
+		_, err := Parse(string(scanner.Text()))
+		if err != nil {
+			t.Error(scanner.Text())
+			t.Errorf(" Error: %v", err)
 		}
 	}
 }
@@ -1536,8 +3075,36 @@ func TestErrors(t *testing.T) {
 // BenchmarkParse1-4         100000             16334 ns/op
 // BenchmarkParse2-4          30000             44121 ns/op
 
+// Benchmark run on 9/3/18, comparing pooled parser performance.
+//
+// benchmark                     old ns/op     new ns/op     delta
+// BenchmarkNormalize-4          2540          2533          -0.28%
+// BenchmarkParse1-4             18269         13330         -27.03%
+// BenchmarkParse2-4             46703         41255         -11.67%
+// BenchmarkParse2Parallel-4     22246         20707         -6.92%
+// BenchmarkParse3-4             4064743       4083135       +0.45%
+//
+// benchmark                     old allocs     new allocs     delta
+// BenchmarkNormalize-4          27             27             +0.00%
+// BenchmarkParse1-4             75             74             -1.33%
+// BenchmarkParse2-4             264            263            -0.38%
+// BenchmarkParse2Parallel-4     176            175            -0.57%
+// BenchmarkParse3-4             360            361            +0.28%
+//
+// benchmark                     old bytes     new bytes     delta
+// BenchmarkNormalize-4          821           821           +0.00%
+// BenchmarkParse1-4             22776         2307          -89.87%
+// BenchmarkParse2-4             28352         7881          -72.20%
+// BenchmarkParse2Parallel-4     25712         5235          -79.64%
+// BenchmarkParse3-4             6352082       6336307       -0.25%
+
+const (
+	sql1 = "select 'abcd', 20, 30.0, eid from a where 1=eid and name='3'"
+	sql2 = "select aaaa, bbb, ccc, ddd, eeee, ffff, gggg, hhhh, iiii from tttt, ttt1, ttt3 where aaaa = bbbb and bbbb = cccc and dddd+1 = eeee group by fff, gggg having hhhh = iiii and iiii = jjjj order by kkkk, llll limit 3, 4"
+)
+
 func BenchmarkParse1(b *testing.B) {
-	sql := "select 'abcd', 20, 30.0, eid from a where 1=eid and name='3'"
+	sql := sql1
 	for i := 0; i < b.N; i++ {
 		ast, err := Parse(sql)
 		if err != nil {
@@ -1548,7 +3115,7 @@ func BenchmarkParse1(b *testing.B) {
 }
 
 func BenchmarkParse2(b *testing.B) {
-	sql := "select aaaa, bbb, ccc, ddd, eeee, ffff, gggg, hhhh, iiii from tttt, ttt1, ttt3 where aaaa = bbbb and bbbb = cccc and dddd+1 = eeee group by fff, gggg having hhhh = iiii and iiii = jjjj order by kkkk, llll limit 3, 4"
+	sql := sql2
 	for i := 0; i < b.N; i++ {
 		ast, err := Parse(sql)
 		if err != nil {
@@ -1556,6 +3123,19 @@ func BenchmarkParse2(b *testing.B) {
 		}
 		_ = String(ast)
 	}
+}
+
+func BenchmarkParse2Parallel(b *testing.B) {
+	sql := sql2
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			ast, err := Parse(sql)
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ast
+		}
+	})
 }
 
 var benchQuery string

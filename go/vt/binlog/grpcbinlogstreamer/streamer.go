@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +19,11 @@ limitations under the License.
 package grpcbinlogstreamer
 
 import (
-	"github.com/youtube/vitess/go/vt/binlog"
-	"github.com/youtube/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/binlog"
+	"vitess.io/vitess/go/vt/servenv"
 
-	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
-	binlogservicepb "github.com/youtube/vitess/go/vt/proto/binlogservice"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	binlogservicepb "vitess.io/vitess/go/vt/proto/binlogservice"
 )
 
 // UpdateStream is the gRPC UpdateStream server

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,9 +19,14 @@ package streamlog
 import (
 	"bufio"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -34,8 +39,13 @@ func (l *logMessage) Format(params url.Values) string {
 	return l.val + "\n"
 }
 
+func testLogf(w io.Writer, params url.Values, m interface{}) error {
+	_, err := io.WriteString(w, m.(*logMessage).Format(params))
+	return err
+}
+
 func TestHTTP(t *testing.T) {
-	l, err := net.Listen("tcp", ":0")
+	l, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +55,7 @@ func TestHTTP(t *testing.T) {
 	go http.Serve(l, nil)
 
 	logger := New("logger", 1)
-	logger.ServeLogs("/log", func(params url.Values, x interface{}) string { return x.(*logMessage).Format(params) })
+	logger.ServeLogs("/log", testLogf)
 
 	// This should not block - there are no subscribers yet.
 	logger.Send(&logMessage{"val1"})
@@ -178,5 +188,70 @@ func TestChannel(t *testing.T) {
 	ch = nil
 	if sz := len(logger.subscribed); sz != 0 {
 		t.Errorf("want 0, got %d", sz)
+	}
+}
+
+func TestFile(t *testing.T) {
+	logger := New("logger", 10)
+
+	dir, err := ioutil.TempDir("", "streamlog_file")
+	if err != nil {
+		t.Fatalf("error getting tempdir: %v", err)
+	}
+
+	logPath := path.Join(dir, "test.log")
+	logChan, err := logger.LogToFile(logPath, testLogf)
+	defer logger.Unsubscribe(logChan)
+	if err != nil {
+		t.Errorf("error enabling file logger: %v", err)
+	}
+
+	logger.Send(&logMessage{"test 1"})
+	logger.Send(&logMessage{"test 2"})
+
+	// Allow time for propagation
+	time.Sleep(10 * time.Millisecond)
+
+	want := "test 1\ntest 2\n"
+	contents, _ := ioutil.ReadFile(logPath)
+	got := string(contents)
+	if want != string(got) {
+		t.Errorf("streamlog file: want %q got %q", want, got)
+	}
+
+	// Rename and send another log which should go to the renamed file
+	rotatedPath := path.Join(dir, "test.log.1")
+	os.Rename(logPath, rotatedPath)
+
+	logger.Send(&logMessage{"test 3"})
+	time.Sleep(10 * time.Millisecond)
+
+	want = "test 1\ntest 2\ntest 3\n"
+	contents, _ = ioutil.ReadFile(rotatedPath)
+	got = string(contents)
+	if want != string(got) {
+		t.Errorf("streamlog file: want %q got %q", want, got)
+	}
+
+	// Send the rotate signal which should reopen the original file path
+	// for new logs to go to
+	syscall.Kill(syscall.Getpid(), syscall.SIGUSR2)
+	time.Sleep(10 * time.Millisecond)
+
+	logger.Send(&logMessage{"test 4"})
+	time.Sleep(10 * time.Millisecond)
+
+	want = "test 1\ntest 2\ntest 3\n"
+	contents, _ = ioutil.ReadFile(rotatedPath)
+	got = string(contents)
+	if want != string(got) {
+		t.Errorf("streamlog file: want %q got %q", want, got)
+	}
+
+	want = "test 4\n"
+	contents, _ = ioutil.ReadFile(logPath)
+	got = string(contents)
+	if want != string(got) {
+		t.Errorf("streamlog file: want %q got %q", want, got)
 	}
 }

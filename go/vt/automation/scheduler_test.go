@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,10 +21,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	context "golang.org/x/net/context"
+	context "context"
 
-	automationpb "github.com/youtube/vitess/go/vt/proto/automation"
+	"github.com/golang/protobuf/proto"
+
+	automationpb "vitess.io/vitess/go/vt/proto/automation"
 )
 
 // newTestScheduler constructs a scheduler with test tasks.

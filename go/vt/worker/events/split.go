@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@ limitations under the License.
 
 package events
 
-import base "github.com/youtube/vitess/go/vt/events"
+import (
+	base "vitess.io/vitess/go/vt/events"
+)
 
 // SplitClone is an event that describes a single step in a horizontal
 // split clone.
@@ -25,7 +27,6 @@ type SplitClone struct {
 
 	Keyspace, Shard, Cell string
 	ExcludeTables         []string
-	Strategy              string
 }
 
 // VerticalSplitClone is an event that describes a single step in a vertical
@@ -35,5 +36,4 @@ type VerticalSplitClone struct {
 
 	Keyspace, Shard, Cell string
 	Tables                []string
-	Strategy              string
 }

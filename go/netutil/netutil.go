@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -154,7 +154,7 @@ func FullyQualifiedHostname() (string, error) {
 	//   127.0.0.1	localhost.localdomain localhost
 	// If the FQDN isn't returned by this function, check the order in the entry
 	// in your /etc/hosts file.
-	return strings.TrimRight(resolvedHostnames[0], "."), nil
+	return strings.TrimSuffix(resolvedHostnames[0], "."), nil
 }
 
 // FullyQualifiedHostnameOrPanic is the same as FullyQualifiedHostname
@@ -167,18 +167,25 @@ func FullyQualifiedHostnameOrPanic() string {
 	return hostname
 }
 
-// ResolveIPv4Addr resolves the address:port part into an IP address:port pair
-func ResolveIPv4Addr(addr string) (string, error) {
+// ResolveIPv4Addrs resolves the address:port part into IP address:port pairs
+func ResolveIPv4Addrs(addr string) ([]string, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	ipAddrs, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(ipAddrs))
 	for _, ipAddr := range ipAddrs {
 		ipv4 := ipAddr.To4()
 		if ipv4 != nil {
-			return net.JoinHostPort(ipv4.String(), port), nil
+			result = append(result, net.JoinHostPort(ipv4.String(), port))
 		}
 	}
-	return "", fmt.Errorf("no IPv4addr for name %v", host)
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no IPv4addr for name %v", host)
+	}
+	return result, nil
 }

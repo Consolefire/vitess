@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,31 +22,38 @@ import (
 	"io"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
+	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
+)
+
+var (
+	defaultTimeout = time.Hour
 )
 
 // RunCommandAndWait executes a single command on a given vtctld and blocks until the command did return or timed out.
 // Output from vtctld is streamed as logutilpb.Event messages which
 // have to be consumed by the caller who has to specify a "recv" function.
-func RunCommandAndWait(ctx context.Context, server string, args []string, actionTimeout time.Duration, recv func(*logutilpb.Event)) error {
+func RunCommandAndWait(ctx context.Context, server string, args []string, recv func(*logutilpb.Event)) error {
 	if recv == nil {
-		return errors.New("No function closure for Event stream specified")
+		return errors.New("no function closure for Event stream specified")
 	}
 	// create the client
-	client, err := New(server, 30*time.Second /* dialTimeout */)
+	client, err := New(server)
 	if err != nil {
-		return fmt.Errorf("Cannot dial to server %v: %v", server, err)
+		return fmt.Errorf("cannot dial to server %v: %v", server, err)
 	}
 	defer client.Close()
 
-	// run the command
-	ctx, cancel := context.WithTimeout(context.Background(), actionTimeout)
-	defer cancel()
-	stream, err := client.ExecuteVtctlCommand(ctx, args, actionTimeout)
+	// run the command ( get the timeout from the context )
+	timeout := defaultTimeout
+	deadline, ok := ctx.Deadline()
+	if ok {
+		timeout = time.Until(deadline)
+	}
+	stream, err := client.ExecuteVtctlCommand(ctx, args, timeout)
 	if err != nil {
-		return fmt.Errorf("Cannot execute remote command: %v", err)
+		return fmt.Errorf("cannot execute remote command: %v", err)
 	}
 
 	// stream the result
@@ -58,7 +65,7 @@ func RunCommandAndWait(ctx context.Context, server string, args []string, action
 		case io.EOF:
 			return nil
 		default:
-			return fmt.Errorf("Remote error: %v", err)
+			return fmt.Errorf("remote error: %v", err)
 		}
 	}
 }

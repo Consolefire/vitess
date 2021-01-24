@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -22,20 +22,20 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/vttablet/grpcqueryservice"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice/fakes"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/wrangler"
-	"github.com/youtube/vitess/go/vt/wrangler/testlib"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/logutil"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vttablet/grpcqueryservice"
+	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/wrangler"
+	"vitess.io/vitess/go/vt/wrangler/testlib"
 )
 
 // streamHealthTabletServer is a local QueryService implementation to support the tests
@@ -91,10 +91,14 @@ func (s *streamHealthTabletServer) streamHealthUnregister(id int) error {
 }
 
 // BroadcastHealth will broadcast the current health to all listeners
-func (s *streamHealthTabletServer) BroadcastHealth(terTimestamp int64, stats *querypb.RealtimeStats) {
+func (s *streamHealthTabletServer) BroadcastHealth() {
 	shr := &querypb.StreamHealthResponse{
-		TabletExternallyReparentedTimestamp: terTimestamp,
-		RealtimeStats:                       stats,
+		TabletExternallyReparentedTimestamp: 42,
+		RealtimeStats: &querypb.RealtimeStats{
+			HealthError:         "testHealthError",
+			SecondsBehindMaster: 72,
+			CpuUsage:            1.1,
+		},
 	}
 
 	s.streamHealthMutex.Lock()
@@ -123,12 +127,6 @@ func TestTabletData(t *testing.T) {
 
 	thc := newTabletHealthCache(ts)
 
-	stats := &querypb.RealtimeStats{
-		HealthError:         "testHealthError",
-		SecondsBehindMaster: 72,
-		CpuUsage:            1.1,
-	}
-
 	// Keep broadcasting until the first result goes through.
 	stop := make(chan struct{})
 	go func() {
@@ -137,7 +135,7 @@ func TestTabletData(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				shsq.BroadcastHealth(42, stats)
+				shsq.BroadcastHealth()
 			}
 		}
 	}()
@@ -150,6 +148,12 @@ func TestTabletData(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("thc.Get failed: %v", err)
+	}
+
+	stats := &querypb.RealtimeStats{
+		HealthError:         "testHealthError",
+		SecondsBehindMaster: 72,
+		CpuUsage:            1.1,
 	}
 	if got, want := result.RealtimeStats, stats; !proto.Equal(got, want) {
 		t.Errorf("RealtimeStats = %#v, want %#v", got, want)

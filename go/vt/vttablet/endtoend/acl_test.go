@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,13 +22,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	"github.com/youtube/vitess/go/vt/vttablet/endtoend/framework"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/rules"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
-func TestTableACLNoAccess(t *testing.T) {
+func TestTableACL(t *testing.T) {
 	client := framework.NewClient()
 
 	aclErr := "table acl error"
@@ -79,6 +80,17 @@ func TestTableACLNoAccess(t *testing.T) {
 	}, {
 		query: "alter table vitess_acl_all_user_read_only comment 'comment'",
 		err:   aclErr,
+	}, {
+		query: "select * from vitess_acl_read_only, vitess_acl_no_access",
+		err:   aclErr,
+	}, {
+		query: "delete from vitess_acl_read_write where key1=(select key1 from vitess_acl_no_access)",
+		err:   aclErr,
+	}, {
+		query: "delete from vitess_acl_read_write where key1=(select key1 from vitess_acl_read_only)",
+	}, {
+		query: "update vitess_acl_read_write join vitess_acl_read_only on 1!=1 set key1=1",
+		err:   aclErr,
 	}}
 
 	for _, tcase := range execCases {
@@ -90,7 +102,7 @@ func TestTableACLNoAccess(t *testing.T) {
 			continue
 		}
 		if err == nil || !strings.HasPrefix(err.Error(), tcase.err) {
-			t.Errorf("Error: %v, must start with %s", err, tcase.err)
+			t.Errorf("Execute(%s): Error: %v, must start with %s", tcase.query, err, tcase.err)
 		}
 	}
 
@@ -177,12 +189,12 @@ func TestQueryRules(t *testing.T) {
 	query := "select * from vitess_test where intval=:asdfg"
 	bv := map[string]*querypb.BindVariable{"asdfg": sqltypes.Int64BindVariable(1)}
 	_, err = client.Execute(query, bv)
-	want = "disallowed due to rule: disallow bindvar 'asdfg', CallerID: dev"
+	want = "disallowed due to rule: disallow bindvar 'asdfg' (CallerID: dev)"
 	if err == nil || err.Error() != want {
 		t.Errorf("Error: %v, want %s", err, want)
 	}
 	_, err = client.StreamExecute(query, bv)
-	want = "disallowed due to rule: disallow bindvar 'asdfg', CallerID: dev"
+	want = "disallowed due to rule: disallow bindvar 'asdfg' (CallerID: dev)"
 	if err == nil || err.Error() != want {
 		t.Errorf("Error: %v, want %s", err, want)
 	}

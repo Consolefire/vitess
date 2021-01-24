@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,50 +25,39 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/testfiles"
-	"github.com/youtube/vitess/go/vt/sqlparser"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/schema"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/tableacl"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 )
 
-// toJSON returns a JSON of the given Plan.
-// Except for "TableName", it's a 1:1 copy of the fields of "Plan".
-// (The JSON output is used in the tests to compare it against the data in the
-// golden files e.g. data/test/tabletserver/exec_cases.txt.)
-func toJSON(p *Plan) ([]byte, error) {
+// MarshalJSON returns a JSON of the given Plan.
+// This is only for testing.
+func (p *Plan) MarshalJSON() ([]byte, error) {
 	mplan := struct {
-		PlanID            PlanType
-		Reason            ReasonType             `json:",omitempty"`
-		TableName         sqlparser.TableIdent   `json:",omitempty"`
-		FieldQuery        *sqlparser.ParsedQuery `json:",omitempty"`
-		FullQuery         *sqlparser.ParsedQuery `json:",omitempty"`
-		OuterQuery        *sqlparser.ParsedQuery `json:",omitempty"`
-		Subquery          *sqlparser.ParsedQuery `json:",omitempty"`
-		UpsertQuery       *sqlparser.ParsedQuery `json:",omitempty"`
-		ColumnNumbers     []int                  `json:",omitempty"`
-		PKValues          []sqltypes.PlanValue   `json:",omitempty"`
-		SecondaryPKValues []sqltypes.PlanValue   `json:",omitempty"`
-		WhereClause       *sqlparser.ParsedQuery `json:",omitempty"`
-		SubqueryPKColumns []int                  `json:",omitempty"`
+		PlanID      PlanType
+		TableName   sqlparser.TableIdent   `json:",omitempty"`
+		Permissions []Permission           `json:",omitempty"`
+		FieldQuery  *sqlparser.ParsedQuery `json:",omitempty"`
+		FullQuery   *sqlparser.ParsedQuery `json:",omitempty"`
+		NextCount   string                 `json:",omitempty"`
+		WhereClause *sqlparser.ParsedQuery `json:",omitempty"`
 	}{
-		PlanID:            p.PlanID,
-		Reason:            p.Reason,
-		TableName:         p.TableName(),
-		FieldQuery:        p.FieldQuery,
-		FullQuery:         p.FullQuery,
-		OuterQuery:        p.OuterQuery,
-		Subquery:          p.Subquery,
-		UpsertQuery:       p.UpsertQuery,
-		ColumnNumbers:     p.ColumnNumbers,
-		PKValues:          p.PKValues,
-		SecondaryPKValues: p.SecondaryPKValues,
-		WhereClause:       p.WhereClause,
-		SubqueryPKColumns: p.SubqueryPKColumns,
+		PlanID:      p.PlanID,
+		TableName:   p.TableName(),
+		Permissions: p.Permissions,
+		FieldQuery:  p.FieldQuery,
+		FullQuery:   p.FullQuery,
+		WhereClause: p.WhereClause,
+	}
+	if !p.NextCount.IsNull() {
+		b, _ := p.NextCount.MarshalJSON()
+		mplan.NextCount = string(b)
 	}
 	return json.Marshal(&mplan)
 }
@@ -76,32 +65,113 @@ func toJSON(p *Plan) ([]byte, error) {
 func TestPlan(t *testing.T) {
 	testSchema := loadSchema("schema_test.json")
 	for tcase := range iterateExecFile("exec_cases.txt") {
-		plan, err := Build(tcase.input, testSchema)
-		var out string
-		if err != nil {
-			out = err.Error()
-		} else {
-			bout, err := toJSON(plan)
-			if err != nil {
-				t.Fatalf("Error marshalling %v: %v", plan, err)
+		t.Run(tcase.input, func(t *testing.T) {
+			if strings.Contains(tcase.options, "PassthroughDMLs") {
+				PassthroughDMLs = true
 			}
-			out = string(bout)
-		}
-		if out != tcase.output {
-			t.Errorf("Line:%v\ngot  = %s\nwant = %s", tcase.lineno, out, tcase.output)
+			var plan *Plan
+			var err error
+			statement, err := sqlparser.Parse(tcase.input)
+			if err == nil {
+				plan, err = Build(statement, testSchema, false, "dbName")
+			}
+			PassthroughDMLs = false
+
+			var out string
 			if err != nil {
-				out = fmt.Sprintf("\"%s\"", out)
+				out = err.Error()
 			} else {
-				bout, _ := json.MarshalIndent(plan, "", "  ")
+				bout, err := json.Marshal(plan)
+				if err != nil {
+					t.Fatalf("Error marshalling %v: %v", plan, err)
+				}
 				out = string(bout)
 			}
-			fmt.Printf("\"%s\"\n%s\n\n", tcase.input, out)
-		}
+			if out != tcase.output {
+				t.Errorf("Line:%v\ngot  = %s\nwant = %s", tcase.lineno, out, tcase.output)
+				if err != nil {
+					out = fmt.Sprintf("\"%s\"", out)
+				} else {
+					bout, _ := json.MarshalIndent(plan, "", "  ")
+					out = string(bout)
+				}
+				fmt.Printf("\"%s\"\n%s\n\n", tcase.input, out)
+			}
+		})
+	}
+}
+
+func TestPlanPoolUnsafe(t *testing.T) {
+	testSchema := loadSchema("schema_test.json")
+	for tcase := range iterateExecFile("pool_unsafe_cases.txt") {
+		t.Run(tcase.input, func(t *testing.T) {
+			var plan *Plan
+			var err error
+			statement, err := sqlparser.Parse(tcase.input)
+			require.NoError(t, err)
+			// In Pooled Connection, plan building will fail.
+			plan, err = Build(statement, testSchema, false /* isReservedConn */, "dbName")
+			require.Error(t, err)
+			out := err.Error()
+			if out != tcase.output {
+				t.Errorf("Line:%v\ngot  = %s\nwant = %s", tcase.lineno, out, tcase.output)
+				if err != nil {
+					out = fmt.Sprintf("\"%s\"", out)
+				} else {
+					bout, _ := json.MarshalIndent(plan, "", "  ")
+					out = string(bout)
+				}
+				fmt.Printf("\"%s\"\n%s\n\n", tcase.input, out)
+			}
+			// In Reserved Connection, plan will be built.
+			plan, err = Build(statement, testSchema, true /* isReservedConn */, "dbName")
+			require.NoError(t, err)
+			require.NotEmpty(t, plan)
+		})
+	}
+}
+
+func TestPlanInReservedConn(t *testing.T) {
+	testSchema := loadSchema("schema_test.json")
+	for tcase := range iterateExecFile("exec_cases.txt") {
+		t.Run(tcase.input, func(t *testing.T) {
+			if strings.Contains(tcase.options, "PassthroughDMLs") {
+				PassthroughDMLs = true
+			}
+			var plan *Plan
+			var err error
+			statement, err := sqlparser.Parse(tcase.input)
+			if err == nil {
+				plan, err = Build(statement, testSchema, true, "dbName")
+			}
+			PassthroughDMLs = false
+
+			var out string
+			if err != nil {
+				out = err.Error()
+			} else {
+				bout, err := json.Marshal(plan)
+				if err != nil {
+					t.Fatalf("Error marshalling %v: %v", plan, err)
+				}
+				out = string(bout)
+			}
+			if out != tcase.output {
+				t.Errorf("Line:%v\ngot  = %s\nwant = %s", tcase.lineno, out, tcase.output)
+				if err != nil {
+					out = fmt.Sprintf("\"%s\"", out)
+				} else {
+					bout, _ := json.MarshalIndent(plan, "", "  ")
+					out = string(bout)
+				}
+				fmt.Printf("\"%s\"\n%s\n\n", tcase.input, out)
+			}
+		})
 	}
 }
 
 func TestCustom(t *testing.T) {
-	testSchemas := testfiles.Glob("tabletserver/*_schema.json")
+	testSchemas, _ := filepath.Glob("testdata/*_schema.json")
 	if len(testSchemas) == 0 {
 		t.Log("No schemas to test")
 		return
@@ -119,12 +189,16 @@ func TestCustom(t *testing.T) {
 		for _, file := range files {
 			t.Logf("Testing file %s", file)
 			for tcase := range iterateExecFile(file) {
-				plan, err := Build(tcase.input, schem)
+				statement, err := sqlparser.Parse(tcase.input)
+				if err != nil {
+					t.Fatalf("Got error: %v, parsing sql: %v", err.Error(), tcase.input)
+				}
+				plan, err := Build(statement, schem, false, "dbName")
 				var out string
 				if err != nil {
 					out = err.Error()
 				} else {
-					bout, err := toJSON(plan)
+					bout, err := json.Marshal(plan)
 					if err != nil {
 						t.Fatalf("Error marshalling %v: %v", plan, err)
 					}
@@ -141,12 +215,12 @@ func TestCustom(t *testing.T) {
 func TestStreamPlan(t *testing.T) {
 	testSchema := loadSchema("schema_test.json")
 	for tcase := range iterateExecFile("stream_cases.txt") {
-		plan, err := BuildStreaming(tcase.input, testSchema)
+		plan, err := BuildStreaming(tcase.input, testSchema, false)
 		var out string
 		if err != nil {
 			out = err.Error()
 		} else {
-			bout, err := toJSON(plan)
+			bout, err := json.Marshal(plan)
 			if err != nil {
 				t.Fatalf("Error marshalling %v: %v", plan, err)
 			}
@@ -159,34 +233,22 @@ func TestStreamPlan(t *testing.T) {
 	}
 }
 
-func TestDDLPlan(t *testing.T) {
-	for tcase := range iterateExecFile("ddl_cases.txt") {
-		plan := DDLParse(tcase.input)
-		expected := make(map[string]interface{})
-		err := json.Unmarshal([]byte(tcase.output), &expected)
-		if err != nil {
-			t.Fatalf("Error marshalling %v", plan)
-		}
-		matchString(t, tcase.lineno, expected["Action"], plan.Action)
-		matchString(t, tcase.lineno, expected["TableName"], sqlparser.String(plan.TableName))
-		matchString(t, tcase.lineno, expected["NewName"], sqlparser.String(plan.NewName))
-	}
-}
-
 func TestMessageStreamingPlan(t *testing.T) {
 	testSchema := loadSchema("schema_test.json")
 	plan, err := BuildMessageStreaming("msg", testSchema)
-	if err != nil {
-		t.Error(err)
-	}
-	bout, _ := toJSON(plan)
+	require.NoError(t, err)
+	bout, _ := json.Marshal(plan)
 	planJSON := string(bout)
 
 	wantPlan := &Plan{
 		PlanID: PlanMessageStream,
 		Table:  testSchema["msg"],
+		Permissions: []Permission{{
+			TableName: "msg",
+			Role:      tableacl.WRITER,
+		}},
 	}
-	bout, _ = toJSON(wantPlan)
+	bout, _ = json.Marshal(wantPlan)
 	wantJSON := string(bout)
 
 	if planJSON != wantJSON {
@@ -203,14 +265,6 @@ func TestMessageStreamingPlan(t *testing.T) {
 	want = "'a' is not a message table"
 	if err == nil || err.Error() != want {
 		t.Errorf("BuildMessageStreaming(absent) error: %v, want %s", err, want)
-	}
-}
-
-func matchString(t *testing.T, line int, expected interface{}, actual string) {
-	if expected != nil {
-		if expected.(string) != actual {
-			t.Errorf("Line %d: expected: %v, received %s", line, expected, actual)
-		}
 	}
 }
 
@@ -232,10 +286,11 @@ func loadSchema(name string) map[string]*schema.Table {
 }
 
 type testCase struct {
-	file   string
-	lineno int
-	input  string
-	output string
+	file    string
+	lineno  int
+	options string
+	input   string
+	output  string
 }
 
 func iterateExecFile(name string) (testCaseIterator chan testCase) {
@@ -250,6 +305,7 @@ func iterateExecFile(name string) (testCaseIterator chan testCase) {
 
 		r := bufio.NewReader(fd)
 		lineno := 0
+		options := ""
 		for {
 			binput, err := r.ReadBytes('\n')
 			if err != nil {
@@ -263,6 +319,11 @@ func iterateExecFile(name string) (testCaseIterator chan testCase) {
 			input := string(binput)
 			if input == "" || input == "\n" || input[0] == '#' || strings.HasPrefix(input, "Length:") {
 				//fmt.Printf("%s\n", input)
+				continue
+			}
+
+			if strings.HasPrefix(input, "options:") {
+				options = input[8:]
 				continue
 			}
 			err = json.Unmarshal(binput, &input)
@@ -293,15 +354,13 @@ func iterateExecFile(name string) (testCaseIterator chan testCase) {
 					break
 				}
 			}
-			testCaseIterator <- testCase{name, lineno, input, string(output)}
+			testCaseIterator <- testCase{name, lineno, options, input, string(output)}
+			options = ""
 		}
 	}()
 	return testCaseIterator
 }
 
 func locateFile(name string) string {
-	if path.IsAbs(name) {
-		return name
-	}
-	return testfiles.Locate("tabletserver/" + name)
+	return "testdata/" + name
 }

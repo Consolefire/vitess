@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,14 +19,15 @@ package worker
 import (
 	"fmt"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vterrors"
 
-	"github.com/youtube/vitess/go/vt/discovery"
-	"github.com/youtube/vitess/go/vt/proto/topodata"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
+	"context"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // tabletProvider defines an interface to pick a tablet for reading data.
@@ -36,7 +37,7 @@ type tabletProvider interface {
 
 	// returnTablet must be called after the tablet is no longer used and e.g.
 	// TabletTracker.Untrack() should get called for it.
-	returnTablet(*topodata.Tablet)
+	returnTablet(*topodatapb.Tablet)
 
 	// description returns a string which can be used in error messages e.g.
 	// the name of the keyspace and the shard.
@@ -47,11 +48,11 @@ type tabletProvider interface {
 // returns the one tablet which was set at creation.
 type singleTabletProvider struct {
 	ctx   context.Context
-	ts    topo.Server
+	ts    *topo.Server
 	alias *topodatapb.TabletAlias
 }
 
-func newSingleTabletProvider(ctx context.Context, ts topo.Server, alias *topodatapb.TabletAlias) *singleTabletProvider {
+func newSingleTabletProvider(ctx context.Context, ts *topo.Server, alias *topodatapb.TabletAlias) *singleTabletProvider {
 	return &singleTabletProvider{ctx, ts, alias}
 }
 
@@ -60,35 +61,36 @@ func (p *singleTabletProvider) getTablet() (*topodatapb.Tablet, error) {
 	tablet, err := p.ts.GetTablet(shortCtx, p.alias)
 	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve tablet alias: %v err: %v", topoproto.TabletAliasString(p.alias), err)
+		return nil, vterrors.Wrapf(err, "failed to resolve tablet alias: %v err", topoproto.TabletAliasString(p.alias))
 	}
 	return tablet.Tablet, err
 }
 
-func (p *singleTabletProvider) returnTablet(*topodata.Tablet) {}
+func (p *singleTabletProvider) returnTablet(*topodatapb.Tablet) {}
 
 func (p *singleTabletProvider) description() string {
 	return topoproto.TabletAliasString(p.alias)
 }
 
 // shardTabletProvider returns a random healthy RDONLY tablet for a given
-// keyspace and shard. It uses the HealthCheck module to retrieve the tablets.
+// keyspace and shard. It uses the LegacyHealthCheck module to retrieve the tablets.
 type shardTabletProvider struct {
-	tsc      *discovery.TabletStatsCache
-	tracker  *TabletTracker
-	keyspace string
-	shard    string
+	tsc        *discovery.LegacyTabletStatsCache
+	tracker    *TabletTracker
+	keyspace   string
+	shard      string
+	tabletType topodatapb.TabletType
 }
 
-func newShardTabletProvider(tsc *discovery.TabletStatsCache, tracker *TabletTracker, keyspace, shard string) *shardTabletProvider {
-	return &shardTabletProvider{tsc, tracker, keyspace, shard}
+func newShardTabletProvider(tsc *discovery.LegacyTabletStatsCache, tracker *TabletTracker, keyspace, shard string, tabletType topodatapb.TabletType) *shardTabletProvider {
+	return &shardTabletProvider{tsc, tracker, keyspace, shard, tabletType}
 }
 
 func (p *shardTabletProvider) getTablet() (*topodatapb.Tablet, error) {
 	// Pick any healthy serving tablet.
-	tablets := p.tsc.GetHealthyTabletStats(p.keyspace, p.shard, topodatapb.TabletType_RDONLY)
+	tablets := p.tsc.GetHealthyTabletStats(p.keyspace, p.shard, p.tabletType)
 	if len(tablets) == 0 {
-		return nil, fmt.Errorf("%v: no healthy RDONLY tablets available", p.description())
+		return nil, fmt.Errorf("%v: no healthy %v tablets available", p.description(), p.tabletType)
 	}
 	return p.tracker.Track(tablets), nil
 }

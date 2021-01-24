@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -66,23 +66,16 @@ any qualified or implicit column reference of a table
 is valid and we rely on the underlying vttablet/MySQL
 to eventually validate such references.
 
-Every 'builder' primitive must satisfy the builder
+Every 'logicalPlan' primitive must satisfy the logicalPlan
 interface. This allows the planbuilder to outsource
-primitive-specific handling into those implementaions.
-
-Any primitive that computes or generates a new column
-must satisfy the 'columnOriginator' interface. When
-you search for a symbol, the symtab returns the
-columnOriginator that originates the symbol. Such
-primitives must also have a unique Order, which will
-allow the push-down algorithms to navigate to it.
+primitive-specific handling into those implementations.
 
 Variable naming: The AST, planbuilder and engine
 are three different worlds that use overloaded
 names that are contextually similar, but different.
 For example a join is:
 	Join is the AST node that represents the SQL construct
-	join is a builder in the current package
+	join is a logicalPlan in the current package
 	Join is a primitive in the engine package
 In order to disambiguate, we'll use the 'a' prefix
 for AST vars, and the 'e' prefix for engine vars.

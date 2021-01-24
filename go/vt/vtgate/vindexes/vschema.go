@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,33 +17,79 @@ limitations under the License.
 package vindexes
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"sort"
-	"strings"
 
-	vschemapb "github.com/youtube/vitess/go/vt/proto/vschema"
-	"github.com/youtube/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/json2"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/sqlparser"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+)
+
+// TabletTypeSuffix maps the tablet type to its suffix string.
+var TabletTypeSuffix = map[topodatapb.TabletType]string{
+	0: "@unknown",
+	1: "@master",
+	2: "@replica",
+	3: "@rdonly",
+	4: "@spare",
+	5: "@experimental",
+	6: "@backup",
+	7: "@restore",
+	8: "@drained",
+}
+
+// The following constants represent table types.
+const (
+	TypeSequence  = "sequence"
+	TypeReference = "reference"
 )
 
 // VSchema represents the denormalized version of SrvVSchema,
 // used for building routing plans.
 type VSchema struct {
-	tables    map[string]*Table
-	Keyspaces map[string]*KeyspaceSchema `json:"keyspaces"`
+	RoutingRules   map[string]*RoutingRule `json:"routing_rules"`
+	uniqueTables   map[string]*Table
+	uniqueVindexes map[string]Vindex
+	Keyspaces      map[string]*KeyspaceSchema `json:"keyspaces"`
+}
+
+// RoutingRule represents one routing rule.
+type RoutingRule struct {
+	Tables []*Table
+	Error  error
+}
+
+// MarshalJSON returns a JSON representation of Column.
+func (rr *RoutingRule) MarshalJSON() ([]byte, error) {
+	if rr.Error != nil {
+		return json.Marshal(rr.Error.Error())
+	}
+	tables := make([]string, 0, len(rr.Tables))
+	for _, t := range rr.Tables {
+		tables = append(tables, t.Keyspace.Name+"."+t.Name.String())
+	}
+	return json.Marshal(tables)
 }
 
 // Table represents a table in VSchema.
 type Table struct {
-	IsSequence     bool                 `json:"is_sequence,omitempty"`
-	Name           sqlparser.TableIdent `json:"name"`
-	Keyspace       *Keyspace            `json:"-"`
-	ColumnVindexes []*ColumnVindex      `json:"column_vindexes,omitempty"`
-	Ordered        []*ColumnVindex      `json:"ordered,omitempty"`
-	Owned          []*ColumnVindex      `json:"owned,omitempty"`
-	AutoIncrement  *AutoIncrement       `json:"auto_increment,omitempty"`
-	Pinned         []byte               `json:"pinned,omitempty"`
+	Type                    string               `json:"type,omitempty"`
+	Name                    sqlparser.TableIdent `json:"name"`
+	Keyspace                *Keyspace            `json:"-"`
+	ColumnVindexes          []*ColumnVindex      `json:"column_vindexes,omitempty"`
+	Ordered                 []*ColumnVindex      `json:"ordered,omitempty"`
+	Owned                   []*ColumnVindex      `json:"owned,omitempty"`
+	AutoIncrement           *AutoIncrement       `json:"auto_increment,omitempty"`
+	Columns                 []Column             `json:"columns,omitempty"`
+	Pinned                  []byte               `json:"pinned,omitempty"`
+	ColumnListAuthoritative bool                 `json:"column_list_authoritative,omitempty"`
 }
 
 // Keyspace contains the keyspcae info for each Table.
@@ -54,27 +100,55 @@ type Keyspace struct {
 
 // ColumnVindex contains the index info for each index of a table.
 type ColumnVindex struct {
-	Column sqlparser.ColIdent `json:"column"`
-	Type   string             `json:"type"`
-	Name   string             `json:"name"`
-	Owned  bool               `json:"owned,omitempty"`
-	Vindex Vindex             `json:"vindex"`
+	Columns []sqlparser.ColIdent `json:"columns"`
+	Type    string               `json:"type"`
+	Name    string               `json:"name"`
+	Owned   bool                 `json:"owned,omitempty"`
+	Vindex  Vindex               `json:"vindex"`
+}
+
+// Column describes a column.
+type Column struct {
+	Name sqlparser.ColIdent `json:"name"`
+	Type querypb.Type       `json:"type"`
+}
+
+// MarshalJSON returns a JSON representation of Column.
+func (col *Column) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Name string `json:"name"`
+		Type string `json:"type,omitempty"`
+	}{
+		Name: col.Name.String(),
+		Type: querypb.Type_name[int32(col.Type)],
+	})
 }
 
 // KeyspaceSchema contains the schema(table) for a keyspace.
 type KeyspaceSchema struct {
 	Keyspace *Keyspace
 	Tables   map[string]*Table
+	Vindexes map[string]Vindex
+	Error    error
 }
 
 // MarshalJSON returns a JSON representation of KeyspaceSchema.
 func (ks *KeyspaceSchema) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Sharded bool              `json:"sharded,omitempty"`
-		Tables  map[string]*Table `json:"tables,omitempty"`
+		Sharded  bool              `json:"sharded,omitempty"`
+		Tables   map[string]*Table `json:"tables,omitempty"`
+		Vindexes map[string]Vindex `json:"vindexes,omitempty"`
+		Error    string            `json:"error,omitempty"`
 	}{
-		Sharded: ks.Keyspace.Sharded,
-		Tables:  ks.Tables,
+		Sharded:  ks.Keyspace.Sharded,
+		Tables:   ks.Tables,
+		Vindexes: ks.Vindexes,
+		Error: func(ks *KeyspaceSchema) string {
+			if ks.Error == nil {
+				return ""
+			}
+			return ks.Error.Error()
+		}(ks),
 	})
 }
 
@@ -82,27 +156,20 @@ func (ks *KeyspaceSchema) MarshalJSON() ([]byte, error) {
 type AutoIncrement struct {
 	Column   sqlparser.ColIdent `json:"column"`
 	Sequence *Table             `json:"sequence"`
-	// ColumnVindexNum is the index of the ColumnVindex
-	// if the column is also a ColumnVindex. Otherwise, it's -1.
-	ColumnVindexNum int `json:"column_vindex_num"`
 }
 
 // BuildVSchema builds a VSchema from a SrvVSchema.
 func BuildVSchema(source *vschemapb.SrvVSchema) (vschema *VSchema, err error) {
 	vschema = &VSchema{
-		tables:    make(map[string]*Table),
-		Keyspaces: make(map[string]*KeyspaceSchema),
+		RoutingRules:   make(map[string]*RoutingRule),
+		uniqueTables:   make(map[string]*Table),
+		uniqueVindexes: make(map[string]Vindex),
+		Keyspaces:      make(map[string]*KeyspaceSchema),
 	}
 	buildKeyspaces(source, vschema)
-	err = buildTables(source, vschema)
-	if err != nil {
-		return nil, err
-	}
-	err = resolveAutoIncrement(source, vschema)
-	if err != nil {
-		return nil, err
-	}
+	resolveAutoIncrement(source, vschema)
 	addDual(vschema)
+	buildRoutingRule(source, vschema)
 	return vschema, nil
 }
 
@@ -119,15 +186,13 @@ func BuildKeyspaceSchema(input *vschemapb.Keyspace, keyspace string) (*KeyspaceS
 		},
 	}
 	vschema := &VSchema{
-		tables:    make(map[string]*Table),
-		Keyspaces: make(map[string]*KeyspaceSchema),
+		uniqueTables:   make(map[string]*Table),
+		uniqueVindexes: make(map[string]Vindex),
+		Keyspaces:      make(map[string]*KeyspaceSchema),
 	}
 	buildKeyspaces(formal, vschema)
-	err := buildTables(formal, vschema)
-	if err != nil {
-		return nil, err
-	}
-	return vschema.Keyspaces[keyspace], nil
+	err := vschema.Keyspaces[keyspace].Error
+	return vschema.Keyspaces[keyspace], err
 }
 
 // ValidateKeyspace ensures that the keyspace vschema is valid.
@@ -139,123 +204,182 @@ func ValidateKeyspace(input *vschemapb.Keyspace) error {
 
 func buildKeyspaces(source *vschemapb.SrvVSchema, vschema *VSchema) {
 	for ksname, ks := range source.Keyspaces {
-		vschema.Keyspaces[ksname] = &KeyspaceSchema{
+		ksvschema := &KeyspaceSchema{
 			Keyspace: &Keyspace{
 				Name:    ksname,
 				Sharded: ks.Sharded,
 			},
-			Tables: make(map[string]*Table),
+			Tables:   make(map[string]*Table),
+			Vindexes: make(map[string]Vindex),
 		}
+		vschema.Keyspaces[ksname] = ksvschema
+		ksvschema.Error = buildTables(ks, vschema, ksvschema)
 	}
 }
 
-func buildTables(source *vschemapb.SrvVSchema, vschema *VSchema) error {
-	for ksname, ks := range source.Keyspaces {
-		keyspace := vschema.Keyspaces[ksname].Keyspace
-		vindexes := make(map[string]Vindex)
-		for vname, vindexInfo := range ks.Vindexes {
-			vindex, err := CreateVindex(vindexInfo.Type, vname, vindexInfo.Params)
-			if err != nil {
-				return err
-			}
-			switch vindex.(type) {
-			case Unique:
-			case NonUnique:
-			default:
-				return fmt.Errorf("vindex %q needs to be Unique or NonUnique", vname)
-			}
-			vindexes[vname] = vindex
+func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSchema) error {
+	keyspace := ksvschema.Keyspace
+	for vname, vindexInfo := range ks.Vindexes {
+		vindex, err := CreateVindex(vindexInfo.Type, vname, vindexInfo.Params)
+		if err != nil {
+			return err
 		}
-		for tname, table := range ks.Tables {
-			t := &Table{
-				Name:     sqlparser.NewTableIdent(tname),
-				Keyspace: keyspace,
-			}
-			if _, ok := vschema.tables[tname]; ok {
-				vschema.tables[tname] = nil
+
+		// If the keyspace requires explicit routing, don't include it in global routing
+		if !ks.RequireExplicitRouting {
+			if _, ok := vschema.uniqueVindexes[vname]; ok {
+				vschema.uniqueVindexes[vname] = nil
 			} else {
-				vschema.tables[tname] = t
+				vschema.uniqueVindexes[vname] = vindex
 			}
-			vschema.Keyspaces[ksname].Tables[tname] = t
-			if table.Type == "sequence" {
-				t.IsSequence = true
-			}
-			if keyspace.Sharded && len(table.ColumnVindexes) == 0 {
-				return fmt.Errorf("missing primary col vindex for table: %s", tname)
-			}
-			for i, ind := range table.ColumnVindexes {
-				vindexInfo, ok := ks.Vindexes[ind.Name]
-				if !ok {
-					return fmt.Errorf("vindex %s not found for table %s", ind.Name, tname)
-				}
-				vindex := vindexes[ind.Name]
-				owned := false
-				if _, ok := vindex.(Lookup); ok && vindexInfo.Owner == tname {
-					owned = true
-				}
-				columnVindex := &ColumnVindex{
-					Column: sqlparser.NewColIdent(ind.Column),
-					Type:   vindexInfo.Type,
-					Name:   ind.Name,
-					Owned:  owned,
-					Vindex: vindex,
-				}
-				if i == 0 {
-					// Perform Primary vindex check.
-					if _, ok := columnVindex.Vindex.(Unique); !ok {
-						return fmt.Errorf("primary vindex %s is not Unique for table %s", ind.Name, tname)
-					}
-					if owned {
-						return fmt.Errorf("primary vindex %s cannot be owned for table %s", ind.Name, tname)
-					}
-				}
-				t.ColumnVindexes = append(t.ColumnVindexes, columnVindex)
-				if owned {
-					t.Owned = append(t.Owned, columnVindex)
-				}
-			}
-			t.Ordered = colVindexSorted(t.ColumnVindexes)
 		}
+		ksvschema.Vindexes[vname] = vindex
+	}
+	for tname, table := range ks.Tables {
+		t := &Table{
+			Name:                    sqlparser.NewTableIdent(tname),
+			Keyspace:                keyspace,
+			ColumnListAuthoritative: table.ColumnListAuthoritative,
+		}
+		switch table.Type {
+		case "", TypeReference:
+			t.Type = table.Type
+		case TypeSequence:
+			if keyspace.Sharded && table.Pinned == "" {
+				return fmt.Errorf("sequence table has to be in an unsharded keyspace or must be pinned: %s", tname)
+			}
+			t.Type = table.Type
+		default:
+			return fmt.Errorf("unidentified table type %s", table.Type)
+		}
+		if table.Pinned != "" {
+			decoded, err := hex.DecodeString(table.Pinned)
+			if err != nil {
+				return fmt.Errorf("could not decode the keyspace id for pin: %v", err)
+			}
+			t.Pinned = decoded
+		}
+
+		// If keyspace is sharded, then any table that's not a reference or pinned must have vindexes.
+		if keyspace.Sharded && t.Type != TypeReference && table.Pinned == "" && len(table.ColumnVindexes) == 0 {
+			return fmt.Errorf("missing primary col vindex for table: %s", tname)
+		}
+
+		// Initialize Columns.
+		colNames := make(map[string]bool)
+		for _, col := range table.Columns {
+			name := sqlparser.NewColIdent(col.Name)
+			if colNames[name.Lowered()] {
+				return fmt.Errorf("duplicate column name '%v' for table: %s", name, tname)
+			}
+			colNames[name.Lowered()] = true
+			t.Columns = append(t.Columns, Column{Name: name, Type: col.Type})
+		}
+
+		// Initialize ColumnVindexes.
+		for i, ind := range table.ColumnVindexes {
+			vindexInfo, ok := ks.Vindexes[ind.Name]
+			if !ok {
+				return fmt.Errorf("vindex %s not found for table %s", ind.Name, tname)
+			}
+			vindex := ksvschema.Vindexes[ind.Name]
+			owned := false
+			if _, ok := vindex.(Lookup); ok && vindexInfo.Owner == tname {
+				owned = true
+			}
+			var columns []sqlparser.ColIdent
+			if ind.Column != "" {
+				if len(ind.Columns) > 0 {
+					return fmt.Errorf("can't use column and columns at the same time in vindex (%s) and table (%s)", ind.Name, tname)
+				}
+				columns = []sqlparser.ColIdent{sqlparser.NewColIdent(ind.Column)}
+			} else {
+				if len(ind.Columns) == 0 {
+					return fmt.Errorf("must specify at least one column for vindex (%s) and table (%s)", ind.Name, tname)
+				}
+				for _, indCol := range ind.Columns {
+					columns = append(columns, sqlparser.NewColIdent(indCol))
+				}
+			}
+			columnVindex := &ColumnVindex{
+				Columns: columns,
+				Type:    vindexInfo.Type,
+				Name:    ind.Name,
+				Owned:   owned,
+				Vindex:  vindex,
+			}
+			if i == 0 {
+				// Perform Primary vindex check.
+				if !columnVindex.Vindex.IsUnique() {
+					return fmt.Errorf("primary vindex %s is not Unique for table %s", ind.Name, tname)
+				}
+				if owned {
+					return fmt.Errorf("primary vindex %s cannot be owned for table %s", ind.Name, tname)
+				}
+			}
+			t.ColumnVindexes = append(t.ColumnVindexes, columnVindex)
+			if owned {
+				if setter, ok := vindex.(WantOwnerInfo); ok {
+					if err := setter.SetOwnerInfo(keyspace.Name, tname, columns); err != nil {
+						return err
+					}
+				}
+				t.Owned = append(t.Owned, columnVindex)
+			}
+		}
+		t.Ordered = colVindexSorted(t.ColumnVindexes)
+
+		// Add the table to the map entries.
+		// If the keyspace requires explicit routing, don't include it in global routing
+		if !ks.RequireExplicitRouting {
+			if _, ok := vschema.uniqueTables[tname]; ok {
+				vschema.uniqueTables[tname] = nil
+			} else {
+				vschema.uniqueTables[tname] = t
+			}
+		}
+		ksvschema.Tables[tname] = t
 	}
 	return nil
 }
 
-func resolveAutoIncrement(source *vschemapb.SrvVSchema, vschema *VSchema) error {
+func resolveAutoIncrement(source *vschemapb.SrvVSchema, vschema *VSchema) {
 	for ksname, ks := range source.Keyspaces {
 		ksvschema := vschema.Keyspaces[ksname]
 		for tname, table := range ks.Tables {
 			t := ksvschema.Tables[tname]
-			if table.AutoIncrement == nil {
+			if t == nil || table.AutoIncrement == nil {
 				continue
 			}
-			t.AutoIncrement = &AutoIncrement{Column: sqlparser.NewColIdent(table.AutoIncrement.Column), ColumnVindexNum: -1}
-			seq, err := vschema.findQualified(table.AutoIncrement.Sequence)
-			if err != nil {
-				return fmt.Errorf("cannot resolve sequence %s: %v", table.AutoIncrement.Sequence, err)
+			seqks, seqtab, err := sqlparser.ParseTable(table.AutoIncrement.Sequence)
+			var seq *Table
+			if err == nil {
+				seq, err = vschema.FindTable(seqks, seqtab)
 			}
-			t.AutoIncrement.Sequence = seq
-			for i, cv := range t.ColumnVindexes {
-				if t.AutoIncrement.Column.Equal(cv.Column) {
-					t.AutoIncrement.ColumnVindexNum = i
-					break
-				}
+			if err != nil {
+				// Better to remove the table than to leave it partially initialized.
+				delete(ksvschema.Tables, tname)
+				delete(vschema.uniqueTables, tname)
+				ksvschema.Error = fmt.Errorf("cannot resolve sequence %s: %v", table.AutoIncrement.Sequence, err)
+				continue
+			}
+			t.AutoIncrement = &AutoIncrement{
+				Column:   sqlparser.NewColIdent(table.AutoIncrement.Column),
+				Sequence: seq,
 			}
 		}
 	}
-	return nil
 }
 
 // addDual adds dual as a valid table to all keyspaces.
-// For unsharded keyspaces, it gets pinned against keyspace id '0x00'.
+// For sharded keyspaces, it gets pinned against keyspace id '0x00'.
 func addDual(vschema *VSchema) {
 	first := ""
 	for ksname, ks := range vschema.Keyspaces {
 		t := &Table{
 			Name:     sqlparser.NewTableIdent("dual"),
 			Keyspace: ks.Keyspace,
-		}
-		if ks.Keyspace.Sharded {
-			t.Pinned = []byte{0}
+			Type:     TypeReference,
 		}
 		ks.Tables["dual"] = t
 		if first == "" || first > ksname {
@@ -264,44 +388,91 @@ func addDual(vschema *VSchema) {
 			// the keyspaces. For consistency, we'll always use the
 			// first keyspace by lexical ordering.
 			first = ksname
-			vschema.tables["dual"] = t
+			vschema.uniqueTables["dual"] = t
 		}
 	}
 }
 
-// findQualified finds a table t or k.t.
-func (vschema *VSchema) findQualified(name string) (*Table, error) {
-	splits := strings.Split(name, ".")
-	switch len(splits) {
-	case 1:
-		return vschema.Find("", splits[0])
-	case 2:
-		return vschema.Find(splits[0], splits[1])
+func buildRoutingRule(source *vschemapb.SrvVSchema, vschema *VSchema) {
+	if source.RoutingRules == nil {
+		return
 	}
-	return nil, fmt.Errorf("table %s not found", name)
+outer:
+	for _, rule := range source.RoutingRules.Rules {
+		rr := &RoutingRule{}
+		if len(rule.ToTables) > 1 {
+			vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+				Error: fmt.Errorf("table %v has more than one target: %v", rule.FromTable, rule.ToTables),
+			}
+			continue
+		}
+		for _, toTable := range rule.ToTables {
+			if _, ok := vschema.RoutingRules[rule.FromTable]; ok {
+				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+					Error: fmt.Errorf("duplicate rule for entry %s", rule.FromTable),
+				}
+				continue outer
+			}
+			toks, totabname, err := sqlparser.ParseTable(toTable)
+			if err != nil {
+				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+					Error: err,
+				}
+				continue outer
+			}
+			if toks == "" {
+				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+					Error: fmt.Errorf("table %s must be qualified", toTable),
+				}
+				continue outer
+			}
+			t, err := vschema.FindTable(toks, totabname)
+			if err != nil {
+				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+					Error: err,
+				}
+				continue outer
+			}
+			rr.Tables = append(rr.Tables, t)
+		}
+		vschema.RoutingRules[rule.FromTable] = rr
+	}
 }
 
-// Find returns a pointer to the Table. If a keyspace is specified, only tables
+// FindTable returns a pointer to the Table. If a keyspace is specified, only tables
 // from that keyspace are searched. If the specified keyspace is unsharded
-// and no tables matched, it's considered valid: Find will construct a table
-// of that name and return it. If no kesypace is specified, then a table is returned
+// and no tables matched, it's considered valid: FindTable will construct a table
+// of that name and return it. If no keyspace is specified, then a table is returned
 // only if its name is unique across all keyspaces. If there is only one
 // keyspace in the vschema, and it's unsharded, then all table requests are considered
 // valid and belonging to that keyspace.
-func (vschema *VSchema) Find(keyspace, tablename string) (table *Table, err error) {
+// FindTable bypasses routing rules and returns at most one table.
+func (vschema *VSchema) FindTable(keyspace, tablename string) (*Table, error) {
+	t, err := vschema.findTable(keyspace, tablename)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, fmt.Errorf("table %s not found", tablename)
+	}
+	return t, nil
+}
+
+// findTable is like FindTable, but does not return an error if a table is not found.
+func (vschema *VSchema) findTable(keyspace, tablename string) (*Table, error) {
 	if keyspace == "" {
-		table, ok := vschema.tables[tablename]
+		table, ok := vschema.uniqueTables[tablename]
 		if table == nil {
 			if ok {
 				return nil, fmt.Errorf("ambiguous table reference: %s", tablename)
 			}
 			if len(vschema.Keyspaces) != 1 {
-				return nil, fmt.Errorf("table %s not found", tablename)
+				return nil, nil
 			}
 			// Loop happens only once.
 			for _, ks := range vschema.Keyspaces {
 				if ks.Keyspace.Sharded {
-					return nil, fmt.Errorf("table %s not found", tablename)
+					return nil, nil
 				}
 				return &Table{Name: sqlparser.NewTableIdent(tablename), Keyspace: ks.Keyspace}, nil
 			}
@@ -312,14 +483,85 @@ func (vschema *VSchema) Find(keyspace, tablename string) (table *Table, err erro
 	if !ok {
 		return nil, fmt.Errorf("keyspace %s not found in vschema", keyspace)
 	}
-	table = ks.Tables[tablename]
+	table := ks.Tables[tablename]
 	if table == nil {
 		if ks.Keyspace.Sharded {
-			return nil, fmt.Errorf("table %s not found", tablename)
+			return nil, nil
 		}
 		return &Table{Name: sqlparser.NewTableIdent(tablename), Keyspace: ks.Keyspace}, nil
 	}
 	return table, nil
+}
+
+// FindRoutedTable finds a table checking the routing rules.
+func (vschema *VSchema) FindRoutedTable(keyspace, tablename string, tabletType topodatapb.TabletType) (*Table, error) {
+	qualified := tablename
+	if keyspace != "" {
+		qualified = keyspace + "." + tablename
+	}
+	fqtn := qualified + TabletTypeSuffix[tabletType]
+	// First look for a fully qualified table name: ks.t@master.
+	// Then look for one without tablet type: ks.t.
+	for _, name := range []string{fqtn, qualified} {
+		rr, ok := vschema.RoutingRules[name]
+		if ok {
+			if rr.Error != nil {
+				return nil, rr.Error
+			}
+			if len(rr.Tables) == 0 {
+				return nil, fmt.Errorf("table %s has been disabled", tablename)
+			}
+			return rr.Tables[0], nil
+		}
+	}
+	return vschema.findTable(keyspace, tablename)
+}
+
+// FindTableOrVindex finds a table or a Vindex by name using Find and FindVindex.
+func (vschema *VSchema) FindTableOrVindex(keyspace, name string, tabletType topodatapb.TabletType) (*Table, Vindex, error) {
+	tables, err := vschema.FindRoutedTable(keyspace, name, tabletType)
+	if err != nil {
+		return nil, nil, err
+	}
+	if tables != nil {
+		return tables, nil, nil
+	}
+	v, err := vschema.FindVindex(keyspace, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	if v != nil {
+		return nil, v, nil
+	}
+	return nil, nil, NotFoundError{TableName: name}
+}
+
+// NotFoundError represents the error where the table name was not found
+type NotFoundError struct {
+	TableName string
+}
+
+func (n NotFoundError) Error() string {
+	return fmt.Sprintf("table %s not found", n.TableName)
+}
+
+// FindVindex finds a vindex by name. If a keyspace is specified, only vindexes
+// from that keyspace are searched. If no kesypace is specified, then a vindex
+// is returned only if its name is unique across all keyspaces. The function
+// returns an error only if the vindex name is ambiguous.
+func (vschema *VSchema) FindVindex(keyspace, name string) (Vindex, error) {
+	if keyspace == "" {
+		vindex, ok := vschema.uniqueVindexes[name]
+		if vindex == nil && ok {
+			return nil, fmt.Errorf("ambiguous vindex reference: %s", name)
+		}
+		return vindex, nil
+	}
+	ks, ok := vschema.Keyspaces[keyspace]
+	if !ok {
+		return nil, fmt.Errorf("keyspace %s not found in vschema", keyspace)
+	}
+	return ks.Vindexes[name], nil
 }
 
 // ByCost provides the interface needed for ColumnVindexes to
@@ -331,9 +573,7 @@ func (bc ByCost) Swap(i, j int)      { bc[i], bc[j] = bc[j], bc[i] }
 func (bc ByCost) Less(i, j int) bool { return bc[i].Vindex.Cost() < bc[j].Vindex.Cost() }
 
 func colVindexSorted(cvs []*ColumnVindex) (sorted []*ColumnVindex) {
-	for _, cv := range cvs {
-		sorted = append(sorted, cv)
-	}
+	sorted = append(sorted, cvs...)
 	sort.Sort(ByCost(sorted))
 	return sorted
 }
@@ -348,7 +588,7 @@ func LoadFormal(filename string) (*vschemapb.SrvVSchema, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(data, formal)
+	err = json2.Unmarshal(data, formal)
 	if err != nil {
 		return nil, err
 	}
@@ -366,9 +606,70 @@ func LoadFormalKeyspace(filename string) (*vschemapb.Keyspace, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(data, formal)
+	err = json2.Unmarshal(data, formal)
 	if err != nil {
 		return nil, err
 	}
 	return formal, nil
+}
+
+// ChooseVindexForType chooses the most appropriate vindex for the give type.
+func ChooseVindexForType(typ querypb.Type) (string, error) {
+	switch {
+	case sqltypes.IsIntegral(typ):
+		return "hash", nil
+	case sqltypes.IsText(typ):
+		return "unicode_loose_md5", nil
+	case sqltypes.IsBinary(typ):
+		return "binary_md5", nil
+	}
+	return "", fmt.Errorf("type %v is not recommended for a vindex", typ)
+}
+
+// FindBestColVindex finds the best ColumnVindex for VReplication.
+func FindBestColVindex(table *Table) (*ColumnVindex, error) {
+	if len(table.ColumnVindexes) == 0 {
+		return nil, fmt.Errorf("table %s has no vindex", table.Name.String())
+	}
+	var result *ColumnVindex
+	for _, cv := range table.ColumnVindexes {
+		if cv.Vindex.NeedsVCursor() {
+			continue
+		}
+		if !cv.Vindex.IsUnique() {
+			continue
+		}
+		if result == nil || result.Vindex.Cost() > cv.Vindex.Cost() {
+			result = cv
+		}
+	}
+	if result == nil {
+		return nil, fmt.Errorf("could not find a vindex to compute keyspace id for table %v", table.Name.String())
+	}
+	return result, nil
+}
+
+// FindVindexForSharding searches through the given slice
+// to find the lowest cost unique vindex
+// primary vindex is always unique
+// if two have the same cost, use the one that occurs earlier in the definition
+// if the final result is too expensive, return nil
+func FindVindexForSharding(tableName string, colVindexes []*ColumnVindex) (*ColumnVindex, error) {
+	if len(colVindexes) == 0 {
+		return nil, fmt.Errorf("no vindex definition for table %v", tableName)
+	}
+	result := colVindexes[0]
+	for _, colVindex := range colVindexes {
+		// Only allow SingleColumn for legacy resharding.
+		if _, ok := colVindex.Vindex.(SingleColumn); !ok {
+			continue
+		}
+		if colVindex.Vindex.Cost() < result.Vindex.Cost() && colVindex.Vindex.IsUnique() {
+			result = colVindex
+		}
+	}
+	if result.Vindex.Cost() > 1 || !result.Vindex.IsUnique() {
+		return nil, fmt.Errorf("could not find a vindex to use for sharding table %v", tableName)
+	}
+	return result, nil
 }

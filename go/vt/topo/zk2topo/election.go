@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,17 @@ limitations under the License.
 package zk2topo
 
 import (
-	"fmt"
 	"path"
 	"sort"
 
-	log "github.com/golang/glog"
-	"github.com/samuel/go-zookeeper/zk"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/topo"
+	"github.com/z-division/go-zookeeper/zk"
+
+	"vitess.io/vitess/go/vt/vterrors"
+
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo"
 )
 
 // This file contains the master election code for zk2topo.Server.
@@ -35,17 +37,12 @@ import (
 func (zs *Server) NewMasterParticipation(name, id string) (topo.MasterParticipation, error) {
 	ctx := context.TODO()
 
-	conn, root, err := zs.connForCell(ctx, topo.GlobalCell)
-	if err != nil {
-		return nil, err
-	}
-	zkPath := path.Join(root, electionsPath, name)
+	zkPath := path.Join(zs.root, electionsPath, name)
 
 	// Create the toplevel directory, OK if it exists already.
 	// We will create the parent directory as well, but not more.
-	_, err = CreateRecursive(ctx, conn, zkPath, nil, 0, zk.WorldACL(PermDirectory), 1)
-	if err != nil && err != zk.ErrNodeExists {
-		return nil, convertError(err)
+	if _, err := CreateRecursive(ctx, zs.conn, zkPath, nil, 0, zk.WorldACL(PermDirectory), 1); err != nil && err != zk.ErrNodeExists {
+		return nil, convertError(err, zkPath)
 	}
 
 	result := &zkMasterParticipation{
@@ -90,41 +87,37 @@ func (mp *zkMasterParticipation) WaitForMastership() (context.Context, error) {
 	// If Stop was already called, mp.done is closed, so we are interrupted.
 	select {
 	case <-mp.done:
-		return nil, topo.ErrInterrupted
+		return nil, topo.NewError(topo.Interrupted, "mastership")
 	default:
 	}
 
 	ctx := context.TODO()
-	conn, root, err := mp.zs.connForCell(ctx, topo.GlobalCell)
-	if err != nil {
-		return nil, err
-	}
-	zkPath := path.Join(root, electionsPath, mp.name)
+	zkPath := path.Join(mp.zs.root, electionsPath, mp.name)
 
 	// Fast path if Stop was already called.
 	select {
 	case <-mp.stopCtx.Done():
 		close(mp.done)
-		return nil, topo.ErrInterrupted
+		return nil, topo.NewError(topo.Interrupted, "mastership")
 	default:
 	}
 
 	// Create the current proposal.
-	proposal, err := conn.Create(ctx, zkPath+"/", mp.id, zk.FlagSequence|zk.FlagEphemeral, zk.WorldACL(PermFile))
+	proposal, err := mp.zs.conn.Create(ctx, zkPath+"/", mp.id, zk.FlagSequence|zk.FlagEphemeral, zk.WorldACL(PermFile))
 	if err != nil {
-		return nil, fmt.Errorf("cannot create proposal file in %v: %v", zkPath, err)
+		return nil, vterrors.Wrapf(err, "cannot create proposal file in %v", zkPath)
 	}
 
 	// Wait until we are it, or we are interrupted. Using a
 	// small-ish time out so it gets exercised faster (as opposed
 	// to crashing after a day of use).
-	err = obtainQueueLock(mp.stopCtx, conn, proposal)
+	err = obtainQueueLock(mp.stopCtx, mp.zs.conn, proposal)
 	switch err {
 	case nil:
 		break
 	case context.Canceled:
 		close(mp.done)
-		return nil, topo.ErrInterrupted
+		return nil, topo.NewError(topo.Interrupted, "mastership")
 	default:
 		// something else went wrong
 		return nil, err
@@ -132,7 +125,7 @@ func (mp *zkMasterParticipation) WaitForMastership() (context.Context, error) {
 
 	// we got the lock, create our background context
 	ctx, cancel := context.WithCancel(context.Background())
-	go mp.watchMastership(ctx, conn, proposal, cancel)
+	go mp.watchMastership(ctx, mp.zs.conn, proposal, cancel)
 	return ctx, nil
 }
 
@@ -142,7 +135,7 @@ func (mp *zkMasterParticipation) WaitForMastership() (context.Context, error) {
 //   it most likely means we lost the ZK session, so we want to stop
 //   being the master.
 // - wait for mp.stop.
-func (mp *zkMasterParticipation) watchMastership(ctx context.Context, conn Conn, proposal string, cancel context.CancelFunc) {
+func (mp *zkMasterParticipation) watchMastership(ctx context.Context, conn *ZkConn, proposal string, cancel context.CancelFunc) {
 	// any interruption of this routine means we're not master any more.
 	defer cancel()
 
@@ -178,16 +171,12 @@ func (mp *zkMasterParticipation) Stop() {
 // GetCurrentMasterID is part of the topo.MasterParticipation interface.
 // We just read the smallest (first) node content, that is the id.
 func (mp *zkMasterParticipation) GetCurrentMasterID(ctx context.Context) (string, error) {
-	conn, root, err := mp.zs.connForCell(ctx, topo.GlobalCell)
-	if err != nil {
-		return "", err
-	}
-	zkPath := path.Join(root, electionsPath, mp.name)
+	zkPath := path.Join(mp.zs.root, electionsPath, mp.name)
 
 	for {
-		children, _, err := conn.Children(ctx, zkPath)
+		children, _, err := mp.zs.conn.Children(ctx, zkPath)
 		if err != nil {
-			return "", convertError(err)
+			return "", convertError(err, zkPath)
 		}
 		if len(children) == 0 {
 			// no current master
@@ -196,14 +185,14 @@ func (mp *zkMasterParticipation) GetCurrentMasterID(ctx context.Context) (string
 		sort.Strings(children)
 
 		childPath := path.Join(zkPath, children[0])
-		data, _, err := conn.Get(ctx, childPath)
+		data, _, err := mp.zs.conn.Get(ctx, childPath)
 		if err != nil {
 			if err == zk.ErrNoNode {
 				// master terminated in front of our own eyes,
 				// try again
 				continue
 			}
-			return "", convertError(err)
+			return "", convertError(err, zkPath)
 		}
 
 		return string(data), nil

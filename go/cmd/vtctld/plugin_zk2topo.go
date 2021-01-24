@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,19 +16,8 @@ limitations under the License.
 
 package main
 
-// Imports and register the 'zk2' topo.Server and its Explorer.
+// Imports and register the 'zk2' topo.Server.
 
 import (
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/topo/zk2topo"
-	"github.com/youtube/vitess/go/vt/vtctld"
+	_ "vitess.io/vitess/go/vt/topo/zk2topo"
 )
-
-func init() {
-	// Wait until flags are parsed, so we can check which topo server is in use.
-	servenv.OnRun(func() {
-		if s, ok := ts.Impl.(*zk2topo.Server); ok {
-			vtctld.HandleExplorer("zk2", vtctld.NewBackendExplorer(s))
-		}
-	})
-}

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,16 +18,20 @@ package tlstest
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
-	"path"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/youtube/vitess/go/vt/vttls"
+	"github.com/stretchr/testify/assert"
+
+	"vitess.io/vitess/go/vt/vttls"
 )
 
 // TestClientServer generates:
@@ -43,26 +47,20 @@ func TestClientServer(t *testing.T) {
 	}
 	defer os.RemoveAll(root)
 
-	// Create the certs and configs.
-	CreateCA(root)
+	clientServerKeyPairs := CreateClientServerCertPairs(root)
 
-	CreateSignedCert(root, CA, "01", "servers", "Servers CA")
-	CreateSignedCert(root, "servers", "01", "server-instance", "Server Instance")
-
-	CreateSignedCert(root, CA, "02", "clients", "Clients CA")
-	CreateSignedCert(root, "clients", "01", "client-instance", "Client Instance")
 	serverConfig, err := vttls.ServerConfig(
-		path.Join(root, "server-instance-cert.pem"),
-		path.Join(root, "server-instance-key.pem"),
-		path.Join(root, "clients-cert.pem"))
+		clientServerKeyPairs.ServerCert,
+		clientServerKeyPairs.ServerKey,
+		clientServerKeyPairs.ClientCA)
 	if err != nil {
 		t.Fatalf("TLSServerConfig failed: %v", err)
 	}
 	clientConfig, err := vttls.ClientConfig(
-		path.Join(root, "client-instance-cert.pem"),
-		path.Join(root, "client-instance-key.pem"),
-		path.Join(root, "servers-cert.pem"),
-		"Server Instance")
+		clientServerKeyPairs.ClientCert,
+		clientServerKeyPairs.ClientKey,
+		clientServerKeyPairs.ServerCA,
+		clientServerKeyPairs.ServerName)
 	if err != nil {
 		t.Fatalf("TLSClientConfig failed: %v", err)
 	}
@@ -74,26 +72,30 @@ func TestClientServer(t *testing.T) {
 	}
 	addr := listener.Addr().String()
 	defer listener.Close()
+	// create a dialer with timeout
+	dialer := new(net.Dialer)
+	dialer.Timeout = 10 * time.Second
 
 	wg := sync.WaitGroup{}
 
 	//
 	// Positive case: accept on server side, connect a client, send data.
 	//
-
+	var clientErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		clientConn, err := tls.Dial("tcp", addr, clientConfig)
-		if err != nil {
-			t.Fatalf("Dial failed: %v", err)
+		clientConn, clientErr := tls.DialWithDialer(dialer, "tcp", addr, clientConfig)
+		if clientErr == nil {
+			clientConn.Write([]byte{42})
+			clientConn.Close()
 		}
-
-		clientConn.Write([]byte{42})
-		clientConn.Close()
 	}()
 
 	serverConn, err := listener.Accept()
+	if clientErr != nil {
+		t.Fatalf("Dial failed: %v", clientErr)
+	}
 	if err != nil {
 		t.Fatalf("Accept failed: %v", err)
 	}
@@ -115,36 +117,124 @@ func TestClientServer(t *testing.T) {
 	//
 
 	badClientConfig, err := vttls.ClientConfig(
-		path.Join(root, "server-instance-cert.pem"),
-		path.Join(root, "server-instance-key.pem"),
-		path.Join(root, "servers-cert.pem"),
-		"Server Instance")
+		clientServerKeyPairs.ServerCert,
+		clientServerKeyPairs.ServerKey,
+		clientServerKeyPairs.ServerCA,
+		clientServerKeyPairs.ServerName)
 	if err != nil {
 		t.Fatalf("TLSClientConfig failed: %v", err)
 	}
 
+	var serverErr error
 	wg.Add(1)
 	go func() {
 		// We expect the Accept to work, but the first read to fail.
 		defer wg.Done()
-		serverConn, err := listener.Accept()
-		if err != nil {
-			t.Fatalf("Connection failed: %v", err)
-		}
-
+		serverConn, serverErr := listener.Accept()
 		// This will fail.
-		result := make([]byte, 1)
-		if n, err := serverConn.Read(result); err == nil {
-			fmt.Printf("Was able to read from server: %v\n", n)
+		if serverErr == nil {
+			result := make([]byte, 1)
+			if n, err := serverConn.Read(result); err == nil {
+				fmt.Printf("Was able to read from server: %v\n", n)
+			}
+			serverConn.Close()
 		}
-		serverConn.Close()
 	}()
 
-	if _, err = tls.Dial("tcp", addr, badClientConfig); err == nil {
-		t.Fatalf("Dial was expected to fail")
+	// When using TLS 1.2, the Dial will fail.
+	// With TLS 1.3, the Dial will succeed and the first Read will fail.
+	clientConn, err := tls.DialWithDialer(dialer, "tcp", addr, badClientConfig)
+	if err != nil {
+		if !strings.Contains(err.Error(), "bad certificate") {
+			t.Errorf("Wrong error returned: %v", err)
+		}
+		return
+	}
+	wg.Wait()
+	if serverErr != nil {
+		t.Fatalf("Connection failed: %v", serverErr)
+	}
+
+	data := make([]byte, 1)
+	_, err = clientConn.Read(data)
+	if err == nil {
+		t.Fatalf("Dial or first Read was expected to fail")
 	}
 	if !strings.Contains(err.Error(), "bad certificate") {
 		t.Errorf("Wrong error returned: %v", err)
 	}
-	t.Logf("Dial returned: %v", err)
+}
+
+func getServerConfig(keypairs ClientServerKeyPairs) (*tls.Config, error) {
+	return vttls.ServerConfig(
+		keypairs.ClientCert,
+		keypairs.ClientKey,
+		keypairs.ServerCA)
+}
+
+func getClientConfig(keypairs ClientServerKeyPairs) (*tls.Config, error) {
+	return vttls.ClientConfig(
+		keypairs.ClientCert,
+		keypairs.ClientKey,
+		keypairs.ServerCA,
+		keypairs.ServerName)
+}
+
+func TestServerTLSConfigCaching(t *testing.T) {
+	testConfigGeneration(t, "servertlstest", getServerConfig, func(config *tls.Config) *x509.CertPool {
+		return config.ClientCAs
+	})
+}
+
+func TestClientTLSConfigCaching(t *testing.T) {
+	testConfigGeneration(t, "clienttlstest", getClientConfig, func(config *tls.Config) *x509.CertPool {
+		return config.RootCAs
+	})
+}
+
+func testConfigGeneration(t *testing.T, rootPrefix string, generateConfig func(ClientServerKeyPairs) (*tls.Config, error), getCertPool func(tlsConfig *tls.Config) *x509.CertPool) {
+	// Our test root.
+	root, err := ioutil.TempDir("", rootPrefix)
+	if err != nil {
+		t.Fatalf("TempDir failed: %v", err)
+	}
+	defer os.RemoveAll(root)
+
+	const configsToGenerate = 1
+
+	firstClientServerKeyPairs := CreateClientServerCertPairs(root)
+	secondClientServerKeyPairs := CreateClientServerCertPairs(root)
+
+	firstExpectedConfig, _ := generateConfig(firstClientServerKeyPairs)
+	secondExpectedConfig, _ := generateConfig(secondClientServerKeyPairs)
+	firstConfigChannel := make(chan *tls.Config, configsToGenerate)
+	secondConfigChannel := make(chan *tls.Config, configsToGenerate)
+
+	var configCounter = 0
+
+	for i := 1; i <= configsToGenerate; i++ {
+		go func() {
+			firstConfig, _ := generateConfig(firstClientServerKeyPairs)
+			firstConfigChannel <- firstConfig
+			secondConfig, _ := generateConfig(secondClientServerKeyPairs)
+			secondConfigChannel <- secondConfig
+		}()
+	}
+
+	for {
+		select {
+		case firstConfig := <-firstConfigChannel:
+			assert.Equal(t, &firstExpectedConfig.Certificates, &firstConfig.Certificates)
+			assert.Equal(t, getCertPool(firstExpectedConfig), getCertPool(firstConfig))
+		case secondConfig := <-secondConfigChannel:
+			assert.Equal(t, &secondExpectedConfig.Certificates, &secondConfig.Certificates)
+			assert.Equal(t, getCertPool(secondExpectedConfig), getCertPool(secondConfig))
+		}
+		configCounter = configCounter + 1
+
+		if configCounter >= 2*configsToGenerate {
+			break
+		}
+	}
+
 }

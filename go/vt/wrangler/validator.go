@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,11 +22,12 @@ import (
 	"net"
 	"sync"
 
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"golang.org/x/net/context"
+	"context"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // As with all distributed systems, things can skew. These functions
@@ -49,7 +50,7 @@ func (wr *Wrangler) waitForResults(wg *sync.WaitGroup, results chan error) error
 	var finalErr error
 	for err := range results {
 		finalErr = errors.New("some validation errors - see log")
-		wr.Logger().Errorf("%v", err)
+		wr.Logger().Error(err)
 	}
 	return finalErr
 }
@@ -95,7 +96,7 @@ func (wr *Wrangler) validateAllTablets(ctx context.Context, wg *sync.WaitGroup, 
 			go func(alias *topodatapb.TabletAlias) {
 				defer wg.Done()
 				if err := topo.Validate(ctx, wr.ts, alias); err != nil {
-					results <- fmt.Errorf("Validate(%v) failed: %v", topoproto.TabletAliasString(alias), err)
+					results <- fmt.Errorf("topo.Validate(%v) failed: %v", topoproto.TabletAliasString(alias), err)
 				} else {
 					wr.Logger().Infof("tablet %v is valid", topoproto.TabletAliasString(alias))
 				}
@@ -162,7 +163,7 @@ func (wr *Wrangler) validateShard(ctx context.Context, keyspace, shard string, p
 		go func(alias *topodatapb.TabletAlias) {
 			defer wg.Done()
 			if err := topo.Validate(ctx, wr.ts, alias); err != nil {
-				results <- fmt.Errorf("Validate(%v) failed: %v", topoproto.TabletAliasString(alias), err)
+				results <- fmt.Errorf("topo.Validate(%v) failed: %v", topoproto.TabletAliasString(alias), err)
 			} else {
 				wr.Logger().Infof("tablet %v is valid", topoproto.TabletAliasString(alias))
 			}
@@ -173,15 +174,13 @@ func (wr *Wrangler) validateShard(ctx context.Context, keyspace, shard string, p
 		wr.validateReplication(ctx, shardInfo, tabletMap, results)
 		wr.pingTablets(ctx, tabletMap, wg, results)
 	}
-
-	return
 }
 
 func normalizeIP(ip string) string {
 	// Normalize loopback to avoid spurious validation errors.
 	if parsedIP := net.ParseIP(ip); parsedIP != nil && parsedIP.IsLoopback() {
 		// Note that this also maps IPv6 localhost to IPv4 localhost
-		// as GetSlaves() will return only IPv4 addresses.
+		// as GetReplicas() will return only IPv4 addresses.
 		return "127.0.0.1"
 	}
 	return ip
@@ -200,48 +199,48 @@ func (wr *Wrangler) validateReplication(ctx context.Context, shardInfo *topo.Sha
 		return
 	}
 
-	slaveList, err := wr.tmc.GetSlaves(ctx, masterTabletInfo.Tablet)
+	replicaList, err := wr.tmc.GetReplicas(ctx, masterTabletInfo.Tablet)
 	if err != nil {
-		results <- fmt.Errorf("GetSlaves(%v) failed: %v", masterTabletInfo, err)
+		results <- fmt.Errorf("GetReplicas(%v) failed: %v", masterTabletInfo, err)
 		return
 	}
-	if len(slaveList) == 0 {
-		results <- fmt.Errorf("no slaves of tablet %v found", shardInfoMasterAliasStr)
+	if len(replicaList) == 0 {
+		results <- fmt.Errorf("no replicas of tablet %v found", shardInfoMasterAliasStr)
 		return
 	}
 
 	tabletIPMap := make(map[string]*topodatapb.Tablet)
-	slaveIPMap := make(map[string]bool)
+	replicaIPMap := make(map[string]bool)
 	for _, tablet := range tabletMap {
 		ip, err := topoproto.MySQLIP(tablet.Tablet)
 		if err != nil {
-			results <- fmt.Errorf("could not resolve IP for tablet %s: %v", topoproto.MysqlHostname(tablet.Tablet), err)
+			results <- fmt.Errorf("could not resolve IP for tablet %s: %v", tablet.Tablet.MysqlHostname, err)
 			continue
 		}
 		tabletIPMap[normalizeIP(ip)] = tablet.Tablet
 	}
 
-	// See if every slave is in the replication graph.
-	for _, slaveAddr := range slaveList {
-		if tabletIPMap[normalizeIP(slaveAddr)] == nil {
-			results <- fmt.Errorf("slave %v not in replication graph for shard %v/%v (mysql instance without vttablet?)", slaveAddr, shardInfo.Keyspace(), shardInfo.ShardName())
+	// See if every replica is in the replication graph.
+	for _, replicaAddr := range replicaList {
+		if tabletIPMap[normalizeIP(replicaAddr)] == nil {
+			results <- fmt.Errorf("replica %v not in replication graph for shard %v/%v (mysql instance without vttablet?)", replicaAddr, shardInfo.Keyspace(), shardInfo.ShardName())
 		}
-		slaveIPMap[normalizeIP(slaveAddr)] = true
+		replicaIPMap[normalizeIP(replicaAddr)] = true
 	}
 
 	// See if every entry in the replication graph is connected to the master.
 	for _, tablet := range tabletMap {
-		if !tablet.IsSlaveType() {
+		if !tablet.IsReplicaType() {
 			continue
 		}
 
 		ip, err := topoproto.MySQLIP(tablet.Tablet)
 		if err != nil {
-			results <- fmt.Errorf("could not resolve IP for tablet %s: %v", topoproto.MysqlHostname(tablet.Tablet), err)
+			results <- fmt.Errorf("could not resolve IP for tablet %s: %v", tablet.Tablet.MysqlHostname, err)
 			continue
 		}
-		if !slaveIPMap[normalizeIP(ip)] {
-			results <- fmt.Errorf("slave %v not replicating: %v slave list: %q", topoproto.TabletAliasString(tablet.Alias), ip, slaveList)
+		if !replicaIPMap[normalizeIP(ip)] {
+			results <- fmt.Errorf("replica %v not replicating: %v replica list: %q", topoproto.TabletAliasString(tablet.Alias), ip, replicaList)
 		}
 	}
 }
@@ -253,6 +252,7 @@ func (wr *Wrangler) pingTablets(ctx context.Context, tabletMap map[string]*topo.
 			defer wg.Done()
 
 			if err := wr.tmc.Ping(ctx, tabletInfo.Tablet); err != nil {
+				//lint:ignore ST1005 function name
 				results <- fmt.Errorf("Ping(%v) failed: %v tablet hostname: %v", tabletAlias, err, tabletInfo.Hostname)
 			}
 		}(tabletAlias, tabletInfo)

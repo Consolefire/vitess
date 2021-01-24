@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,15 +19,15 @@ package main
 // Import and register the gRPC mysqlctl server
 
 import (
-	"github.com/youtube/vitess/go/vt/mysqlctl/grpcmysqlctlserver"
-	"github.com/youtube/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/mysqlctl/grpcmysqlctlserver"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 func init() {
 	servenv.InitServiceMap("grpc", "mysqlctl")
 	servenv.OnRun(func() {
 		if servenv.GRPCCheckServiceMap("mysqlctl") {
-			grpcmysqlctlserver.StartServer(servenv.GRPCServer, mysqld)
+			grpcmysqlctlserver.StartServer(servenv.GRPCServer, cnf, mysqld)
 		}
 	})
 }

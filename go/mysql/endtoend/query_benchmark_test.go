@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,13 +18,15 @@ package endtoend
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/vt/vttest"
+	"vitess.io/vitess/go/mysql"
+	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
+	"vitess.io/vitess/go/vt/vttest"
 )
 
 // This file contains various long-running tests for mysql.
@@ -33,24 +35,37 @@ import (
 // of benchmarks on it. To minimize overhead, we only run one database, and
 // run all the benchmarks on it.
 func BenchmarkWithRealDatabase(b *testing.B) {
-	// Common setup code.
-	hdl, err := vttest.LaunchVitess(
-		vttest.MySQLOnly("vttest"),
-		vttest.Schema("create table a(id int, name varchar(128), primary key(id))"),
-		vttest.NoStderr())
-	if err != nil {
-		b.Fatal(err)
+	// Launch MySQL.
+	// We need a Keyspace in the topology, so the DbName is set.
+	// We need a Shard too, so the database 'vttest' is created.
+	cfg := vttest.Config{
+		Topology: &vttestpb.VTTestTopology{
+			Keyspaces: []*vttestpb.Keyspace{
+				{
+					Name: "vttest",
+					Shards: []*vttestpb.Shard{
+						{
+							Name:           "0",
+							DbNameOverride: "vttest",
+						},
+					},
+				},
+			},
+		},
+		OnlyMySQL: true,
 	}
-	defer func() {
-		err = hdl.TearDown()
-		if err != nil {
-			b.Error(err)
-		}
-	}()
-	params, err := hdl.MySQLConnParams()
-	if err != nil {
-		b.Error(err)
+	if err := cfg.InitSchemas("vttest", "create table a(id int, name varchar(128), primary key(id))", nil); err != nil {
+		b.Fatalf("InitSchemas failed: %v\n", err)
 	}
+	defer os.RemoveAll(cfg.SchemaDir)
+	cluster := vttest.LocalCluster{
+		Config: cfg,
+	}
+	if err := cluster.Setup(); err != nil {
+		b.Fatalf("could not launch mysql: %v\n", err)
+	}
+	defer cluster.TearDown()
+	params := cluster.MySQLConnParams()
 
 	b.Run("Inserts", func(b *testing.B) {
 		benchmarkInserts(b, &params)
@@ -96,12 +111,12 @@ func benchmarkParallelReads(b *testing.B, params *mysql.ConnParams, parallelCoun
 
 			conn, err := mysql.Connect(ctx, params)
 			if err != nil {
-				b.Fatal(err)
+				b.Error(err)
 			}
 
 			for j := 0; j < b.N; j++ {
 				if _, err := conn.ExecuteFetch("select * from a", 10000, true); err != nil {
-					b.Fatalf("ExecuteFetch(%v, %v) failed: %v", i, j, err)
+					b.Errorf("ExecuteFetch(%v, %v) failed: %v", i, j, err)
 				}
 			}
 			conn.Close()

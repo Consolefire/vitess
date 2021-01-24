@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,18 +24,20 @@ import (
 	"os"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/dbconfigs"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
 	// mysqld is used by the rpc implementation plugin.
 	mysqld *mysqlctl.Mysqld
+	cnf    *mysqlctl.Mycnf
 
 	mysqlPort   = flag.Int("mysql_port", 3306, "mysql port")
 	tabletUID   = flag.Uint("tablet_uid", 41983, "tablet uid")
@@ -56,14 +58,8 @@ func main() {
 	defer logutil.Flush()
 
 	// mysqlctld only starts and stops mysql, only needs dba.
-	dbconfigFlags := dbconfigs.DbaConfig
-	dbconfigs.RegisterFlags(dbconfigFlags)
-	flag.Parse()
-
-	if *servenv.Version {
-		servenv.AppVersion.Print()
-		os.Exit(0)
-	}
+	dbconfigs.RegisterFlags(dbconfigs.Dba)
+	servenv.ParseFlags("mysqlctld")
 
 	// We'll register this OnTerm handler before mysqld starts, so we get notified
 	// if mysqld dies on its own without us (or our RPC client) telling it to.
@@ -80,14 +76,14 @@ func main() {
 		log.Infof("mycnf file (%s) doesn't exist, initializing", mycnfFile)
 
 		var err error
-		mysqld, err = mysqlctl.CreateMysqld(uint32(*tabletUID), *mysqlSocket, int32(*mysqlPort), dbconfigFlags)
+		mysqld, cnf, err = mysqlctl.CreateMysqldAndMycnf(uint32(*tabletUID), *mysqlSocket, int32(*mysqlPort))
 		if err != nil {
 			log.Errorf("failed to initialize mysql config: %v", err)
 			exit.Return(1)
 		}
 		mysqld.OnTerm(onTermFunc)
 
-		if err := mysqld.Init(ctx, *initDBSQLFile); err != nil {
+		if err := mysqld.Init(ctx, cnf, *initDBSQLFile); err != nil {
 			log.Errorf("failed to initialize mysql data dir and start mysqld: %v", err)
 			exit.Return(1)
 		}
@@ -96,22 +92,27 @@ func main() {
 		log.Infof("mycnf file (%s) already exists, starting without init", mycnfFile)
 
 		var err error
-		mysqld, err = mysqlctl.OpenMysqld(uint32(*tabletUID), dbconfigFlags)
+		mysqld, cnf, err = mysqlctl.OpenMysqldAndMycnf(uint32(*tabletUID))
 		if err != nil {
 			log.Errorf("failed to find mysql config: %v", err)
 			exit.Return(1)
 		}
 		mysqld.OnTerm(onTermFunc)
 
-		err = mysqld.RefreshConfig()
+		err = mysqld.RefreshConfig(ctx, cnf)
 		if err != nil {
 			log.Errorf("failed to refresh config: %v", err)
 			exit.Return(1)
 		}
 
-		if err := mysqld.Start(ctx); err != nil {
-			log.Errorf("failed to start mysqld: %v", err)
-			exit.Return(1)
+		// check if we were interrupted during a previous restore
+		if !mysqlctl.RestoreWasInterrupted(cnf) {
+			if err := mysqld.Start(ctx, cnf); err != nil {
+				log.Errorf("failed to start mysqld: %v", err)
+				exit.Return(1)
+			}
+		} else {
+			log.Infof("found interrupted restore, not starting mysqld")
 		}
 	}
 	cancel()
@@ -123,7 +124,7 @@ func main() {
 	servenv.OnTermSync(func() {
 		log.Infof("mysqlctl received SIGTERM, shutting down mysqld first")
 		ctx := context.Background()
-		mysqld.Shutdown(ctx, true)
+		mysqld.Shutdown(ctx, cnf, true)
 	})
 
 	// Start RPC server and wait for SIGTERM.

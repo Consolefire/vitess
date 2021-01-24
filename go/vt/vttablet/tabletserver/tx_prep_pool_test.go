@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ package tabletserver
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestEmptyPrep(t *testing.T) {
@@ -32,13 +34,9 @@ func TestEmptyPrep(t *testing.T) {
 func TestPrepPut(t *testing.T) {
 	pp := NewTxPreparedPool(2)
 	err := pp.Put(nil, "aa")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	err = pp.Put(nil, "bb")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want := "prepared transactions exceeded limit: 2"
 	err = pp.Put(nil, "cc")
 	if err == nil || err.Error() != want {
@@ -50,6 +48,7 @@ func TestPrepPut(t *testing.T) {
 		t.Errorf("Put err: %v, want %s", err, want)
 	}
 	_, err = pp.FetchForCommit("aa")
+	require.NoError(t, err)
 	err = pp.Put(nil, "aa")
 	want = "duplicate DTID in Prepare: aa"
 	if err == nil || err.Error() != want {
@@ -57,14 +56,12 @@ func TestPrepPut(t *testing.T) {
 	}
 	pp.Forget("aa")
 	err = pp.Put(nil, "aa")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 }
 
 func TestPrepFetchForRollback(t *testing.T) {
 	pp := NewTxPreparedPool(2)
-	conn := &TxConnection{}
+	conn := &StatefulConnection{}
 	pp.Put(conn, "aa")
 	got := pp.FetchForRollback("bb")
 	if got != nil {
@@ -82,44 +79,38 @@ func TestPrepFetchForRollback(t *testing.T) {
 
 func TestPrepFetchForCommit(t *testing.T) {
 	pp := NewTxPreparedPool(2)
-	conn := &TxConnection{}
+	conn := &StatefulConnection{}
 	got, err := pp.FetchForCommit("aa")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if got != nil {
 		t.Errorf("Get(aa): %v, want nil", got)
 	}
 	pp.Put(conn, "aa")
 	got, err = pp.FetchForCommit("aa")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if got != conn {
 		t.Errorf("pp.Get(aa): %p, want %p", got, conn)
 	}
-	got, err = pp.FetchForCommit("aa")
-	want := "commiting"
+	_, err = pp.FetchForCommit("aa")
+	want := "committing"
 	if err == nil || err.Error() != want {
 		t.Errorf("FetchForCommit err: %v, want %s", err, want)
 	}
 	pp.SetFailed("aa")
-	got, err = pp.FetchForCommit("aa")
+	_, err = pp.FetchForCommit("aa")
 	want = "failed"
 	if err == nil || err.Error() != want {
 		t.Errorf("FetchForCommit err: %v, want %s", err, want)
 	}
 	pp.SetFailed("bb")
-	got, err = pp.FetchForCommit("bb")
+	_, err = pp.FetchForCommit("bb")
 	want = "failed"
 	if err == nil || err.Error() != want {
 		t.Errorf("FetchForCommit err: %v, want %s", err, want)
 	}
 	pp.Forget("aa")
 	got, err = pp.FetchForCommit("aa")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if got != nil {
 		t.Errorf("Get(aa): %v, want nil", got)
 	}
@@ -127,8 +118,8 @@ func TestPrepFetchForCommit(t *testing.T) {
 
 func TestPrepFetchAll(t *testing.T) {
 	pp := NewTxPreparedPool(2)
-	conn1 := &TxConnection{}
-	conn2 := &TxConnection{}
+	conn1 := &StatefulConnection{}
+	conn2 := &StatefulConnection{}
 	pp.Put(conn1, "aa")
 	pp.Put(conn2, "bb")
 	got := pp.FetchAll()

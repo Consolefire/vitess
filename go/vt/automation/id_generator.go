@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@ limitations under the License.
 
 package automation
 
-import "strconv"
-import "sync/atomic"
+import (
+	"strconv"
+	"sync/atomic"
+)
 
 // IDGenerator generates unique task and cluster operation IDs.
 type IDGenerator struct {

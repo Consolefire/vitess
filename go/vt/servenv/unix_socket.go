@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 	"net"
 	"os"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
 )
 
 var (
@@ -42,13 +42,13 @@ func serveSocketFile() {
 	if _, err := os.Stat(name); err == nil {
 		err = os.Remove(name)
 		if err != nil {
-			log.Fatalf("Cannot remove socket file %v: %v", name, err)
+			log.Exitf("Cannot remove socket file %v: %v", name, err)
 		}
 	}
 
 	l, err := net.Listen("unix", name)
 	if err != nil {
-		log.Fatalf("Error listening on socket file %v: %v", name, err)
+		log.Exitf("Error listening on socket file %v: %v", name, err)
 	}
 	log.Infof("Listening on socket file %v for gRPC", name)
 	go GRPCServer.Serve(l)

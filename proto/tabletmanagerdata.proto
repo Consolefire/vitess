@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,6 +18,7 @@ limitations under the License.
 // RPC calls to VtTablet for the management API.
 
 syntax = "proto3";
+option go_package = "vitess.io/vitess/go/vt/proto/tabletmanagerdata";
 
 package tabletmanagerdata;
 
@@ -51,6 +52,10 @@ message TableDefinition {
 
   // approximate number of rows
   uint64 row_count = 7;
+
+  // column names along with their types.
+  // NOTE: this is a superset of columns.
+  repeated query.Field fields = 8;
 }
 
 message SchemaDefinition {
@@ -90,12 +95,6 @@ message DbPermission {
 message Permissions {
   repeated UserPermission user_permissions = 1;
   repeated DbPermission db_permissions = 2;
-}
-
-// BlpPosition is a replication position for a given binlog player
-message BlpPosition {
-  uint32 uid = 1;
-  string position = 2;
 }
 
 //
@@ -187,7 +186,7 @@ message IgnoreHealthErrorResponse {
 
 message ReloadSchemaRequest {
   // wait_position allows scheduling a schema reload to occur after a
-  // given DDL has replicated to this slave, by specifying a replication
+  // given DDL has replicated to this server, by specifying a replication
   // position to wait for. Leave empty to trigger the reload immediately.
   string wait_position = 1;
 }
@@ -216,6 +215,18 @@ message ApplySchemaRequest {
 message ApplySchemaResponse {
   SchemaDefinition before_schema = 1;
   SchemaDefinition after_schema = 2;
+}
+
+message LockTablesRequest {
+}
+
+message LockTablesResponse {
+}
+
+message UnlockTablesRequest {
+}
+
+message UnlockTablesResponse {
 }
 
 message ExecuteFetchAsDbaRequest {
@@ -250,11 +261,18 @@ message ExecuteFetchAsAppResponse {
   query.QueryResult result = 1;
 }
 
-message SlaveStatusRequest {
+message ReplicationStatusRequest {
 }
 
-message SlaveStatusResponse {
+message ReplicationStatusResponse {
   replicationdata.Status status = 1;
+}
+
+message MasterStatusRequest {
+}
+
+message MasterStatusResponse {
+  replicationdata.MasterStatus status = 1;
 }
 
 message MasterPositionRequest {
@@ -264,84 +282,69 @@ message MasterPositionResponse {
   string position = 1;
 }
 
-message StopSlaveRequest {
+message WaitForPositionRequest {
+  string position = 1;
 }
 
-message StopSlaveResponse {
+message WaitForPositionResponse {
 }
 
-message StopSlaveMinimumRequest {
+message StopReplicationRequest {
+}
+
+message StopReplicationResponse {
+}
+
+message StopReplicationMinimumRequest {
   string position = 1;
   int64 wait_timeout = 2;
 }
 
-message StopSlaveMinimumResponse {
+message StopReplicationMinimumResponse {
   string position = 1;
 }
 
-message StartSlaveRequest {
+message StartReplicationRequest {
 }
 
-message StartSlaveResponse {
+message StartReplicationResponse {
 }
 
-message TabletExternallyReparentedRequest {
-  // external_id is an string value that may be provided by an external
-  // agent for tracking purposes. The tablet will emit this string in
-  // events triggered by TabletExternallyReparented, such as VitessReparent.
-  string external_id = 1;
+message StartReplicationUntilAfterRequest {
+  string position = 1;
+  int64 wait_timeout = 2;
 }
 
-message TabletExternallyReparentedResponse {
+message StartReplicationUntilAfterResponse {
 }
 
-message TabletExternallyElectedRequest {
+message GetReplicasRequest {
 }
 
-message TabletExternallyElectedResponse {
-}
-
-message GetSlavesRequest {
-}
-
-message GetSlavesResponse {
+message GetReplicasResponse {
   repeated string addrs = 1;
-}
-
-message WaitBlpPositionRequest {
-  BlpPosition blp_position = 1;
-  int64 wait_timeout = 2;
-}
-
-message WaitBlpPositionResponse {
-}
-
-message StopBlpRequest {
-}
-
-message StopBlpResponse {
-  repeated BlpPosition blp_positions = 1;
-}
-
-message StartBlpRequest {
-}
-
-message StartBlpResponse {
-}
-
-message RunBlpUntilRequest {
-  repeated BlpPosition blp_positions = 1;
-  int64 wait_timeout = 2;
-}
-
-message RunBlpUntilResponse {
-  string position = 1;
 }
 
 message ResetReplicationRequest {
 }
 
 message ResetReplicationResponse {
+}
+
+message VReplicationExecRequest {
+  string query = 1;
+}
+
+message VReplicationExecResponse {
+  query.QueryResult result = 1;
+}
+
+message VReplicationWaitForPosRequest {
+  int64 id = 1;
+  string position = 2;
+}
+
+message VReplicationWaitForPosResponse {
 }
 
 message InitMasterRequest {
@@ -361,64 +364,74 @@ message PopulateReparentJournalRequest {
 message PopulateReparentJournalResponse {
 }
 
-message InitSlaveRequest {
+message InitReplicaRequest {
   topodata.TabletAlias parent = 1;
   string replication_position = 2;
   int64 time_created_ns = 3;
 }
 
-message InitSlaveResponse {
+message InitReplicaResponse {
 }
 
 message DemoteMasterRequest {
 }
 
 message DemoteMasterResponse {
-  string position = 1;
+  // Position is deprecated, and is a string representation of a demoted masters executed position.
+  string deprecated_position = 1 [deprecated=true];
+
+  // MasterStatus represents the response from calling `SHOW MASTER STATUS` on a master that has been demoted.
+  replicationdata.MasterStatus master_status = 2;
 }
 
-message PromoteSlaveWhenCaughtUpRequest {
-  string position = 1;
+message UndoDemoteMasterRequest {
 }
 
-message PromoteSlaveWhenCaughtUpResponse {
-  string position = 1;
+message UndoDemoteMasterResponse {
 }
 
-message SlaveWasPromotedRequest {
+message ReplicaWasPromotedRequest {
 }
 
-message SlaveWasPromotedResponse {
+message ReplicaWasPromotedResponse {
 }
 
 message SetMasterRequest {
   topodata.TabletAlias parent = 1;
   int64 time_created_ns = 2;
-  bool force_start_slave = 3;
+  bool force_start_replication = 3;
+  string wait_position = 4;
 }
 
 message SetMasterResponse {
 }
 
-message SlaveWasRestartedRequest {
+message ReplicaWasRestartedRequest {
   // the parent alias the tablet should have
   topodata.TabletAlias parent = 1;
 }
 
-message SlaveWasRestartedResponse {
+message ReplicaWasRestartedResponse {
 }
 
 message StopReplicationAndGetStatusRequest {
+  replicationdata.StopReplicationMode stop_replication_mode = 1;
 }
 
 message StopReplicationAndGetStatusResponse {
-  replicationdata.Status status = 1;
+  // HybridStatus is deprecated. It currently represents a hybrid struct where all data represents the before state,
+  // except for all position related data which comes from the after state. Please use status instead, which holds
+  // discrete replication status calls before and after stopping the replica, or stopping the replica's io_thread.
+  replicationdata.Status hybrid_status = 1 [deprecated=true];
+
+  // Status represents the replication status call right before, and right after telling the replica to stop.
+  replicationdata.StopReplicationStatus status = 2;
 }
 
-message PromoteSlaveRequest {
+message PromoteReplicaRequest {
 }
 
-message PromoteSlaveResponse {
+message PromoteReplicaResponse {
   string position = 1;
 }
 
@@ -426,6 +439,7 @@ message PromoteSlaveResponse {
 
 message BackupRequest {
   int64 concurrency = 1;
+  bool allowMaster = 2;
 }
 
 message BackupResponse {
@@ -437,4 +451,14 @@ message RestoreFromBackupRequest {
 
 message RestoreFromBackupResponse {
   logutil.Event event = 1;
+}
+
+message VExecRequest {
+  string query = 1;
+  string workflow = 2;
+  string keyspace = 3;
+}
+
+message VExecResponse {
+  query.QueryResult result = 1;
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,9 +19,10 @@ package mysql
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 
-	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // binlogEvent wraps a raw packet buffer and provides methods to examine it
@@ -161,6 +162,11 @@ func (ev binlogEvent) IsDeleteRows() bool {
 		ev.Type() == eDeleteRowsEventV2
 }
 
+// IsPseudo is always false for a native binlogEvent.
+func (ev binlogEvent) IsPseudo() bool {
+	return false
+}
+
 // Format implements BinlogEvent.Format().
 //
 // Expected format (L = total length of event data):
@@ -170,7 +176,7 @@ func (ev binlogEvent) IsDeleteRows() bool {
 //   4         timestamp (same as timestamp header field)
 //   1         header length
 //   p         (one byte per packet type) event type header lengths
-//             Rest was infered from reading source code:
+//             Rest was inferred from reading source code:
 //   1         checksum algorithm
 //   4         checksum
 func (ev binlogEvent) Format() (f BinlogFormat, err error) {
@@ -180,12 +186,12 @@ func (ev binlogEvent) Format() (f BinlogFormat, err error) {
 
 	f.FormatVersion = binary.LittleEndian.Uint16(data[:2])
 	if f.FormatVersion != 4 {
-		return f, fmt.Errorf("format version = %d, we only support version 4", f.FormatVersion)
+		return f, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "format version = %d, we only support version 4", f.FormatVersion)
 	}
 	f.ServerVersion = string(bytes.TrimRight(data[2:2+50], "\x00"))
 	f.HeaderLength = data[2+50+4]
 	if f.HeaderLength < 19 {
-		return f, fmt.Errorf("header length = %d, should be >= 19", f.HeaderLength)
+		return f, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "header length = %d, should be >= 19", f.HeaderLength)
 	}
 
 	// MySQL/MariaDB 5.6.1+ always adds a 4-byte checksum to the end of a
@@ -225,7 +231,7 @@ func (ev binlogEvent) Query(f BinlogFormat) (query Query, err error) {
 	// position of SQL query
 	sqlPos := dbPos + dbLen + 1 // +1 for NULL terminator
 	if sqlPos > len(data) {
-		return query, fmt.Errorf("SQL query position overflows buffer (%v > %v)", sqlPos, len(data))
+		return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "SQL query position overflows buffer (%v > %v)", sqlPos, len(data))
 	}
 
 	// We've checked that the buffer is big enough for sql, so everything before
@@ -252,17 +258,17 @@ varsLoop:
 			pos += 8
 		case QCatalog: // Used in MySQL 5.0.0 - 5.0.3
 			if pos+1 > len(vars) {
-				return query, fmt.Errorf("Q_CATALOG status var overflows buffer (%v + 1 > %v)", pos, len(vars))
+				return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "Q_CATALOG status var overflows buffer (%v + 1 > %v)", pos, len(vars))
 			}
 			pos += 1 + int(vars[pos]) + 1
 		case QCatalogNZCode: // Used in MySQL > 5.0.3 to replace QCatalog
 			if pos+1 > len(vars) {
-				return query, fmt.Errorf("Q_CATALOG_NZ_CODE status var overflows buffer (%v + 1 > %v)", pos, len(vars))
+				return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "Q_CATALOG_NZ_CODE status var overflows buffer (%v + 1 > %v)", pos, len(vars))
 			}
 			pos += 1 + int(vars[pos])
 		case QCharsetCode:
 			if pos+6 > len(vars) {
-				return query, fmt.Errorf("Q_CHARSET_CODE status var overflows buffer (%v + 6 > %v)", pos, len(vars))
+				return query, vterrors.Errorf(vtrpc.Code_INTERNAL, "Q_CHARSET_CODE status var overflows buffer (%v + 6 > %v)", pos, len(vars))
 			}
 			query.Charset = &binlogdatapb.Charset{
 				Client: int32(binary.LittleEndian.Uint16(vars[pos : pos+2])),
@@ -290,7 +296,7 @@ func (ev binlogEvent) IntVar(f BinlogFormat) (byte, uint64, error) {
 
 	typ := data[0]
 	if typ != IntVarLastInsertID && typ != IntVarInsertID {
-		return 0, 0, fmt.Errorf("invalid IntVar ID: %v", data[0])
+		return 0, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid IntVar ID: %v", data[0])
 	}
 
 	value := binary.LittleEndian.Uint64(data[1 : 1+8])

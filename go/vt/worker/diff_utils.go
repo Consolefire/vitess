@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,28 +20,37 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/wrangler"
+
+	"context"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/youtube/vitess/go/sqlescape"
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/key"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"github.com/youtube/vitess/go/vt/vtgate/vindexes"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletconn"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/sqlescape"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/grpcclient"
+	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
+	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/tabletconn"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // QueryResultReader will stream rows towards the output channel.
@@ -56,7 +65,7 @@ type QueryResultReader struct {
 
 // NewQueryResultReaderForTablet creates a new QueryResultReader for
 // the provided tablet / sql query
-func NewQueryResultReaderForTablet(ctx context.Context, ts topo.Server, tabletAlias *topodatapb.TabletAlias, sql string) (*QueryResultReader, error) {
+func NewQueryResultReaderForTablet(ctx context.Context, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, sql string) (*QueryResultReader, error) {
 	shortCtx, cancel := context.WithTimeout(ctx, *remoteActionsTimeout)
 	tablet, err := ts.GetTablet(shortCtx, tabletAlias)
 	cancel()
@@ -64,7 +73,7 @@ func NewQueryResultReaderForTablet(ctx context.Context, ts topo.Server, tabletAl
 		return nil, err
 	}
 
-	conn, err := tabletconn.GetDialer()(tablet.Tablet, *remoteActionsTimeout)
+	conn, err := tabletconn.GetDialer()(tablet.Tablet, grpcclient.FailFast(false))
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +87,41 @@ func NewQueryResultReaderForTablet(ctx context.Context, ts topo.Server, tabletAl
 	// read the columns, or grab the error
 	cols, err := stream.Recv()
 	if err != nil {
-		return nil, fmt.Errorf("Cannot read Fields for query '%v': %v", sql, err)
+		return nil, vterrors.Wrapf(err, "Cannot read Fields for query '%v'", sql)
+	}
+
+	return &QueryResultReader{
+		output: stream,
+		fields: cols.Fields,
+		conn:   conn,
+	}, nil
+}
+
+// NewTransactionalQueryResultReaderForTablet creates a new QueryResultReader for
+// the provided tablet / sql query, and runs it in an existing transaction
+func NewTransactionalQueryResultReaderForTablet(ctx context.Context, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, sql string, txID int64) (*QueryResultReader, error) {
+	shortCtx, cancel := context.WithTimeout(ctx, *remoteActionsTimeout)
+	tablet, err := ts.GetTablet(shortCtx, tabletAlias)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := tabletconn.GetDialer()(tablet.Tablet, grpcclient.FailFast(false))
+	if err != nil {
+		return nil, err
+	}
+
+	stream := queryservice.ExecuteWithTransactionalStreamer(ctx, conn, &querypb.Target{
+		Keyspace:   tablet.Tablet.Keyspace,
+		Shard:      tablet.Tablet.Shard,
+		TabletType: tablet.Tablet.Type,
+	}, sql, make(map[string]*querypb.BindVariable), txID, nil)
+
+	// read the columns, or grab the error
+	cols, err := stream.Recv()
+	if err != nil {
+		return nil, vterrors.Wrapf(err, "cannot read Fields for query '%v'", sql)
 	}
 
 	return &QueryResultReader{
@@ -99,8 +142,8 @@ func (qrr *QueryResultReader) Fields() []*querypb.Field {
 }
 
 // Close closes the connection to the tablet.
-func (qrr *QueryResultReader) Close(ctx context.Context) error {
-	return qrr.conn.Close(ctx)
+func (qrr *QueryResultReader) Close(ctx context.Context) {
+	qrr.conn.Close(ctx)
 }
 
 // v3KeyRangeFilter is a sqltypes.ResultStream implementation that filters
@@ -189,13 +232,33 @@ func uint64FromKeyspaceID(keyspaceID []byte) uint64 {
 // TableScan returns a QueryResultReader that gets all the rows from a
 // table, ordered by Primary Key. The returned columns are ordered
 // with the Primary Key columns in front.
-func TableScan(ctx context.Context, log logutil.Logger, ts topo.Server, tabletAlias *topodatapb.TabletAlias, td *tabletmanagerdatapb.TableDefinition) (*QueryResultReader, error) {
+func TableScan(ctx context.Context, log logutil.Logger, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, td *tabletmanagerdatapb.TableDefinition) (*QueryResultReader, error) {
 	sql := fmt.Sprintf("SELECT %v FROM %v", strings.Join(escapeAll(orderedColumns(td)), ", "), sqlescape.EscapeID(td.Name))
 	if len(td.PrimaryKeyColumns) > 0 {
 		sql += fmt.Sprintf(" ORDER BY %v", strings.Join(escapeAll(td.PrimaryKeyColumns), ", "))
 	}
 	log.Infof("SQL query for %v/%v: %v", topoproto.TabletAliasString(tabletAlias), td.Name, sql)
 	return NewQueryResultReaderForTablet(ctx, ts, tabletAlias, sql)
+}
+
+// TransactionalTableScan does the same thing as TableScan, but runs inside a transaction
+func TransactionalTableScan(ctx context.Context, log logutil.Logger, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, txID int64, td *tabletmanagerdatapb.TableDefinition) (*QueryResultReader, error) {
+	sql := fmt.Sprintf("SELECT %v FROM %v", strings.Join(escapeAll(orderedColumns(td)), ", "), sqlescape.EscapeID(td.Name))
+	if len(td.PrimaryKeyColumns) > 0 {
+		sql += fmt.Sprintf(" ORDER BY %v", strings.Join(escapeAll(td.PrimaryKeyColumns), ", "))
+	}
+	log.Infof("SQL query for %v/%v: %v", topoproto.TabletAliasString(tabletAlias), td.Name, sql)
+	return NewTransactionalQueryResultReaderForTablet(ctx, ts, tabletAlias, sql, txID)
+}
+
+// CreateTargetFrom is a helper function
+func CreateTargetFrom(tablet *topodatapb.Tablet) *query.Target {
+	return &query.Target{
+		Cell:       tablet.Alias.Cell,
+		Keyspace:   tablet.Keyspace,
+		Shard:      tablet.Shard,
+		TabletType: tablet.Type,
+	}
 }
 
 // TableScanByKeyRange returns a QueryResultReader that gets all the
@@ -205,12 +268,12 @@ func TableScan(ctx context.Context, log logutil.Logger, ts topo.Server, tabletAl
 // If keyspaceSchema is passed in, we go into v3 mode, and we ask for all
 // source data, and filter here. Otherwise we stick with v2 mode, where we can
 // ask the source tablet to do the filtering.
-func TableScanByKeyRange(ctx context.Context, log logutil.Logger, ts topo.Server, tabletAlias *topodatapb.TabletAlias, td *tabletmanagerdatapb.TableDefinition, keyRange *topodatapb.KeyRange, keyspaceSchema *vindexes.KeyspaceSchema, shardingColumnName string, shardingColumnType topodatapb.KeyspaceIdType) (*QueryResultReader, error) {
+func TableScanByKeyRange(ctx context.Context, log logutil.Logger, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, td *tabletmanagerdatapb.TableDefinition, keyRange *topodatapb.KeyRange, keyspaceSchema *vindexes.KeyspaceSchema, shardingColumnName string, shardingColumnType topodatapb.KeyspaceIdType) (*QueryResultReader, error) {
 	if keyspaceSchema != nil {
 		// switch to v3 mode.
 		keyResolver, err := newV3ResolverFromColumnList(keyspaceSchema, td.Name, orderedColumns(td))
 		if err != nil {
-			return nil, fmt.Errorf("cannot resolve v3 sharding keys for table %v: %v", td.Name, err)
+			return nil, vterrors.Wrapf(err, "cannot resolve v3 sharding keys for table %v", td.Name)
 		}
 
 		// full table scan
@@ -262,7 +325,7 @@ func TableScanByKeyRange(ctx context.Context, log logutil.Logger, ts topo.Server
 			}
 		}
 	default:
-		return nil, fmt.Errorf("Unsupported ShardingColumnType: %v", shardingColumnType)
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "unsupported ShardingColumnType: %v", shardingColumnType)
 	}
 
 	sql := fmt.Sprintf("SELECT %v FROM %v %v", strings.Join(escapeAll(orderedColumns(td)), ", "), sqlescape.EscapeID(td.Name), where)
@@ -275,7 +338,7 @@ func TableScanByKeyRange(ctx context.Context, log logutil.Logger, ts topo.Server
 
 // ErrStoppedRowReader is returned by RowReader.Next() when
 // StopAfterCurrentResult() and it finished the current result.
-var ErrStoppedRowReader = errors.New("RowReader won't advance to the next Result because StopAfterCurrentResult() was called")
+var ErrStoppedRowReader = vterrors.New(vtrpc.Code_ABORTED, "RowReader won't advance to the next Result because StopAfterCurrentResult() was called")
 
 // RowReader returns individual rows from a ResultReader.
 type RowReader struct {
@@ -371,7 +434,7 @@ func (dr *DiffReport) HasDifferences() bool {
 // ComputeQPS fills in processingQPS
 func (dr *DiffReport) ComputeQPS() {
 	if dr.processedRows > 0 {
-		dr.processingQPS = int(time.Duration(dr.processedRows) * time.Second / time.Now().Sub(dr.startingTime))
+		dr.processingQPS = int(time.Duration(dr.processedRows) * time.Second / time.Since(dr.startingTime))
 	}
 }
 
@@ -399,8 +462,8 @@ func RowsEqual(left, right []sqltypes.Value) int {
 // TODO: This can panic if types for left and right don't match.
 func CompareRows(fields []*querypb.Field, compareCount int, left, right []sqltypes.Value) (int, error) {
 	for i := 0; i < compareCount; i++ {
-		lv, _ := sqltypes.ToNative(left[i])
-		rv, _ := sqltypes.ToNative(right[i])
+		lv, _ := evalengine.ToNative(left[i])
+		rv, _ := evalengine.ToNative(right[i])
 		switch l := lv.(type) {
 		case int64:
 			r := rv.(int64)
@@ -427,7 +490,7 @@ func CompareRows(fields []*querypb.Field, compareCount int, left, right []sqltyp
 			r := rv.([]byte)
 			return bytes.Compare(l, r), nil
 		default:
-			return 0, fmt.Errorf("Unsuported type %T returned by mysql.proto.Convert", l)
+			return 0, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "unsupported type %T returned by mysql.proto.Convert", l)
 		}
 	}
 	return 0, nil
@@ -437,27 +500,27 @@ func CompareRows(fields []*querypb.Field, compareCount int, left, right []sqltyp
 // It assumes left and right are sorted by ascending primary key.
 // it will record errors if extra rows exist on either side.
 type RowDiffer struct {
-	left         *RowReader
-	right        *RowReader
-	pkFieldCount int
+	left            *RowReader
+	right           *RowReader
+	tableDefinition *tabletmanagerdatapb.TableDefinition
 }
 
 // NewRowDiffer returns a new RowDiffer
-func NewRowDiffer(left, right *QueryResultReader, tableDefinition *tabletmanagerdatapb.TableDefinition) (*RowDiffer, error) {
+func NewRowDiffer(left, right ResultReader, tableDefinition *tabletmanagerdatapb.TableDefinition) (*RowDiffer, error) {
 	leftFields := left.Fields()
 	rightFields := right.Fields()
 	if len(leftFields) != len(rightFields) {
-		return nil, fmt.Errorf("Cannot diff inputs with different types")
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "[table=%v] Cannot diff inputs with different types", tableDefinition.Name)
 	}
 	for i, field := range leftFields {
 		if field.Type != rightFields[i].Type {
-			return nil, fmt.Errorf("Cannot diff inputs with different types: field %v types are %v and %v", i, field.Type, rightFields[i].Type)
+			return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "[table=%v] Cannot diff inputs with different types: field %v types are %v and %v", tableDefinition.Name, i, field.Type, rightFields[i].Type)
 		}
 	}
 	return &RowDiffer{
-		left:         NewRowReader(left),
-		right:        NewRowReader(right),
-		pkFieldCount: len(tableDefinition.PrimaryKeyColumns),
+		left:            NewRowReader(left),
+		right:           NewRowReader(right),
+		tableDefinition: tableDefinition,
 	}, nil
 }
 
@@ -496,21 +559,23 @@ func (rd *RowDiffer) Go(log logutil.Logger) (dr DiffReport, err error) {
 			}
 
 			// drain right, update count
-			if count, err := rd.right.Drain(); err != nil {
+			log.Errorf("Draining extra row(s) found on the right starting with: %v", right)
+			var count int
+			if count, err = rd.right.Drain(); err != nil {
 				return dr, err
-			} else {
-				dr.extraRowsRight += 1 + count
 			}
+			dr.extraRowsRight += 1 + count
 			return
 		}
 		if right == nil {
 			// no more rows from the right
 			// we know we have rows from left, drain, update count
-			if count, err := rd.left.Drain(); err != nil {
+			log.Errorf("Draining extra row(s) found on the left starting with: %v", left)
+			var count int
+			if count, err = rd.left.Drain(); err != nil {
 				return dr, err
-			} else {
-				dr.extraRowsLeft += 1 + count
 			}
+			dr.extraRowsLeft += 1 + count
 			return
 		}
 
@@ -524,10 +589,10 @@ func (rd *RowDiffer) Go(log logutil.Logger) (dr DiffReport, err error) {
 			continue
 		}
 
-		if f >= rd.pkFieldCount {
+		if f >= len(rd.tableDefinition.PrimaryKeyColumns) {
 			// rows have the same primary key, only content is different
 			if dr.mismatchedRows < 10 {
-				log.Errorf("Different content %v in same PK: %v != %v", dr.mismatchedRows, left, right)
+				log.Errorf("[table=%v] Different content %v in same PK: %v != %v", rd.tableDefinition.Name, dr.mismatchedRows, left, right)
 			}
 			dr.mismatchedRows++
 			advanceLeft = true
@@ -536,20 +601,20 @@ func (rd *RowDiffer) Go(log logutil.Logger) (dr DiffReport, err error) {
 		}
 
 		// have to find the 'smallest' row and advance it
-		c, err := CompareRows(rd.left.Fields(), rd.pkFieldCount, left, right)
+		c, err := CompareRows(rd.left.Fields(), len(rd.tableDefinition.PrimaryKeyColumns), left, right)
 		if err != nil {
 			return dr, err
 		}
 		if c < 0 {
 			if dr.extraRowsLeft < 10 {
-				log.Errorf("Extra row %v on left: %v", dr.extraRowsLeft, left)
+				log.Errorf("[table=%v] Extra row %v on left: %v", rd.tableDefinition.Name, dr.extraRowsLeft, left)
 			}
 			dr.extraRowsLeft++
 			advanceLeft = true
 			continue
 		} else if c > 0 {
 			if dr.extraRowsRight < 10 {
-				log.Errorf("Extra row %v on right: %v", dr.extraRowsRight, right)
+				log.Errorf("[table=%v] Extra row %v on right: %v", rd.tableDefinition.Name, dr.extraRowsRight, right)
 			}
 			dr.extraRowsRight++
 			advanceRight = true
@@ -560,10 +625,141 @@ func (rd *RowDiffer) Go(log logutil.Logger) (dr DiffReport, err error) {
 		// they're the same. Logging a regular difference
 		// then, and advancing both.
 		if dr.mismatchedRows < 10 {
-			log.Errorf("Different content %v in same PK: %v != %v", dr.mismatchedRows, left, right)
+			log.Errorf("[table=%v] Different content %v in same PK: %v != %v", rd.tableDefinition.Name, dr.mismatchedRows, left, right)
 		}
 		dr.mismatchedRows++
 		advanceLeft = true
 		advanceRight = true
 	}
+}
+
+// createTransactions returns an array of transactions that all share the same view of the data.
+// It will check that no new transactions have been seen between the creation of the underlying transactions,
+// to guarantee that all TransactionalTableScanner are pointing to the same point
+func createTransactions(ctx context.Context, numberOfScanners int, wr *wrangler.Wrangler, cleaner *wrangler.Cleaner, queryService queryservice.QueryService, target *query.Target, tabletInfo *topodatapb.Tablet) ([]int64, error) {
+	scanners := make([]int64, numberOfScanners)
+	for i := 0; i < numberOfScanners; i++ {
+
+		tx, _, err := queryService.Begin(ctx, target, &query.ExecuteOptions{
+			// Make sure our tx is not killed by tx sniper
+			Workload:             query.ExecuteOptions_DBA,
+			TransactionIsolation: query.ExecuteOptions_CONSISTENT_SNAPSHOT_READ_ONLY,
+		})
+		if err != nil {
+			return nil, vterrors.Wrapf(err, "could not open transaction on %v", topoproto.TabletAliasString(tabletInfo.Alias))
+		}
+
+		// Remember to rollback the transactions
+		cleaner.Record("CloseTransaction", topoproto.TabletAliasString(tabletInfo.Alias), func(ctx context.Context, wr *wrangler.Wrangler) error {
+			queryService, err := tabletconn.GetDialer()(tabletInfo, true)
+			if err != nil {
+				return err
+			}
+			_, err = queryService.Rollback(ctx, target, tx)
+			return err
+		})
+
+		scanners[i] = tx
+	}
+
+	return scanners, nil
+}
+
+// TableScanner is a simple abstraction that allows a TableScanner user to remain impervious
+// by the transactionality of the connection
+type TableScanner interface {
+	ScanTable(ctx context.Context, td *tabletmanagerdatapb.TableDefinition) (*QueryResultReader, error)
+}
+
+// TransactionalTableScanner works inside of a transaction set up with CONSISTENT SNAPSHOT
+type TransactionalTableScanner struct {
+	wr           *wrangler.Wrangler
+	cleaner      *wrangler.Cleaner
+	tabletAlias  *topodatapb.TabletAlias
+	queryService queryservice.QueryService
+	tx           int64
+}
+
+// ScanTable performs a full table scan, ordered by the primary keys, if any
+func (tt TransactionalTableScanner) ScanTable(ctx context.Context, td *tabletmanagerdatapb.TableDefinition) (*QueryResultReader, error) {
+	return TransactionalTableScan(ctx, tt.wr.Logger(), tt.wr.TopoServer(), tt.tabletAlias, tt.tx, td)
+}
+
+// NonTransactionalTableScanner just passes through the queries, and relies on paused replication traffic taking care of the consistent snapshot part
+type NonTransactionalTableScanner struct {
+	wr           *wrangler.Wrangler
+	cleaner      *wrangler.Cleaner
+	tabletAlias  *topodatapb.TabletAlias
+	queryService queryservice.QueryService
+}
+
+// ScanTable performs a full table scan, ordered by the primary keys, if any
+func (ntts NonTransactionalTableScanner) ScanTable(ctx context.Context, td *tabletmanagerdatapb.TableDefinition) (*QueryResultReader, error) {
+	return TableScan(ctx, ntts.wr.Logger(), ntts.wr.TopoServer(), ntts.tabletAlias, td)
+}
+
+// CreateConsistentTableScanners will momentarily stop updates on the tablet, and then create connections that are all
+// consistent snapshots of the same point in the transaction history
+func CreateConsistentTableScanners(ctx context.Context, tablet *topo.TabletInfo, wr *wrangler.Wrangler, cleaner *wrangler.Cleaner, numberOfScanners int) ([]TableScanner, string, error) {
+	txs, gtid, err := CreateConsistentTransactions(ctx, tablet, wr, cleaner, numberOfScanners)
+	if err != nil {
+		return nil, "", err
+	}
+
+	queryService, _ := tabletconn.GetDialer()(tablet.Tablet, true)
+	defer queryService.Close(ctx)
+
+	scanners := make([]TableScanner, numberOfScanners)
+	for i, tx := range txs {
+		scanners[i] = TransactionalTableScanner{
+			wr:           wr,
+			cleaner:      cleaner,
+			tabletAlias:  tablet.Alias,
+			queryService: queryService,
+			tx:           tx,
+		}
+	}
+
+	return scanners, gtid, nil
+}
+
+// CreateConsistentTransactions creates a number of consistent snapshot transactions,
+// all starting from the same spot in the tx log
+func CreateConsistentTransactions(ctx context.Context, tablet *topo.TabletInfo, wr *wrangler.Wrangler, cleaner *wrangler.Cleaner, numberOfScanners int) ([]int64, string, error) {
+	if numberOfScanners < 1 {
+		return nil, "", vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "need more than zero scanners: %d", numberOfScanners)
+	}
+
+	tm := tmclient.NewTabletManagerClient()
+	defer tm.Close()
+
+	// Lock all tables with a read lock to pause replication
+	err := tm.LockTables(ctx, tablet.Tablet)
+	if err != nil {
+		return nil, "", vterrors.Wrapf(err, "could not lock tables on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+	}
+	defer func() {
+		tm := tmclient.NewTabletManagerClient()
+		defer tm.Close()
+		tm.UnlockTables(ctx, tablet.Tablet)
+		wr.Logger().Infof("tables unlocked on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+	}()
+
+	wr.Logger().Infof("tables locked on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+	target := CreateTargetFrom(tablet.Tablet)
+
+	// Create transactions
+	queryService, _ := tabletconn.GetDialer()(tablet.Tablet, true)
+	defer queryService.Close(ctx)
+	connections, err := createTransactions(ctx, numberOfScanners, wr, cleaner, queryService, target, tablet.Tablet)
+	if err != nil {
+		return nil, "", vterrors.Wrapf(err, "failed to create transactions on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+	}
+	wr.Logger().Infof("transactions created on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+	executedGtid, err := tm.MasterPosition(ctx, tablet.Tablet)
+	if err != nil {
+		return nil, "", vterrors.Wrapf(err, "could not read executed GTID set on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+	}
+
+	return connections, executedGtid, nil
 }

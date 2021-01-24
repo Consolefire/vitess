@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,21 +21,22 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/require"
 
-	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 var dmlErrorCases = []string{
 	"query",
-	"query /* _stream 10 (eid id name ) (null 1 'bmFtZQ==' ); */",
-	"query /* _stream _table_ eid id name ) (null 1 'bmFtZQ==' ); */",
-	"query /* _stream _table_ (10 id name ) (null 1 'bmFtZQ==' ); */",
-	"query /* _stream _table_ (eid id name  (null 1 'bmFtZQ==' ); */",
-	"query /* _stream _table_ (eid id name)  (null 'aaa' 'bmFtZQ==' ); */",
-	"query /* _stream _table_ (eid id name)  (null 'bmFtZQ==' ); */",
-	"query /* _stream _table_ (eid id name)  (null 1.1 'bmFtZQ==' ); */",
-	"query /* _stream _table_ (eid id name)  (null a 'bmFtZQ==' ); */",
+	"query /* _stream 10 (eid id `name` ) (null 1 'bmFtZQ==' ); */",
+	"query /* _stream _table_ eid id `name` ) (null 1 'bmFtZQ==' ); */",
+	"query /* _stream _table_ (10 id `name` ) (null 1 'bmFtZQ==' ); */",
+	"query /* _stream _table_ (eid id `name`  (null 1 'bmFtZQ==' ); */",
+	"query /* _stream _table_ (eid id `name`)  (null 'aaa' 'bmFtZQ==' ); */",
+	"query /* _stream _table_ (eid id `name`)  (null 'bmFtZQ==' ); */",
+	"query /* _stream _table_ (eid id `name`)  (null 1.1 'bmFtZQ==' ); */",
+	"query /* _stream _table_ (eid id `name`)  (null a 'bmFtZQ==' ); */",
 }
 
 func TestEventErrors(t *testing.T) {
@@ -90,9 +91,7 @@ func TestSetErrors(t *testing.T) {
 	}
 	before := binlogStreamerErrors.Counts()["EventStreamer"]
 	err := evs.transactionToEvent(nil, statements)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	got := binlogStreamerErrors.Counts()["EventStreamer"]
 	if got != before+1 {
 		t.Errorf("got: %v, want: %+v", got, before+1)
@@ -116,7 +115,7 @@ func TestDMLEvent(t *testing.T) {
 		{
 			Statement: &binlogdatapb.BinlogTransaction_Statement{
 				Category: binlogdatapb.BinlogTransaction_Statement_BL_INSERT,
-				Sql:      []byte("query /* _stream _table_ (eid id name)  (null 1 'bmFtZQ==' ) (null 18446744073709551615 'bmFtZQ==' ); */"),
+				Sql:      []byte("query /* _stream _table_ (eid id `name`)  (null 1 'bmFtZQ==' ) (null 18446744073709551615 'bmFtZQ==' ); */"),
 			},
 		},
 		{
@@ -160,9 +159,7 @@ func TestDMLEvent(t *testing.T) {
 		},
 	}
 	err := evs.transactionToEvent(eventToken, statements)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 }
 
 func TestDDLEvent(t *testing.T) {
@@ -208,7 +205,5 @@ func TestDDLEvent(t *testing.T) {
 		},
 	}
 	err := evs.transactionToEvent(eventToken, statements)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 }

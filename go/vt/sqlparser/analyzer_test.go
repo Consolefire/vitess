@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,20 +17,26 @@ limitations under the License.
 package sqlparser
 
 import (
-	"reflect"
-	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/sqltypes"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/test/utils"
+
+	"github.com/stretchr/testify/assert"
+
+	"vitess.io/vitess/go/sqltypes"
 )
 
 func TestPreview(t *testing.T) {
 	testcases := []struct {
 		sql  string
-		want int
+		want StatementType
 	}{
 		{"select ...", StmtSelect},
 		{"    select ...", StmtSelect},
+		{"(select ...", StmtSelect},
+		{"( select ...", StmtSelect},
 		{"insert ...", StmtInsert},
 		{"replace ....", StmtReplace},
 		{"   update ...", StmtUpdate},
@@ -45,9 +51,16 @@ func TestPreview(t *testing.T) {
 		{"\n\t begin ", StmtBegin},
 		{"... begin ", StmtUnknown},
 		{"begin ...", StmtUnknown},
+		{"begin /* ... */", StmtBegin},
+		{"begin /* ... *//*test*/", StmtBegin},
+		{"begin;", StmtBegin},
+		{"begin ;", StmtBegin},
+		{"begin; /*...*/", StmtBegin},
 		{"start transaction", StmtBegin},
 		{"commit", StmtCommit},
+		{"commit /*...*/", StmtCommit},
 		{"rollback", StmtRollback},
+		{"rollback /*...*/", StmtRollback},
 		{"create", StmtDDL},
 		{"alter", StmtDDL},
 		{"rename", StmtDDL},
@@ -56,21 +69,28 @@ func TestPreview(t *testing.T) {
 		{"show", StmtShow},
 		{"use", StmtUse},
 		{"analyze", StmtOther},
-		{"describe", StmtOther},
-		{"desc", StmtOther},
-		{"explain", StmtOther},
+		{"describe", StmtExplain},
+		{"desc", StmtExplain},
+		{"explain", StmtExplain},
 		{"repair", StmtOther},
 		{"optimize", StmtOther},
-		{"truncate", StmtOther},
+		{"grant", StmtPriv},
+		{"revoke", StmtPriv},
+		{"truncate", StmtDDL},
+		{"flush", StmtFlush},
 		{"unknown", StmtUnknown},
 
 		{"/* leading comment */ select ...", StmtSelect},
+		{"/* leading comment */ (select ...", StmtSelect},
 		{"/* leading comment */ /* leading comment 2 */ select ...", StmtSelect},
+		{"/*! MySQL-specific comment */", StmtComment},
+		{"/*!50708 MySQL-version comment */", StmtComment},
 		{"-- leading single line comment \n select ...", StmtSelect},
 		{"-- leading single line comment \n -- leading single line comment 2\n select ...", StmtSelect},
 
 		{"/* leading comment no end select ...", StmtUnknown},
 		{"-- leading single line comment no end select ...", StmtUnknown},
+		{"/*!40000 ALTER TABLE `t1` DISABLE KEYS */", StmtComment},
 	}
 	for _, tcase := range testcases {
 		if got := Preview(tcase.sql); got != tcase.want {
@@ -98,6 +118,94 @@ func TestIsDML(t *testing.T) {
 	for _, tcase := range testcases {
 		if got := IsDML(tcase.sql); got != tcase.want {
 			t.Errorf("IsDML(%s): %v, want %v", tcase.sql, got, tcase.want)
+		}
+	}
+}
+
+func TestSplitAndExpression(t *testing.T) {
+	testcases := []struct {
+		sql string
+		out []string
+	}{{
+		sql: "select * from t",
+		out: nil,
+	}, {
+		sql: "select * from t where a = 1",
+		out: []string{"a = 1"},
+	}, {
+		sql: "select * from t where a = 1 and b = 1",
+		out: []string{"a = 1", "b = 1"},
+	}, {
+		sql: "select * from t where a = 1 and (b = 1 and c = 1)",
+		out: []string{"a = 1", "b = 1", "c = 1"},
+	}, {
+		sql: "select * from t where a = 1 and (b = 1 or c = 1)",
+		out: []string{"a = 1", "b = 1 or c = 1"},
+	}, {
+		sql: "select * from t where a = 1 and b = 1 or c = 1",
+		out: []string{"a = 1 and b = 1 or c = 1"},
+	}, {
+		sql: "select * from t where a = 1 and b = 1 + (c = 1)",
+		out: []string{"a = 1", "b = 1 + (c = 1)"},
+	}, {
+		sql: "select * from t where (a = 1 and ((b = 1 and c = 1)))",
+		out: []string{"a = 1", "b = 1", "c = 1"},
+	}}
+	for _, tcase := range testcases {
+		stmt, err := Parse(tcase.sql)
+		assert.NoError(t, err)
+		var expr Expr
+		if where := stmt.(*Select).Where; where != nil {
+			expr = where.Expr
+		}
+		splits := SplitAndExpression(nil, expr)
+		var got []string
+		for _, split := range splits {
+			got = append(got, String(split))
+		}
+		assert.Equal(t, tcase.out, got)
+	}
+}
+
+func TestTableFromStatement(t *testing.T) {
+	testcases := []struct {
+		in, out string
+	}{{
+		in:  "select * from t",
+		out: "t",
+	}, {
+		in:  "select * from t.t",
+		out: "t.t",
+	}, {
+		in:  "select * from t1, t2",
+		out: "table expression is complex",
+	}, {
+		in:  "select * from (t)",
+		out: "table expression is complex",
+	}, {
+		in:  "select * from t1 join t2",
+		out: "table expression is complex",
+	}, {
+		in:  "select * from (select * from t) as tt",
+		out: "table expression is complex",
+	}, {
+		in:  "update t set a=1",
+		out: "unrecognized statement: update t set a=1",
+	}, {
+		in:  "bad query",
+		out: "syntax error at position 4 near 'bad'",
+	}}
+
+	for _, tc := range testcases {
+		name, err := TableFromStatement(tc.in)
+		var got string
+		if err != nil {
+			got = err.Error()
+		} else {
+			got = String(name)
+		}
+		if got != tc.out {
+			t.Errorf("TableFromStatement('%s'): %s, want %s", tc.in, got, tc.out)
 		}
 	}
 }
@@ -137,7 +245,7 @@ func TestIsColName(t *testing.T) {
 		in:  &ColName{},
 		out: true,
 	}, {
-		in: newHexVal(""),
+		in: newHexLiteral(""),
 	}}
 	for _, tc := range testcases {
 		out := IsColName(tc.in)
@@ -152,32 +260,35 @@ func TestIsValue(t *testing.T) {
 		in  Expr
 		out bool
 	}{{
-		in:  newStrVal("aa"),
+		in:  newStrLiteral("aa"),
 		out: true,
 	}, {
-		in:  newHexVal("3131"),
+		in:  newHexLiteral("3131"),
 		out: true,
 	}, {
-		in:  newIntVal("1"),
+		in:  newIntLiteral("1"),
 		out: true,
 	}, {
-		in:  newValArg(":a"),
+		in:  newArgument(":a"),
 		out: true,
 	}, {
 		in:  &NullVal{},
 		out: false,
 	}}
 	for _, tc := range testcases {
-		out := IsValue(tc.in)
-		if out != tc.out {
-			t.Errorf("IsValue(%T): %v, want %v", tc.in, out, tc.out)
-		}
-		if tc.out {
-			// NewPlanValue should not fail for valid values.
-			if _, err := NewPlanValue(tc.in); err != nil {
-				t.Error(err)
+		t.Run(String(tc.in), func(t *testing.T) {
+			out := IsValue(tc.in)
+			if out != tc.out {
+				t.Errorf("IsValue(%T): %v, want %v", tc.in, out, tc.out)
 			}
-		}
+			if tc.out {
+				// NewPlanValue should not fail for valid values.
+				if _, err := NewPlanValue(tc.in); err != nil {
+					t.Error(err)
+				}
+			}
+
+		})
 	}
 }
 
@@ -189,7 +300,7 @@ func TestIsNull(t *testing.T) {
 		in:  &NullVal{},
 		out: true,
 	}, {
-		in: newStrVal(""),
+		in: newStrLiteral(""),
 	}}
 	for _, tc := range testcases {
 		out := IsNull(tc.in)
@@ -204,7 +315,7 @@ func TestIsSimpleTuple(t *testing.T) {
 		in  Expr
 		out bool
 	}{{
-		in:  ValTuple{newStrVal("aa")},
+		in:  ValTuple{newStrLiteral("aa")},
 		out: true,
 	}, {
 		in: ValTuple{&ColName{}},
@@ -234,37 +345,40 @@ func TestNewPlanValue(t *testing.T) {
 		out sqltypes.PlanValue
 		err string
 	}{{
-		in: &SQLVal{
-			Type: ValArg,
-			Val:  []byte(":valarg"),
-		},
+		in:  Argument(":valarg"),
 		out: sqltypes.PlanValue{Key: "valarg"},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: IntVal,
 			Val:  []byte("10"),
 		},
 		out: sqltypes.PlanValue{Value: sqltypes.NewInt64(10)},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: IntVal,
 			Val:  []byte("1111111111111111111111111111111111111111"),
 		},
 		err: "value out of range",
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: StrVal,
 			Val:  []byte("strval"),
 		},
 		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
+			Type: BitVal,
+			Val:  []byte("01100001"),
+		},
+		err: "expression is too complex",
+	}, {
+		in: &Literal{
 			Type: HexVal,
 			Val:  []byte("3131"),
 		},
 		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("11")},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: HexVal,
 			Val:  []byte("313"),
 		},
@@ -274,11 +388,8 @@ func TestNewPlanValue(t *testing.T) {
 		out: sqltypes.PlanValue{ListKey: "list"},
 	}, {
 		in: ValTuple{
-			&SQLVal{
-				Type: ValArg,
-				Val:  []byte(":valarg"),
-			},
-			&SQLVal{
+			Argument(":valarg"),
+			&Literal{
 				Type: StrVal,
 				Val:  []byte("strval"),
 			},
@@ -292,14 +403,6 @@ func TestNewPlanValue(t *testing.T) {
 		},
 	}, {
 		in: ValTuple{
-			&ParenExpr{Expr: &SQLVal{
-				Type: ValArg,
-				Val:  []byte(":valarg"),
-			}},
-		},
-		err: "expression is too complex",
-	}, {
-		in: ValTuple{
 			ListArg("::list"),
 		},
 		err: "unsupported: nested lists",
@@ -307,131 +410,91 @@ func TestNewPlanValue(t *testing.T) {
 		in:  &NullVal{},
 		out: sqltypes.PlanValue{},
 	}, {
-		in: &ParenExpr{Expr: &SQLVal{
-			Type: ValArg,
-			Val:  []byte(":valarg"),
-		}},
+		in: &Literal{
+			Type: FloatVal,
+			Val:  []byte("2.1"),
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewFloat64(2.1)},
+	}, {
+		in: &UnaryExpr{
+			Operator: Latin1Op,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  []byte("strval"),
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: UBinaryOp,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  []byte("strval"),
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: Utf8mb4Op,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  []byte("strval"),
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: Utf8Op,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  []byte("strval"),
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: UMinusOp,
+			Expr: &Literal{
+				Type: FloatVal,
+				Val:  []byte("2.1"),
+			},
+		},
 		err: "expression is too complex",
 	}}
 	for _, tc := range tcases {
-		got, err := NewPlanValue(tc.in)
-		if err != nil {
-			if !strings.Contains(err.Error(), tc.err) {
-				t.Errorf("NewPlanValue(%s) error: %v, want '%s'", String(tc.in), err, tc.err)
+		t.Run(String(tc.in), func(t *testing.T) {
+			got, err := NewPlanValue(tc.in)
+			if tc.err != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.err)
+				return
 			}
-			continue
-		}
-		if tc.err != "" {
-			t.Errorf("NewPlanValue(%s) error: nil, want '%s'", String(tc.in), tc.err)
-			continue
-		}
-		if !reflect.DeepEqual(got, tc.out) {
-			t.Errorf("NewPlanValue(%s): %v, want %v", String(tc.in), got, tc.out)
-		}
+
+			require.NoError(t, err)
+			mustMatch(t, tc.out, got, "wut!")
+		})
 	}
 }
 
-func TestStringIn(t *testing.T) {
-	testcases := []struct {
-		in1 string
-		in2 []string
-		out bool
-	}{{
-		in1: "v1",
-		in2: []string{"v1", "v2"},
-		out: true,
-	}, {
-		in1: "v0",
-		in2: []string{"v1", "v2"},
-	}}
-	for _, tc := range testcases {
-		out := StringIn(tc.in1, tc.in2...)
-		if out != tc.out {
-			t.Errorf("StringIn(%v,%v): %#v, want %#v", tc.in1, tc.in2, out, tc.out)
-		}
-	}
+var mustMatch = utils.MustMatchFn(
+	[]interface{}{ // types with unexported fields
+		sqltypes.Value{},
+	},
+	[]string{".Conn"}, // ignored fields
+)
+
+func newStrLiteral(in string) *Literal {
+	return NewStrLiteral([]byte(in))
 }
 
-func TestExtractSetValues(t *testing.T) {
-	testcases := []struct {
-		sql     string
-		out     map[string]interface{}
-		charset string
-		err     string
-	}{{
-		sql: "invalid",
-		err: "syntax error at position 8 near 'invalid'",
-	}, {
-		sql: "select * from t",
-		err: "ast did not yield *sqlparser.Set: *sqlparser.Select",
-	}, {
-		sql: "set a.autocommit=1",
-		err: "invalid syntax: a.autocommit",
-	}, {
-		sql: "set autocommit=1+1",
-		err: "invalid syntax: 1 + 1",
-	}, {
-		sql: "set transaction_mode='single'",
-		out: map[string]interface{}{"transaction_mode": "single"},
-	}, {
-		sql: "set autocommit=1",
-		out: map[string]interface{}{"autocommit": int64(1)},
-	}, {
-		sql: "set AUTOCOMMIT=1",
-		out: map[string]interface{}{"autocommit": int64(1)},
-	}, {
-		sql: "SET character_set_results = NULL",
-		out: map[string]interface{}{"character_set_results": nil},
-	}, {
-		sql: "SET foo = 0x1234",
-		err: "invalid value type: 0x1234",
-	}, {
-		sql:     "SET names utf8",
-		out:     map[string]interface{}{},
-		charset: "utf8",
-	}, {
-		sql:     "SET names ascii collation ascii_bin",
-		out:     map[string]interface{}{},
-		charset: "ascii",
-	}, {
-		sql:     "SET charset default",
-		out:     map[string]interface{}{},
-		charset: "default",
-	}, {
-		sql:     "SET character set ascii",
-		out:     map[string]interface{}{},
-		charset: "ascii",
-	}}
-	for _, tcase := range testcases {
-		out, charset, err := ExtractSetValues(tcase.sql)
-		if tcase.err != "" {
-			if err == nil || err.Error() != tcase.err {
-				t.Errorf("ExtractSetValues(%s): %v, want '%s'", tcase.sql, err, tcase.err)
-			}
-		} else if err != nil {
-			t.Errorf("ExtractSetValues(%s): %v, want no error", tcase.sql, err)
-		}
-		if !reflect.DeepEqual(out, tcase.out) {
-			t.Errorf("ExtractSetValues(%s): %v, want '%v'", tcase.sql, out, tcase.out)
-		}
-		if charset != tcase.charset {
-			t.Errorf("ExtractSetValues(%s): %v, want '%v'", tcase.sql, charset, tcase.charset)
-		}
-	}
+func newIntLiteral(in string) *Literal {
+	return NewIntLiteral([]byte(in))
 }
 
-func newStrVal(in string) *SQLVal {
-	return NewStrVal([]byte(in))
+func newHexLiteral(in string) *Literal {
+	return NewHexLiteral([]byte(in))
 }
 
-func newIntVal(in string) *SQLVal {
-	return NewIntVal([]byte(in))
-}
-
-func newHexVal(in string) *SQLVal {
-	return NewHexVal([]byte(in))
-}
-
-func newValArg(in string) *SQLVal {
-	return NewValArg([]byte(in))
+func newArgument(in string) Expr {
+	return NewArgument([]byte(in))
 }

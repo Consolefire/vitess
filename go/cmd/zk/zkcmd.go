@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,15 +32,16 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/samuel/go-zookeeper/zk"
-	"golang.org/x/crypto/ssh/terminal"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo/zk2topo"
-	"github.com/youtube/vitess/go/vt/vtctld"
+	"github.com/z-division/go-zookeeper/zk"
+	"golang.org/x/crypto/ssh/terminal"
+
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo/zk2topo"
+	"vitess.io/vitess/go/vt/vtctl"
 )
 
 var doc = `
@@ -50,6 +51,8 @@ It tries to mimic unix file system commands wherever possible, but
 there are some slight differences in flag handling.
 
 zk -h - provide help on overriding cell selection
+
+zk addAuth digest user:pass
 
 zk cat /zk/path
 zk cat -l /zk/path1 /zk/path2 (list filename before file data)
@@ -107,22 +110,23 @@ const (
 type cmdFunc func(ctx context.Context, subFlags *flag.FlagSet, args []string) error
 
 var cmdMap map[string]cmdFunc
-var zconn zk2topo.Conn
+var zconn *zk2topo.ZkConn
 
 func init() {
 	cmdMap = map[string]cmdFunc{
-		"cat":   cmdCat,
-		"chmod": cmdChmod,
-		"cp":    cmdCp,
-		"edit":  cmdEdit,
-		"ls":    cmdLs,
-		"rm":    cmdRm,
-		"stat":  cmdStat,
-		"touch": cmdTouch,
-		"unzip": cmdUnzip,
-		"wait":  cmdWait,
-		"watch": cmdWatch,
-		"zip":   cmdZip,
+		"addAuth": cmdAddAuth,
+		"cat":     cmdCat,
+		"chmod":   cmdChmod,
+		"cp":      cmdCp,
+		"edit":    cmdEdit,
+		"ls":      cmdLs,
+		"rm":      cmdRm,
+		"stat":    cmdStat,
+		"touch":   cmdTouch,
+		"unzip":   cmdUnzip,
+		"wait":    cmdWait,
+		"watch":   cmdWatch,
+		"zip":     cmdZip,
 	}
 }
 
@@ -136,7 +140,7 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %v:\n", os.Args[0])
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, doc)
+		fmt.Fprint(os.Stderr, doc)
 	}
 	flag.Parse()
 	args := flag.Args()
@@ -149,7 +153,7 @@ func main() {
 	args = args[1:]
 	cmd, ok := cmdMap[cmdName]
 	if !ok {
-		log.Fatalf("Unknown command %v", cmdName)
+		log.Exitf("Unknown command %v", cmdName)
 	}
 	subFlags := flag.NewFlagSet(cmdName, flag.ExitOnError)
 
@@ -174,7 +178,7 @@ func main() {
 
 func fixZkPath(zkPath string) string {
 	if zkPath != "/" {
-		zkPath = strings.TrimRight(zkPath, "/")
+		zkPath = strings.TrimSuffix(zkPath, "/")
 	}
 	return path.Clean(zkPath)
 }
@@ -206,7 +210,7 @@ func cmdWait(ctx context.Context, subFlags *flag.FlagSet, args []string) error {
 	}
 	if err != nil {
 		if err == zk.ErrNoNode {
-			_, _, wait, err = zconn.ExistsW(ctx, zkPath)
+			_, _, wait, _ = zconn.ExistsW(ctx, zkPath)
 		} else {
 			return fmt.Errorf("wait: error %v: %v", zkPath, err)
 		}
@@ -500,6 +504,15 @@ func cmdRm(ctx context.Context, subFlags *flag.FlagSet, args []string) error {
 	return nil
 }
 
+func cmdAddAuth(ctx context.Context, subFlags *flag.FlagSet, args []string) error {
+	subFlags.Parse(args)
+	if subFlags.NArg() < 2 {
+		return fmt.Errorf("addAuth: expected args <scheme> <auth>")
+	}
+	scheme, auth := subFlags.Arg(0), subFlags.Arg(1)
+	return zconn.AddAuth(ctx, scheme, []byte(auth))
+}
+
 func cmdCat(ctx context.Context, subFlags *flag.FlagSet, args []string) error {
 	var (
 		longListing = subFlags.Bool("l", false, "long listing")
@@ -536,7 +549,7 @@ func cmdCat(ctx context.Context, subFlags *flag.FlagSet, args []string) error {
 		}
 		decoded := ""
 		if *decodeProto {
-			decoded, err = vtctld.DecodeContent(zkPath, data)
+			decoded, err = vtctl.DecodeContent(zkPath, data, false)
 			if err != nil {
 				log.Warningf("cat: cannot proto decode %v: %v", zkPath, err)
 				decoded = string(data)
@@ -600,7 +613,7 @@ func cmdEdit(ctx context.Context, subFlags *flag.FlagSet, args []string) error {
 		return fmt.Errorf("edit: cannot read file %v", err)
 	}
 
-	if bytes.Compare(fileData, data) != 0 {
+	if !bytes.Equal(fileData, data) {
 		// data changed - update if we can
 		_, err = zconn.Set(ctx, zkPath, fileData, stat.Version)
 		if err != nil {
@@ -900,7 +913,7 @@ func cmdZip(ctx context.Context, subFlags *flag.FlagSet, args []string) error {
 			continue
 		}
 		fi := &zip.FileHeader{Name: path, Method: zip.Deflate}
-		fi.SetModTime(zk2topo.Time(stat.Mtime))
+		fi.Modified = zk2topo.Time(stat.Mtime)
 		f, err := zipWriter.CreateHeader(fi)
 		if err != nil {
 			return fmt.Errorf("zip: create failed: %v", err)

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -22,15 +22,16 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletconn"
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/grpcclient"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // This file maintains a tablet health cache. It establishes streaming
@@ -88,7 +89,7 @@ func (th *tabletHealth) lastAccessed() time.Time {
 	return th.accessed
 }
 
-func (th *tabletHealth) stream(ctx context.Context, ts topo.Server, tabletAlias *topodatapb.TabletAlias) (err error) {
+func (th *tabletHealth) stream(ctx context.Context, ts *topo.Server, tabletAlias *topodatapb.TabletAlias) (err error) {
 	defer func() {
 		th.mu.Lock()
 		th.err = err
@@ -101,7 +102,7 @@ func (th *tabletHealth) stream(ctx context.Context, ts topo.Server, tabletAlias 
 		return err
 	}
 
-	conn, err := tabletconn.GetDialer()(ti.Tablet, 30*time.Second)
+	conn, err := tabletconn.GetDialer()(ti.Tablet, grpcclient.FailFast(true))
 	if err != nil {
 		return err
 	}
@@ -126,7 +127,7 @@ func (th *tabletHealth) stream(ctx context.Context, ts topo.Server, tabletAlias 
 }
 
 type tabletHealthCache struct {
-	ts topo.Server
+	ts *topo.Server
 
 	// mu protects the map.
 	mu sync.Mutex
@@ -135,7 +136,7 @@ type tabletHealthCache struct {
 	tabletMap map[string]*tabletHealth
 }
 
-func newTabletHealthCache(ts topo.Server) *tabletHealthCache {
+func newTabletHealthCache(ts *topo.Server) *tabletHealthCache {
 	return &tabletHealthCache{
 		ts:        ts,
 		tabletMap: make(map[string]*tabletHealth),

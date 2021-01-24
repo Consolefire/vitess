@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@ limitations under the License.
 package wrangler
 
 import (
-	"github.com/youtube/vitess/go/vt/topotools"
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/vt/topotools"
 )
 
 // RebuildKeyspaceGraph rebuilds the serving graph data while locking out other changes.
-func (wr *Wrangler) RebuildKeyspaceGraph(ctx context.Context, keyspace string, cells []string) error {
-	return topotools.RebuildKeyspace(ctx, wr.logger, wr.ts, keyspace, cells)
+func (wr *Wrangler) RebuildKeyspaceGraph(ctx context.Context, keyspace string, cells []string, allowPartial bool) error {
+	return topotools.RebuildKeyspace(ctx, wr.logger, wr.ts, keyspace, cells, allowPartial)
 }

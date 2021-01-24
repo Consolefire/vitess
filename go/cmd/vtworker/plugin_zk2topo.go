@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,8 @@ limitations under the License.
 
 package main
 
+// Imports and register the zk2 TopologyServer
+
 import (
-	// Imports and register the zk2 TopologyServer
-	_ "github.com/youtube/vitess/go/vt/topo/zk2topo"
+	_ "vitess.io/vitess/go/vt/topo/zk2topo"
 )

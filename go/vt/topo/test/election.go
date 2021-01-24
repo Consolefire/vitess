@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo"
 )
 
 func waitForMasterID(t *testing.T, mp topo.MasterParticipation, expected string) {
@@ -46,13 +46,17 @@ func waitForMasterID(t *testing.T, mp topo.MasterParticipation, expected string)
 }
 
 // checkElection runs the tests on the MasterParticipation part of the
-// topo.Impl API.
-func checkElection(t *testing.T, ts topo.Impl) {
+// topo.Conn API.
+func checkElection(t *testing.T, ts *topo.Server) {
+	conn, err := ts.ConnForCell(context.Background(), topo.GlobalCell)
+	if err != nil {
+		t.Fatalf("ConnForCell(global) failed: %v", err)
+	}
 	name := "testmp"
 
 	// create a new MasterParticipation
 	id1 := "id1"
-	mp1, err := ts.NewMasterParticipation(name, id1)
+	mp1, err := conn.NewMasterParticipation(name, id1)
 	if err != nil {
 		t.Fatalf("cannot create mp1: %v", err)
 	}
@@ -66,12 +70,26 @@ func checkElection(t *testing.T, ts topo.Impl) {
 		t.Fatalf("mp1 cannot become master: %v", err)
 	}
 
+	// A lot of implementations use a toplevel directory for their elections.
+	// Make sure it is marked as 'Ephemeral'.
+	entries, err := conn.ListDir(context.Background(), "/", true /*full*/)
+	if err != nil {
+		t.Fatalf("ListDir(/) failed: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name != topo.CellsPath {
+			if !e.Ephemeral {
+				t.Errorf("toplevel directory that is not ephemeral: %v", e)
+			}
+		}
+	}
+
 	// get the current master name, better be id1
 	waitForMasterID(t, mp1, id1)
 
 	// create a second MasterParticipation on same name
 	id2 := "id2"
-	mp2, err := ts.NewMasterParticipation(name, id2)
+	mp2, err := conn.NewMasterParticipation(name, id2)
 	if err != nil {
 		t.Fatalf("cannot create mp2: %v", err)
 	}
@@ -125,7 +143,7 @@ func checkElection(t *testing.T, ts topo.Impl) {
 	// does, for instance. There is a go routine that runs
 	// WaitForMastership and needs to exit cleanly at the end.
 	_, err = mp2.WaitForMastership()
-	if err != topo.ErrInterrupted {
-		t.Errorf("wrong error returned by WaitForMastership, got %v expected %v", err, topo.ErrInterrupted)
+	if !topo.IsErrType(err, topo.Interrupted) {
+		t.Errorf("wrong error returned by WaitForMastership, got %v expected %v", err, topo.NewError(topo.Interrupted, ""))
 	}
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,14 +22,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"path"
 	"text/template"
 
 	"flag"
 
-	"github.com/youtube/vitess/go/vt/env"
+	"vitess.io/vitess/go/vt/env"
 )
 
 // This files handles the creation of Mycnf objects for the default 'vt'
@@ -85,7 +84,6 @@ func NewMycnf(tabletUID uint32, mysqlPort int32) *Mycnf {
 	cnf.MasterInfoFile = path.Join(tabletDir, "master.info")
 	cnf.PidFile = path.Join(tabletDir, "mysql.pid")
 	cnf.TmpDir = path.Join(tabletDir, "tmp")
-	cnf.SlaveLoadTmpDir = cnf.TmpDir
 	return cnf
 }
 
@@ -121,19 +119,9 @@ func (cnf *Mycnf) directoryList() []string {
 	}
 }
 
-// makeMycnf will join cnf files cnfPaths and substitute in the right values.
-func (cnf *Mycnf) makeMycnf(cnfFiles []string) (string, error) {
-	myTemplateSource := new(bytes.Buffer)
-	myTemplateSource.WriteString("[mysqld]\n")
-	for _, path := range cnfFiles {
-		data, dataErr := ioutil.ReadFile(path)
-		if dataErr != nil {
-			return "", dataErr
-		}
-		myTemplateSource.WriteString("## " + path + "\n")
-		myTemplateSource.Write(data)
-	}
-	return cnf.fillMycnfTemplate(myTemplateSource.String())
+// makeMycnf will substitute values
+func (cnf *Mycnf) makeMycnf(partialcnf string) (string, error) {
+	return cnf.fillMycnfTemplate(partialcnf)
 }
 
 // fillMycnfTemplate will fill in the passed in template with the values
@@ -155,9 +143,9 @@ func (cnf *Mycnf) fillMycnfTemplate(tmplSrc string) (string, error) {
 //
 // The value assigned to ServerID will be in the range [100, 2^31):
 // - It avoids 0 because that's reserved for mysqlbinlog dumps.
-// - It also avoids 1-99 because low numbers are used for fake slave
-// connections.  See NewSlaveConnection() in slave_connection.go for
-// more on that.
+// - It also avoids 1-99 because low numbers are used for fake
+// connections.  See NewBinlogConnection() in binlog/binlog_connection.go
+// for more on that.
 // - It avoids the 2^31 - 2^32-1 range, as there seems to be some
 // confusion there. The main MySQL documentation at:
 // http://dev.mysql.com/doc/refman/5.7/en/replication-options.html
@@ -167,7 +155,7 @@ func (cnf *Mycnf) fillMycnfTemplate(tmplSrc string) (string, error) {
 // for that range).
 // Such an ID may also be responsible for a mysqld crash in semi-sync code,
 // although we haven't been able to verify that yet. The issue for that is:
-// https://github.com/youtube/vitess/issues/2280
+// https://github.com/vitessio/vitess/issues/2280
 func (cnf *Mycnf) RandomizeMysqlServerID() error {
 	// rand.Int(_, max) returns a value in the range [0, max).
 	bigN, err := rand.Int(rand.Reader, big.NewInt(1<<31-100))

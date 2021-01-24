@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,9 +19,8 @@ package servenv
 import (
 	"flag"
 
-	log "github.com/golang/glog"
-
-	"github.com/youtube/vitess/go/flagutil"
+	"vitess.io/vitess/go/flagutil"
+	"vitess.io/vitess/go/vt/log"
 )
 
 var (
@@ -36,7 +35,7 @@ var (
 
 func init() {
 	flag.Var(&serviceMapFlag, "service_map", "comma separated list of services to enable (or disable if prefixed with '-') Example: grpc-vtworker")
-	onInit(func() {
+	OnInit(func() {
 		updateServiceMap()
 	})
 }

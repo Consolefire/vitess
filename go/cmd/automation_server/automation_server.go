@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,15 @@ limitations under the License.
 package main
 
 import (
-	"flag"
 	"fmt"
 	"net"
 	"os"
 
 	"google.golang.org/grpc"
 
-	"github.com/youtube/vitess/go/vt/automation"
-	automationservicepb "github.com/youtube/vitess/go/vt/proto/automationservice"
-	"github.com/youtube/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/automation"
+	automationservicepb "vitess.io/vitess/go/vt/proto/automationservice"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 func init() {
@@ -34,13 +33,7 @@ func init() {
 }
 
 func main() {
-
-	flag.Parse()
-
-	if *servenv.Version {
-		servenv.AppVersion.Print()
-		os.Exit(0)
-	}
+	servenv.ParseFlags("automation_server")
 
 	fmt.Println("Automation Server, listening on:", *servenv.Port)
 
@@ -63,5 +56,7 @@ func main() {
 	}
 	scheduler.Run()
 	automationservicepb.RegisterAutomationServer(grpcServer, scheduler)
-	grpcServer.Serve(listener)
+	if err := grpcServer.Serve(listener); err != nil {
+		fmt.Println(err)
+	}
 }

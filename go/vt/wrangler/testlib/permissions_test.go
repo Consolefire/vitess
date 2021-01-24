@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,21 +19,30 @@ package testlib
 import (
 	"strings"
 	"testing"
+	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/wrangler"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/wrangler"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func TestPermissions(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	// Initialize our environment
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1", "cell2")
@@ -55,7 +64,7 @@ func TestPermissions(t *testing.T) {
 
 	// master will be asked for permissions
 	master.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
-		"SELECT * FROM mysql.user": {
+		"SELECT * FROM mysql.user ORDER BY host, user": {
 			Fields: []*querypb.Field{
 				{
 					Name: "Host",
@@ -419,7 +428,7 @@ func TestPermissions(t *testing.T) {
 				},
 			},
 		},
-		"SELECT * FROM mysql.db": {
+		"SELECT * FROM mysql.db ORDER BY host, db, user": {
 			Fields: []*querypb.Field{
 				{
 					Name: "Host",
@@ -544,19 +553,19 @@ func TestPermissions(t *testing.T) {
 	defer master.StopActionLoop(t)
 
 	// Make a two-level-deep copy, so we can make them diverge later.
-	user := *master.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user"]
+	user := *master.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user ORDER BY host, user"]
 	user.Fields = append([]*querypb.Field{}, user.Fields...)
 
 	// replica will be asked for permissions
 	replica.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
-		"SELECT * FROM mysql.user": &user,
-		"SELECT * FROM mysql.db":   master.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.db"],
+		"SELECT * FROM mysql.user ORDER BY host, user":   &user,
+		"SELECT * FROM mysql.db ORDER BY host, db, user": master.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.db ORDER BY host, db, user"],
 	}
 	replica.StartActionLoop(t, wr)
 	defer replica.StopActionLoop(t)
 
 	// Overwrite with the correct value to make sure it passes.
-	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user"].Fields[0] = &querypb.Field{
+	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user ORDER BY host, user"].Fields[0] = &querypb.Field{
 		Name: "Host",
 		Type: sqltypes.Char,
 	}
@@ -567,7 +576,7 @@ func TestPermissions(t *testing.T) {
 	}
 
 	// modify one field, this should fail
-	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user"].Fields[0] = &querypb.Field{
+	replica.FakeMysqlDaemon.FetchSuperQueryMap["SELECT * FROM mysql.user ORDER BY host, user"].Fields[0] = &querypb.Field{
 		Name: "Wrong",
 		Type: sqltypes.Char,
 	}

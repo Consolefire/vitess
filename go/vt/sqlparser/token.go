@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,12 +18,12 @@ package sqlparser
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
+	"strings"
 
-	"github.com/youtube/vitess/go/bytes2"
-	"github.com/youtube/vitess/go/sqltypes"
+	"vitess.io/vitess/go/bytes2"
+	"vitess.io/vitess/go/sqltypes"
 )
 
 const (
@@ -34,18 +34,20 @@ const (
 // Tokenizer is the struct used to generate SQL
 // tokens for the parser.
 type Tokenizer struct {
-	InStream      io.Reader
-	AllowComments bool
-	ForceEOF      bool
-	lastChar      uint16
-	Position      int
-	lastToken     []byte
-	LastError     error
-	posVarIndex   int
-	ParseTree     Statement
-	partialDDL    *DDL
-	nesting       int
-	multi         bool
+	InStream            io.Reader
+	AllowComments       bool
+	SkipSpecialComments bool
+	SkipToEnd           bool
+	lastChar            uint16
+	Position            int
+	lastToken           []byte
+	LastError           error
+	posVarIndex         int
+	ParseTree           Statement
+	partialDDL          Statement
+	nesting             int
+	multi               bool
+	specialComment      *Tokenizer
 
 	buf     []byte
 	bufPos  int
@@ -83,8 +85,11 @@ func NewTokenizer(r io.Reader) *Tokenizer {
 // in identifiers. See the docs for each grammar to determine which one to put it into.
 var keywords = map[string]int{
 	"accessible":          UNUSED,
-	"add":                 UNUSED,
+	"action":              ACTION,
+	"add":                 ADD,
+	"after":               AFTER,
 	"against":             AGAINST,
+	"algorithm":           ALGORITHM,
 	"all":                 ALL,
 	"alter":               ALTER,
 	"analyze":             ANALYZE,
@@ -93,11 +98,16 @@ var keywords = map[string]int{
 	"asc":                 ASC,
 	"asensitive":          UNUSED,
 	"auto_increment":      AUTO_INCREMENT,
+	"avg_row_length":      AVG_ROW_LENGTH,
 	"before":              UNUSED,
+	"begin":               BEGIN,
 	"between":             BETWEEN,
 	"bigint":              BIGINT,
 	"binary":              BINARY,
 	"_binary":             UNDERSCORE_BINARY,
+	"_utf8mb4":            UNDERSCORE_UTF8MB4,
+	"_utf8":               UNDERSCORE_UTF8,
+	"_latin1":             UNDERSCORE_LATIN1,
 	"bit":                 BIT,
 	"blob":                BLOB,
 	"bool":                BOOL,
@@ -105,28 +115,46 @@ var keywords = map[string]int{
 	"both":                UNUSED,
 	"by":                  BY,
 	"call":                UNUSED,
-	"cascade":             UNUSED,
+	"cascade":             CASCADE,
+	"cascaded":            CASCADED,
 	"case":                CASE,
 	"cast":                CAST,
-	"change":              UNUSED,
+	"channel":             CHANNEL,
+	"change":              CHANGE,
 	"char":                CHAR,
 	"character":           CHARACTER,
 	"charset":             CHARSET,
-	"check":               UNUSED,
+	"check":               CHECK,
+	"checksum":            CHECKSUM,
+	"coalesce":            COALESCE,
+	"code":                CODE,
 	"collate":             COLLATE,
-	"column":              UNUSED,
+	"collation":           COLLATION,
+	"column":              COLUMN,
+	"columns":             COLUMNS,
 	"comment":             COMMENT_KEYWORD,
+	"committed":           COMMITTED,
+	"commit":              COMMIT,
+	"compact":             COMPACT,
+	"compressed":          COMPRESSED,
+	"compression":         COMPRESSION,
 	"condition":           UNUSED,
-	"constraint":          UNUSED,
+	"connection":          CONNECTION,
+	"constraint":          CONSTRAINT,
 	"continue":            UNUSED,
 	"convert":             CONVERT,
+	"copy":                COPY,
+	"substr":              SUBSTR,
+	"substring":           SUBSTRING,
 	"create":              CREATE,
 	"cross":               CROSS,
+	"csv":                 CSV,
 	"current_date":        CURRENT_DATE,
 	"current_time":        CURRENT_TIME,
 	"current_timestamp":   CURRENT_TIMESTAMP,
-	"current_user":        UNUSED,
+	"current_user":        CURRENT_USER,
 	"cursor":              UNUSED,
+	"data":                DATA,
 	"database":            DATABASE,
 	"databases":           DATABASES,
 	"day_hour":            UNUSED,
@@ -139,58 +167,94 @@ var keywords = map[string]int{
 	"decimal":             DECIMAL,
 	"declare":             UNUSED,
 	"default":             DEFAULT,
+	"definer":             DEFINER,
+	"delay_key_write":     DELAY_KEY_WRITE,
 	"delayed":             UNUSED,
 	"delete":              DELETE,
 	"desc":                DESC,
 	"describe":            DESCRIBE,
 	"deterministic":       UNUSED,
+	"directory":           DIRECTORY,
+	"disable":             DISABLE,
+	"discard":             DISCARD,
+	"disk":                DISK,
 	"distinct":            DISTINCT,
-	"distinctrow":         UNUSED,
+	"distinctrow":         DISTINCTROW,
 	"div":                 DIV,
 	"double":              DOUBLE,
+	"do":                  DO,
 	"drop":                DROP,
+	"dumpfile":            DUMPFILE,
 	"duplicate":           DUPLICATE,
+	"dynamic":             DYNAMIC,
 	"each":                UNUSED,
 	"else":                ELSE,
 	"elseif":              UNUSED,
-	"enclosed":            UNUSED,
+	"enable":              ENABLE,
+	"enclosed":            ENCLOSED,
+	"encryption":          ENCRYPTION,
 	"end":                 END,
+	"enforced":            ENFORCED,
+	"engine":              ENGINE,
+	"engines":             ENGINES,
 	"enum":                ENUM,
+	"error":               ERROR,
 	"escape":              ESCAPE,
-	"escaped":             UNUSED,
+	"escaped":             ESCAPED,
+	"exchange":            EXCHANGE,
+	"exclusive":           EXCLUSIVE,
 	"exists":              EXISTS,
 	"exit":                UNUSED,
 	"explain":             EXPLAIN,
 	"expansion":           EXPANSION,
+	"export":              EXPORT,
+	"extended":            EXTENDED,
 	"false":               FALSE,
 	"fetch":               UNUSED,
+	"fields":              FIELDS,
+	"first":               FIRST,
+	"fixed":               FIXED,
 	"float":               FLOAT_TYPE,
 	"float4":              UNUSED,
 	"float8":              UNUSED,
+	"flush":               FLUSH,
 	"for":                 FOR,
 	"force":               FORCE,
-	"foreign":             UNUSED,
+	"foreign":             FOREIGN,
+	"format":              FORMAT,
 	"from":                FROM,
-	"fulltext":            UNUSED,
+	"full":                FULL,
+	"fulltext":            FULLTEXT,
+	"function":            FUNCTION,
+	"general":             GENERAL,
 	"generated":           UNUSED,
+	"geometry":            GEOMETRY,
+	"geometrycollection":  GEOMETRYCOLLECTION,
 	"get":                 UNUSED,
+	"global":              GLOBAL,
 	"grant":               UNUSED,
 	"group":               GROUP,
 	"group_concat":        GROUP_CONCAT,
 	"having":              HAVING,
+	"header":              HEADER,
 	"high_priority":       UNUSED,
+	"hosts":               HOSTS,
 	"hour_microsecond":    UNUSED,
 	"hour_minute":         UNUSED,
 	"hour_second":         UNUSED,
 	"if":                  IF,
 	"ignore":              IGNORE,
+	"import":              IMPORT,
 	"in":                  IN,
 	"index":               INDEX,
+	"indexes":             INDEXES,
 	"infile":              UNUSED,
 	"inout":               UNUSED,
 	"inner":               INNER,
+	"inplace":             INPLACE,
 	"insensitive":         UNUSED,
 	"insert":              INSERT,
+	"insert_method":       INSERT_METHOD,
 	"int":                 INT,
 	"int1":                UNUSED,
 	"int2":                UNUSED,
@@ -202,158 +266,235 @@ var keywords = map[string]int{
 	"into":                INTO,
 	"io_after_gtids":      UNUSED,
 	"is":                  IS,
+	"isolation":           ISOLATION,
 	"iterate":             UNUSED,
+	"invoker":             INVOKER,
 	"join":                JOIN,
 	"json":                JSON,
 	"key":                 KEY,
-	"keys":                UNUSED,
+	"keys":                KEYS,
+	"keyspaces":           KEYSPACES,
+	"key_block_size":      KEY_BLOCK_SIZE,
 	"kill":                UNUSED,
+	"last":                LAST,
 	"language":            LANGUAGE,
 	"last_insert_id":      LAST_INSERT_ID,
 	"leading":             UNUSED,
 	"leave":               UNUSED,
 	"left":                LEFT,
 	"less":                LESS,
+	"level":               LEVEL,
 	"like":                LIKE,
 	"limit":               LIMIT,
 	"linear":              UNUSED,
-	"lines":               UNUSED,
-	"load":                UNUSED,
+	"lines":               LINES,
+	"linestring":          LINESTRING,
+	"load":                LOAD,
+	"local":               LOCAL,
 	"localtime":           LOCALTIME,
 	"localtimestamp":      LOCALTIMESTAMP,
 	"lock":                LOCK,
+	"logs":                LOGS,
 	"long":                UNUSED,
 	"longblob":            LONGBLOB,
 	"longtext":            LONGTEXT,
 	"loop":                UNUSED,
-	"low_priority":        UNUSED,
+	"low_priority":        LOW_PRIORITY,
+	"manifest":            MANIFEST,
 	"master_bind":         UNUSED,
 	"match":               MATCH,
+	"max_rows":            MAX_ROWS,
 	"maxvalue":            MAXVALUE,
 	"mediumblob":          MEDIUMBLOB,
 	"mediumint":           MEDIUMINT,
 	"mediumtext":          MEDIUMTEXT,
+	"memory":              MEMORY,
+	"merge":               MERGE,
 	"middleint":           UNUSED,
+	"min_rows":            MIN_ROWS,
 	"minute_microsecond":  UNUSED,
 	"minute_second":       UNUSED,
 	"mod":                 MOD,
 	"mode":                MODE,
+	"modify":              MODIFY,
 	"modifies":            UNUSED,
+	"multilinestring":     MULTILINESTRING,
+	"multipoint":          MULTIPOINT,
+	"multipolygon":        MULTIPOLYGON,
+	"name":                NAME,
 	"names":               NAMES,
 	"natural":             NATURAL,
 	"nchar":               NCHAR,
 	"next":                NEXT,
+	"no":                  NO,
+	"none":                NONE,
 	"not":                 NOT,
-	"no_write_to_binlog":  UNUSED,
+	"no_write_to_binlog":  NO_WRITE_TO_BINLOG,
 	"null":                NULL,
 	"numeric":             NUMERIC,
+	"off":                 OFF,
 	"offset":              OFFSET,
 	"on":                  ON,
+	"only":                ONLY,
 	"optimize":            OPTIMIZE,
-	"optimizer_costs":     UNUSED,
-	"option":              UNUSED,
-	"optionally":          UNUSED,
+	"optimizer_costs":     OPTIMIZER_COSTS,
+	"option":              OPTION,
+	"optionally":          OPTIONALLY,
 	"or":                  OR,
 	"order":               ORDER,
 	"out":                 UNUSED,
 	"outer":               OUTER,
-	"outfile":             UNUSED,
+	"outfile":             OUTFILE,
+	"overwrite":           OVERWRITE,
+	"pack_keys":           PACK_KEYS,
+	"parser":              PARSER,
 	"partition":           PARTITION,
+	"partitioning":        PARTITIONING,
+	"password":            PASSWORD,
+	"plugins":             PLUGINS,
+	"point":               POINT,
+	"polygon":             POLYGON,
 	"precision":           UNUSED,
 	"primary":             PRIMARY,
-	"procedure":           UNUSED,
+	"privileges":          PRIVILEGES,
+	"processlist":         PROCESSLIST,
+	"procedure":           PROCEDURE,
 	"query":               QUERY,
 	"range":               UNUSED,
-	"read":                UNUSED,
+	"read":                READ,
 	"reads":               UNUSED,
 	"read_write":          UNUSED,
 	"real":                REAL,
-	"references":          UNUSED,
+	"rebuild":             REBUILD,
+	"redundant":           REDUNDANT,
+	"references":          REFERENCES,
 	"regexp":              REGEXP,
-	"release":             UNUSED,
+	"relay":               RELAY,
+	"release":             RELEASE,
+	"remove":              REMOVE,
 	"rename":              RENAME,
 	"reorganize":          REORGANIZE,
 	"repair":              REPAIR,
 	"repeat":              UNUSED,
+	"repeatable":          REPEATABLE,
 	"replace":             REPLACE,
 	"require":             UNUSED,
 	"resignal":            UNUSED,
-	"restrict":            UNUSED,
+	"restrict":            RESTRICT,
 	"return":              UNUSED,
 	"revoke":              UNUSED,
 	"right":               RIGHT,
 	"rlike":               REGEXP,
-	"schema":              UNUSED,
-	"schemas":             UNUSED,
+	"rollback":            ROLLBACK,
+	"row_format":          ROW_FORMAT,
+	"s3":                  S3,
+	"savepoint":           SAVEPOINT,
+	"schema":              SCHEMA,
+	"schemas":             SCHEMAS,
 	"second_microsecond":  UNUSED,
+	"security":            SECURITY,
 	"select":              SELECT,
 	"sensitive":           UNUSED,
 	"separator":           SEPARATOR,
+	"sequence":            SEQUENCE,
+	"serializable":        SERIALIZABLE,
+	"session":             SESSION,
 	"set":                 SET,
 	"share":               SHARE,
+	"shared":              SHARED,
 	"show":                SHOW,
 	"signal":              UNUSED,
 	"signed":              SIGNED,
+	"slow":                SLOW,
 	"smallint":            SMALLINT,
-	"spatial":             UNUSED,
+	"spatial":             SPATIAL,
 	"specific":            UNUSED,
-	"sql":                 UNUSED,
+	"sql":                 SQL,
 	"sqlexception":        UNUSED,
 	"sqlstate":            UNUSED,
 	"sqlwarning":          UNUSED,
 	"sql_big_result":      UNUSED,
 	"sql_cache":           SQL_CACHE,
-	"sql_calc_found_rows": UNUSED,
+	"sql_calc_found_rows": SQL_CALC_FOUND_ROWS,
 	"sql_no_cache":        SQL_NO_CACHE,
 	"sql_small_result":    UNUSED,
 	"ssl":                 UNUSED,
-	"starting":            UNUSED,
+	"start":               START,
+	"starting":            STARTING,
+	"stats_auto_recalc":   STATS_AUTO_RECALC,
+	"stats_persistent":    STATS_PERSISTENT,
+	"stats_sample_pages":  STATS_SAMPLE_PAGES,
+	"status":              STATUS,
+	"storage":             STORAGE,
 	"stored":              UNUSED,
 	"straight_join":       STRAIGHT_JOIN,
+	"stream":              STREAM,
+	"vstream":             VSTREAM,
 	"table":               TABLE,
 	"tables":              TABLES,
-	"terminated":          UNUSED,
+	"tablespace":          TABLESPACE,
+	"temptable":           TEMPTABLE,
+	"terminated":          TERMINATED,
 	"text":                TEXT,
 	"than":                THAN,
 	"then":                THEN,
 	"time":                TIME,
 	"timestamp":           TIMESTAMP,
+	"timestampadd":        TIMESTAMPADD,
+	"timestampdiff":       TIMESTAMPDIFF,
 	"tinyblob":            TINYBLOB,
 	"tinyint":             TINYINT,
 	"tinytext":            TINYTEXT,
 	"to":                  TO,
 	"trailing":            UNUSED,
-	"trigger":             UNUSED,
+	"transaction":         TRANSACTION,
+	"tree":                TREE,
+	"traditional":         TRADITIONAL,
+	"trigger":             TRIGGER,
 	"true":                TRUE,
 	"truncate":            TRUNCATE,
+	"uncommitted":         UNCOMMITTED,
+	"undefined":           UNDEFINED,
 	"undo":                UNUSED,
 	"union":               UNION,
 	"unique":              UNIQUE,
-	"unlock":              UNUSED,
+	"unlock":              UNLOCK,
 	"unsigned":            UNSIGNED,
 	"update":              UPDATE,
+	"upgrade":             UPGRADE,
 	"usage":               UNUSED,
 	"use":                 USE,
+	"user_resources":      USER_RESOURCES,
 	"using":               USING,
 	"utc_date":            UTC_DATE,
 	"utc_time":            UTC_TIME,
 	"utc_timestamp":       UTC_TIMESTAMP,
+	"validation":          VALIDATION,
 	"values":              VALUES,
+	"variables":           VARIABLES,
 	"varbinary":           VARBINARY,
 	"varchar":             VARCHAR,
 	"varcharacter":        UNUSED,
 	"varying":             UNUSED,
 	"virtual":             UNUSED,
+	"vindex":              VINDEX,
+	"vindexes":            VINDEXES,
 	"view":                VIEW,
+	"vitess":              VITESS,
 	"vitess_keyspaces":    VITESS_KEYSPACES,
+	"vitess_metadata":     VITESS_METADATA,
 	"vitess_shards":       VITESS_SHARDS,
-	"vschema_tables":      VSCHEMA_TABLES,
+	"vitess_tablets":      VITESS_TABLETS,
+	"vschema":             VSCHEMA,
+	"warnings":            WARNINGS,
 	"when":                WHEN,
 	"where":               WHERE,
 	"while":               UNUSED,
 	"with":                WITH,
-	"write":               UNUSED,
-	"xor":                 UNUSED,
+	"without":             WITHOUT,
+	"work":                WORK,
+	"write":               WRITE,
+	"xor":                 XOR,
 	"year":                YEAR,
 	"year_month":          UNUSED,
 	"zerofill":            ZEROFILL,
@@ -367,13 +508,26 @@ func init() {
 		if id == UNUSED {
 			continue
 		}
-		keywordStrings[id] = str
+		keywordStrings[id] = strings.ToLower(str)
 	}
+}
+
+// KeywordString returns the string corresponding to the given keyword
+func KeywordString(id int) string {
+	str, ok := keywordStrings[id]
+	if !ok {
+		return ""
+	}
+	return str
 }
 
 // Lex returns the next token form the Tokenizer.
 // This function is used by go yacc.
 func (tkn *Tokenizer) Lex(lval *yySymType) int {
+	if tkn.SkipToEnd {
+		return tkn.skipStatement()
+	}
+
 	typ, val := tkn.Scan()
 	for typ == COMMENT {
 		if tkn.AllowComments {
@@ -381,41 +535,81 @@ func (tkn *Tokenizer) Lex(lval *yySymType) int {
 		}
 		typ, val = tkn.Scan()
 	}
+	if typ == 0 || typ == ';' || typ == LEX_ERROR {
+		// If encounter end of statement or invalid token,
+		// we should not accept partially parsed DDLs. They
+		// should instead result in parser errors. See the
+		// Parse function to see how this is handled.
+		tkn.partialDDL = nil
+	}
 	lval.bytes = val
 	tkn.lastToken = val
 	return typ
 }
 
+// PositionedErr holds context related to parser errors
+type PositionedErr struct {
+	Err  string
+	Pos  int
+	Near []byte
+}
+
+func (p PositionedErr) Error() string {
+	if p.Near != nil {
+		return fmt.Sprintf("%s at position %v near '%s'", p.Err, p.Pos, p.Near)
+	}
+	return fmt.Sprintf("%s at position %v", p.Err, p.Pos)
+}
+
 // Error is called by go yacc if there's a parsing error.
 func (tkn *Tokenizer) Error(err string) {
-	buf := &bytes2.Buffer{}
-	if tkn.lastToken != nil {
-		fmt.Fprintf(buf, "%s at position %v near '%s'", err, tkn.Position, tkn.lastToken)
-	} else {
-		fmt.Fprintf(buf, "%s at position %v", err, tkn.Position)
-	}
-	tkn.LastError = errors.New(buf.String())
+	tkn.LastError = PositionedErr{Err: err, Pos: tkn.Position, Near: tkn.lastToken}
 
 	// Try and re-sync to the next statement
-	if tkn.lastChar != ';' {
-		tkn.skipStatement()
-	}
+	tkn.skipStatement()
 }
 
 // Scan scans the tokenizer for the next token and returns
 // the token type and an optional value.
 func (tkn *Tokenizer) Scan() (int, []byte) {
+	if tkn.specialComment != nil {
+		// Enter specialComment scan mode.
+		// for scanning such kind of comment: /*! MySQL-specific code */
+		specialComment := tkn.specialComment
+		tok, val := specialComment.Scan()
+		if tok != 0 {
+			// return the specialComment scan result as the result
+			return tok, val
+		}
+		// leave specialComment scan mode after all stream consumed.
+		tkn.specialComment = nil
+	}
 	if tkn.lastChar == 0 {
 		tkn.next()
 	}
 
-	if tkn.ForceEOF {
-		tkn.skipStatement()
-		return 0, nil
-	}
-
 	tkn.skipBlank()
 	switch ch := tkn.lastChar; {
+	case ch == '@':
+		tokenID := AT_ID
+		tkn.next()
+		if tkn.lastChar == '@' {
+			tokenID = AT_AT_ID
+			tkn.next()
+		}
+		var tID int
+		var tBytes []byte
+		ch = tkn.lastChar
+		tkn.next()
+		if ch == '`' {
+			tID, tBytes = tkn.scanLiteralIdentifier()
+		} else {
+			tID, tBytes = tkn.scanIdentifier(byte(ch), true)
+		}
+		if tID == LEX_ERROR {
+			return tID, nil
+		}
+		return tokenID, tBytes
 	case isLetter(ch):
 		tkn.next()
 		if ch == 'X' || ch == 'x' {
@@ -430,19 +624,26 @@ func (tkn *Tokenizer) Scan() (int, []byte) {
 				return tkn.scanBitLiteral()
 			}
 		}
-		return tkn.scanIdentifier(byte(ch))
+		return tkn.scanIdentifier(byte(ch), false)
 	case isDigit(ch):
 		return tkn.scanNumber(false)
 	case ch == ':':
 		return tkn.scanBindVar()
-	case ch == ';' && tkn.multi:
+	case ch == ';':
+		if tkn.multi {
+			// In multi mode, ';' is treated as EOF. So, we don't advance.
+			// Repeated calls to Scan will keep returning 0 until ParseNext
+			// forces the advance.
+			return 0, nil
+		}
+		tkn.next()
+		return ';', nil
+	case ch == eofChar:
 		return 0, nil
 	default:
 		tkn.next()
 		switch ch {
-		case eofChar:
-			return 0, nil
-		case '=', ',', ';', '(', ')', '+', '*', '%', '^', '~':
+		case '=', ',', '(', ')', '+', '*', '%', '^', '~':
 			return int(ch), nil
 		case '&':
 			if tkn.lastChar == '&' {
@@ -473,6 +674,9 @@ func (tkn *Tokenizer) Scan() (int, []byte) {
 				return tkn.scanCommentType1("//")
 			case '*':
 				tkn.next()
+				if tkn.lastChar == '!' && !tkn.SkipSpecialComments {
+					return tkn.scanMySQLSpecificComment()
+				}
 				return tkn.scanCommentType2()
 			default:
 				return int(ch), nil
@@ -540,12 +744,14 @@ func (tkn *Tokenizer) Scan() (int, []byte) {
 	}
 }
 
-// skipStatement scans until the EOF, or end of statement is encountered.
-func (tkn *Tokenizer) skipStatement() {
-	ch := tkn.lastChar
-	for ch != ';' && ch != eofChar {
-		tkn.next()
-		ch = tkn.lastChar
+// skipStatement scans until end of statement.
+func (tkn *Tokenizer) skipStatement() int {
+	tkn.SkipToEnd = false
+	for {
+		typ, _ := tkn.Scan()
+		if typ == 0 || typ == ';' || typ == LEX_ERROR {
+			return typ
+		}
 	}
 }
 
@@ -557,17 +763,23 @@ func (tkn *Tokenizer) skipBlank() {
 	}
 }
 
-func (tkn *Tokenizer) scanIdentifier(firstByte byte) (int, []byte) {
+func (tkn *Tokenizer) scanIdentifier(firstByte byte, isVariable bool) (int, []byte) {
 	buffer := &bytes2.Buffer{}
 	buffer.WriteByte(firstByte)
-	for isLetter(tkn.lastChar) || isDigit(tkn.lastChar) {
+	for isLetter(tkn.lastChar) ||
+		isDigit(tkn.lastChar) ||
+		tkn.lastChar == '@' ||
+		(isVariable && isCarat(tkn.lastChar)) {
+		if tkn.lastChar == '@' {
+			isVariable = true
+		}
 		buffer.WriteByte(byte(tkn.lastChar))
 		tkn.next()
 	}
 	lowered := bytes.ToLower(buffer.Bytes())
 	loweredStr := string(lowered)
 	if keywordID, found := keywords[loweredStr]; found {
-		return keywordID, lowered
+		return keywordID, buffer.Bytes()
 	}
 	// dual must always be case-insensitive
 	if loweredStr == "dual" {
@@ -796,6 +1008,29 @@ func (tkn *Tokenizer) scanCommentType2() (int, []byte) {
 	return COMMENT, buffer.Bytes()
 }
 
+func (tkn *Tokenizer) scanMySQLSpecificComment() (int, []byte) {
+	buffer := &bytes2.Buffer{}
+	buffer.WriteString("/*!")
+	tkn.next()
+	for {
+		if tkn.lastChar == '*' {
+			tkn.consumeNext(buffer)
+			if tkn.lastChar == '/' {
+				tkn.consumeNext(buffer)
+				break
+			}
+			continue
+		}
+		if tkn.lastChar == eofChar {
+			return LEX_ERROR, buffer.Bytes()
+		}
+		tkn.consumeNext(buffer)
+	}
+	_, sql := ExtractMysqlComment(buffer.String())
+	tkn.specialComment = NewStringTokenizer(sql)
+	return tkn.Scan()
+}
+
 func (tkn *Tokenizer) consumeNext(buffer *bytes2.Buffer) {
 	if tkn.lastChar == eofChar {
 		// This should never happen.
@@ -831,13 +1066,18 @@ func (tkn *Tokenizer) next() {
 func (tkn *Tokenizer) reset() {
 	tkn.ParseTree = nil
 	tkn.partialDDL = nil
+	tkn.specialComment = nil
 	tkn.posVarIndex = 0
 	tkn.nesting = 0
-	tkn.ForceEOF = false
+	tkn.SkipToEnd = false
 }
 
 func isLetter(ch uint16) bool {
-	return 'a' <= ch && ch <= 'z' || 'A' <= ch && ch <= 'Z' || ch == '_' || ch == '@'
+	return 'a' <= ch && ch <= 'z' || 'A' <= ch && ch <= 'Z' || ch == '_' || ch == '$'
+}
+
+func isCarat(ch uint16) bool {
+	return ch == '.' || ch == '\'' || ch == '"' || ch == '`'
 }
 
 func digitVal(ch uint16) int {

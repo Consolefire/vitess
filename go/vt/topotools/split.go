@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,66 @@ limitations under the License.
 package topotools
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
-	"github.com/youtube/vitess/go/vt/key"
-	"github.com/youtube/vitess/go/vt/topo"
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/vt/key"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo"
 )
+
+// ValidateForReshard returns an error if sourceShards cannot reshard into
+// targetShards.
+func ValidateForReshard(sourceShards, targetShards []*topo.ShardInfo) error {
+	for _, source := range sourceShards {
+		for _, target := range targetShards {
+			if key.KeyRangeEqual(source.KeyRange, target.KeyRange) {
+				return fmt.Errorf("same keyrange is present in source and target: %v", key.KeyRangeString(source.KeyRange))
+			}
+		}
+	}
+	sourcekr, err := combineKeyRanges(sourceShards)
+	if err != nil {
+		return err
+	}
+	targetkr, err := combineKeyRanges(targetShards)
+	if err != nil {
+		return err
+	}
+	if !key.KeyRangeEqual(sourcekr, targetkr) {
+		return fmt.Errorf("source and target keyranges don't match: %v vs %v", key.KeyRangeString(sourcekr), key.KeyRangeString(targetkr))
+	}
+	return nil
+}
+
+func combineKeyRanges(shards []*topo.ShardInfo) (*topodatapb.KeyRange, error) {
+	if len(shards) == 0 {
+		return nil, fmt.Errorf("there are no shards to combine")
+	}
+	result := shards[0].KeyRange
+	krmap := make(map[string]*topodatapb.KeyRange)
+	for _, si := range shards[1:] {
+		krmap[si.ShardName()] = si.KeyRange
+	}
+	for len(krmap) != 0 {
+		foundOne := false
+		for k, kr := range krmap {
+			newkr, ok := key.KeyRangeAdd(result, kr)
+			if ok {
+				foundOne = true
+				result = newkr
+				delete(krmap, k)
+			}
+		}
+		if !foundOne {
+			return nil, errors.New("shards don't form a contiguous keyrange")
+		}
+	}
+	return result, nil
+}
 
 // OverlappingShards contains sets of shards that overlap which each-other.
 // With this library, there is no guarantee of which set will be left or right.
@@ -65,7 +118,7 @@ func OverlappingShardsForShard(os []*OverlappingShards, shardName string) *Overl
 // having 40-80, 40-60 and 40-50 in the same keyspace is not supported and
 // will return an error).
 // If shards don't perfectly overlap, they are not returned.
-func FindOverlappingShards(ctx context.Context, ts topo.Server, keyspace string) ([]*OverlappingShards, error) {
+func FindOverlappingShards(ctx context.Context, ts *topo.Server, keyspace string) ([]*OverlappingShards, error) {
 	shardMap, err := ts.FindAllShardsInKeyspace(ctx, keyspace)
 	if err != nil {
 		return nil, err
@@ -101,7 +154,7 @@ func findOverlappingShards(shardMap map[string]*topo.ShardInfo) ([]*OverlappingS
 			si := findIntersectingShard(shardMap, left)
 			if si != nil {
 				if intersect(si, right) {
-					return nil, fmt.Errorf("Shard %v intersects with more than one shard, this is not supported", si.ShardName())
+					return nil, fmt.Errorf("shard %v intersects with more than one shard, this is not supported", si.ShardName())
 				}
 				foundOne = true
 				right = append(right, si)
@@ -111,7 +164,7 @@ func findOverlappingShards(shardMap map[string]*topo.ShardInfo) ([]*OverlappingS
 			si = findIntersectingShard(shardMap, right)
 			if si != nil {
 				if intersect(si, left) {
-					return nil, fmt.Errorf("Shard %v intersects with more than one shard, this is not supported", si.ShardName())
+					return nil, fmt.Errorf("shard %v intersects with more than one shard, this is not supported", si.ShardName())
 				}
 				foundOne = true
 				left = append(left, si)

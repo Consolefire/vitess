@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -25,12 +25,13 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/netutil"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	"github.com/youtube/vitess/go/vt/vttls"
-	"gopkg.in/ldap.v2"
+	ldap "gopkg.in/ldap.v2"
+
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/vt/log"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/vttls"
 )
 
 var (
@@ -48,7 +49,7 @@ type AuthServerLdap struct {
 	Password       string
 	GroupQuery     string
 	UserDnPattern  string
-	RefreshSeconds time.Duration
+	RefreshSeconds int64
 }
 
 // Init is public so it can be called from plugin_auth_ldap.go (go/cmd/vtgate)
@@ -62,7 +63,7 @@ func Init() {
 		return
 	}
 	if *ldapAuthMethod != mysql.MysqlClearPassword && *ldapAuthMethod != mysql.MysqlDialog {
-		log.Fatalf("Invalid mysql_ldap_auth_method value: only support mysql_clear_password or dialog")
+		log.Exitf("Invalid mysql_ldap_auth_method value: only support mysql_clear_password or dialog")
 	}
 	ldapAuthServer := &AuthServerLdap{
 		Client:       &ClientImpl{},
@@ -75,11 +76,11 @@ func Init() {
 		var err error
 		data, err = ioutil.ReadFile(*ldapAuthConfigFile)
 		if err != nil {
-			log.Fatalf("Failed to read mysql_ldap_auth_config_file: %v", err)
+			log.Exitf("Failed to read mysql_ldap_auth_config_file: %v", err)
 		}
 	}
 	if err := json.Unmarshal(data, ldapAuthServer); err != nil {
-		log.Fatalf("Error parsing AuthServerLdap config: %v", err)
+		log.Exitf("Error parsing AuthServerLdap config: %v", err)
 	}
 	mysql.RegisterAuthServerImpl("ldap", ldapAuthServer)
 }
@@ -189,7 +190,7 @@ func (lud *LdapUserData) update() {
 
 // Get returns wrapped username and LDAP groups and possibly updates the cache
 func (lud *LdapUserData) Get() *querypb.VTGateCallerID {
-	if time.Since(lud.lastUpdated) > lud.asl.RefreshSeconds*time.Second {
+	if int64(time.Since(lud.lastUpdated).Seconds()) > lud.asl.RefreshSeconds {
 		go lud.update()
 	}
 	return &querypb.VTGateCallerID{Username: lud.username, Groups: lud.groups}
@@ -221,6 +222,9 @@ type ClientImpl struct {
 // This must be called before any other methods
 func (lci *ClientImpl) Connect(network string, config *ServerConfig) error {
 	conn, err := ldap.Dial(network, config.LdapServer)
+	if err != nil {
+		return err
+	}
 	lci.Conn = conn
 	// Reconnect with TLS ... why don't we simply DialTLS directly?
 	serverName, _, err := netutil.SplitHostPort(config.LdapServer)

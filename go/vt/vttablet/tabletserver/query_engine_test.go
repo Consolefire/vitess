@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,40 +25,43 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/mysql/fakesqldb"
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/dbconfigs"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/planbuilder"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/schema"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/schema/schematest"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/streamlog"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/tableacl"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema/schematest"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
-func TestStrictTransTables(t *testing.T) {
+func TestStrictMode(t *testing.T) {
 	db := fakesqldb.New(t)
 	defer db.Close()
 	for query, result := range schematest.Queries() {
 		db.AddQuery(query, result)
 	}
-	testUtils := newTestUtils()
-	dbcfgs := testUtils.newDBConfigs(db)
 
 	// Test default behavior.
-	config := tabletenv.DefaultQsConfig
-	// config.EnforceStrictTransTable is true by default.
-	qe := NewQueryEngine(DummyChecker, schema.NewEngine(DummyChecker, config), config)
-	qe.InitDBConfig(dbcfgs)
+	config := tabletenv.NewDefaultConfig()
+	config.DB = newDBConfigs(db)
+	env := tabletenv.NewEnv(config, "TabletServerTest")
+	se := schema.NewEngine(env)
+	qe := NewQueryEngine(env, se)
+	qe.se.InitDBConfig(newDBConfigs(db).DbaWithDB())
 	qe.se.Open()
 	if err := qe.Open(); err != nil {
 		t.Error(err)
 	}
 	qe.Close()
 
-	// Check that we fail if STRICT_TRANS_TABLES is not set.
+	// Check that we fail if STRICT_TRANS_TABLES or STRICT_ALL_TABLES is not set.
 	db.AddQuery(
 		"select @@global.sql_mode",
 		&sqltypes.Result{
@@ -66,10 +69,9 @@ func TestStrictTransTables(t *testing.T) {
 			Rows:   [][]sqltypes.Value{{sqltypes.NewVarBinary("")}},
 		},
 	)
-	qe = NewQueryEngine(DummyChecker, schema.NewEngine(DummyChecker, config), config)
-	qe.InitDBConfig(dbcfgs)
+	qe = NewQueryEngine(env, se)
 	err := qe.Open()
-	wantErr := "require sql_mode to be STRICT_TRANS_TABLES: got ''"
+	wantErr := "require sql_mode to be STRICT_TRANS_TABLES or STRICT_ALL_TABLES: got ''"
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("Open: %v, want %s", err, wantErr)
 	}
@@ -77,8 +79,7 @@ func TestStrictTransTables(t *testing.T) {
 
 	// Test that we succeed if the enforcement flag is off.
 	config.EnforceStrictTransTables = false
-	qe = NewQueryEngine(DummyChecker, schema.NewEngine(DummyChecker, config), config)
-	qe.InitDBConfig(dbcfgs)
+	qe = NewQueryEngine(env, se)
 	if err := qe.Open(); err != nil {
 		t.Fatal(err)
 	}
@@ -91,17 +92,15 @@ func TestGetPlanPanicDuetoEmptyQuery(t *testing.T) {
 	for query, result := range schematest.Queries() {
 		db.AddQuery(query, result)
 	}
-	testUtils := newTestUtils()
-	dbcfgs := testUtils.newDBConfigs(db)
-	qe := newTestQueryEngine(10, 10*time.Second, true, dbcfgs)
+	qe := newTestQueryEngine(10, 10*time.Second, true, newDBConfigs(db))
 	qe.se.Open()
 	qe.Open()
 	defer qe.Close()
 
 	ctx := context.Background()
 	logStats := tabletenv.NewLogStats(ctx, "GetPlanStats")
-	_, err := qe.GetPlan(ctx, logStats, "", false)
-	want := "syntax error"
+	_, err := qe.GetPlan(ctx, logStats, "", false, false /* inReservedConn */)
+	want := "empty statement"
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("qe.GetPlan: %v, want %s", err, want)
 	}
@@ -113,9 +112,7 @@ func TestGetMessageStreamPlan(t *testing.T) {
 	for query, result := range schematest.Queries() {
 		db.AddQuery(query, result)
 	}
-	testUtils := newTestUtils()
-	dbcfgs := testUtils.newDBConfigs(db)
-	qe := newTestQueryEngine(10, 10*time.Second, true, dbcfgs)
+	qe := newTestQueryEngine(10, 10*time.Second, true, newDBConfigs(db))
 	qe.se.Open()
 	qe.Open()
 	defer qe.Close()
@@ -127,6 +124,10 @@ func TestGetMessageStreamPlan(t *testing.T) {
 	wantPlan := &planbuilder.Plan{
 		PlanID: planbuilder.PlanMessageStream,
 		Table:  qe.tables["msg"],
+		Permissions: []planbuilder.Permission{{
+			TableName: "msg",
+			Role:      tableacl.WRITER,
+		}},
 	}
 	if !reflect.DeepEqual(plan.Plan, wantPlan) {
 		t.Errorf("GetMessageStreamPlan(msg): %v, want %v", plan.Plan, wantPlan)
@@ -148,9 +149,7 @@ func TestQueryPlanCache(t *testing.T) {
 	db.AddQuery("select * from test_table_01 where 1 != 1", &sqltypes.Result{})
 	db.AddQuery("select * from test_table_02 where 1 != 1", &sqltypes.Result{})
 
-	testUtils := newTestUtils()
-	dbcfgs := testUtils.newDBConfigs(db)
-	qe := newTestQueryEngine(10, 10*time.Second, true, dbcfgs)
+	qe := newTestQueryEngine(10, 10*time.Second, true, newDBConfigs(db))
 	qe.se.Open()
 	qe.Open()
 	defer qe.Close()
@@ -158,14 +157,14 @@ func TestQueryPlanCache(t *testing.T) {
 	ctx := context.Background()
 	logStats := tabletenv.NewLogStats(ctx, "GetPlanStats")
 	qe.SetQueryPlanCacheCap(1)
-	firstPlan, err := qe.GetPlan(ctx, logStats, firstQuery, false)
+	firstPlan, err := qe.GetPlan(ctx, logStats, firstQuery, false, false /* inReservedConn */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if firstPlan == nil {
 		t.Fatalf("plan should not be nil")
 	}
-	secondPlan, err := qe.GetPlan(ctx, logStats, secondQuery, false)
+	secondPlan, err := qe.GetPlan(ctx, logStats, secondQuery, false, false /* inReservedConn */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,9 +191,7 @@ func TestNoQueryPlanCache(t *testing.T) {
 	db.AddQuery("select * from test_table_01 where 1 != 1", &sqltypes.Result{})
 	db.AddQuery("select * from test_table_02 where 1 != 1", &sqltypes.Result{})
 
-	testUtils := newTestUtils()
-	dbcfgs := testUtils.newDBConfigs(db)
-	qe := newTestQueryEngine(10, 10*time.Second, true, dbcfgs)
+	qe := newTestQueryEngine(10, 10*time.Second, true, newDBConfigs(db))
 	qe.se.Open()
 	qe.Open()
 	defer qe.Close()
@@ -202,7 +199,39 @@ func TestNoQueryPlanCache(t *testing.T) {
 	ctx := context.Background()
 	logStats := tabletenv.NewLogStats(ctx, "GetPlanStats")
 	qe.SetQueryPlanCacheCap(1)
-	firstPlan, err := qe.GetPlan(ctx, logStats, firstQuery, true)
+	firstPlan, err := qe.GetPlan(ctx, logStats, firstQuery, true, false /* inReservedConn */)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstPlan == nil {
+		t.Fatalf("plan should not be nil")
+	}
+	if qe.plans.Size() != 0 {
+		t.Fatalf("query plan cache should be 0")
+	}
+	qe.ClearQueryPlanCache()
+}
+
+func TestNoQueryPlanCacheDirective(t *testing.T) {
+	db := fakesqldb.New(t)
+	defer db.Close()
+	for query, result := range schematest.Queries() {
+		db.AddQuery(query, result)
+	}
+
+	firstQuery := "select /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ * from test_table_01"
+	db.AddQuery("select /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ * from test_table_01 where 1 != 1", &sqltypes.Result{})
+	db.AddQuery("select /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ * from test_table_02 where 1 != 1", &sqltypes.Result{})
+
+	qe := newTestQueryEngine(10, 10*time.Second, true, newDBConfigs(db))
+	qe.se.Open()
+	qe.Open()
+	defer qe.Close()
+
+	ctx := context.Background()
+	logStats := tabletenv.NewLogStats(ctx, "GetPlanStats")
+	qe.SetQueryPlanCacheCap(1)
+	firstPlan, err := qe.GetPlan(ctx, logStats, firstQuery, false, false /* inReservedConn */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,41 +252,97 @@ func TestStatsURL(t *testing.T) {
 	}
 	query := "select * from test_table_01"
 	db.AddQuery("select * from test_table_01 where 1 != 1", &sqltypes.Result{})
-	testUtils := newTestUtils()
-	dbcfgs := testUtils.newDBConfigs(db)
-	qe := newTestQueryEngine(10, 1*time.Second, true, dbcfgs)
+	qe := newTestQueryEngine(10, 1*time.Second, true, newDBConfigs(db))
 	qe.se.Open()
 	qe.Open()
 	defer qe.Close()
 	// warm up cache
 	ctx := context.Background()
 	logStats := tabletenv.NewLogStats(ctx, "GetPlanStats")
-	qe.GetPlan(ctx, logStats, query, false)
+	qe.GetPlan(ctx, logStats, query, false, false /* inReservedConn */)
 
 	request, _ := http.NewRequest("GET", "/debug/tablet_plans", nil)
 	response := httptest.NewRecorder()
-	qe.ServeHTTP(response, request)
+	qe.handleHTTPQueryPlans(response, request)
 
 	request, _ = http.NewRequest("GET", "/debug/query_stats", nil)
 	response = httptest.NewRecorder()
-	qe.ServeHTTP(response, request)
+	qe.handleHTTPQueryStats(response, request)
 
 	request, _ = http.NewRequest("GET", "/debug/query_rules", nil)
 	response = httptest.NewRecorder()
-	qe.ServeHTTP(response, request)
-
-	request, _ = http.NewRequest("GET", "/debug/unknown", nil)
-	response = httptest.NewRecorder()
-	qe.ServeHTTP(response, request)
+	qe.handleHTTPQueryRules(response, request)
 }
 
-func newTestQueryEngine(queryPlanCacheSize int, idleTimeout time.Duration, strict bool, dbcfgs dbconfigs.DBConfigs) *QueryEngine {
-	config := tabletenv.DefaultQsConfig
-	config.QueryPlanCacheSize = queryPlanCacheSize
-	config.IdleTimeout = float64(idleTimeout) / 1e9
-	se := schema.NewEngine(DummyChecker, config)
-	qe := NewQueryEngine(DummyChecker, se, config)
-	se.InitDBConfig(dbcfgs)
-	qe.InitDBConfig(dbcfgs)
+func newTestQueryEngine(queryCacheSize int, idleTimeout time.Duration, strict bool, dbcfgs *dbconfigs.DBConfigs) *QueryEngine {
+	config := tabletenv.NewDefaultConfig()
+	config.DB = dbcfgs
+	config.QueryCacheSize = queryCacheSize
+	config.OltpReadPool.IdleTimeoutSeconds.Set(idleTimeout)
+	config.OlapReadPool.IdleTimeoutSeconds.Set(idleTimeout)
+	config.TxPool.IdleTimeoutSeconds.Set(idleTimeout)
+	env := tabletenv.NewEnv(config, "TabletServerTest")
+	se := schema.NewEngine(env)
+	qe := NewQueryEngine(env, se)
+	se.InitDBConfig(dbcfgs.DbaWithDB())
 	return qe
+}
+
+func runConsolidatedQuery(t *testing.T, sql string) *QueryEngine {
+	db := fakesqldb.New(t)
+	defer db.Close()
+
+	qe := newTestQueryEngine(10, 1*time.Second, true, newDBConfigs(db))
+	qe.se.Open()
+	qe.Open()
+	defer qe.Close()
+
+	r1, ok := qe.consolidator.Create(sql)
+	if !ok {
+		t.Errorf("expected first consolidator ok")
+	}
+	r2, ok := qe.consolidator.Create(sql)
+	if ok {
+		t.Errorf("expected second consolidator not ok")
+	}
+
+	r1.Broadcast()
+	r2.Wait()
+
+	return qe
+}
+
+func TestConsolidationsUIRedaction(t *testing.T) {
+	// Reset to default redaction state.
+	defer func() {
+		*streamlog.RedactDebugUIQueries = false
+	}()
+
+	request, _ := http.NewRequest("GET", "/debug/consolidations", nil)
+
+	sql := "select * from test_db_01 where col = 'secret'"
+	redactedSQL := "select * from test_db_01 where col = :redacted1"
+
+	// First with the redaction off
+	*streamlog.RedactDebugUIQueries = false
+	unRedactedResponse := httptest.NewRecorder()
+	qe := runConsolidatedQuery(t, sql)
+
+	qe.handleHTTPConsolidations(unRedactedResponse, request)
+	if !strings.Contains(unRedactedResponse.Body.String(), sql) {
+		t.Fatalf("Response is missing the consolidated query: %v %v", sql, unRedactedResponse.Body.String())
+	}
+
+	// Now with the redaction on
+	*streamlog.RedactDebugUIQueries = true
+	redactedResponse := httptest.NewRecorder()
+	qe.handleHTTPConsolidations(redactedResponse, request)
+
+	if strings.Contains(redactedResponse.Body.String(), "secret") {
+		t.Fatalf("Response contains unredacted consolidated query: %v %v", sql, redactedResponse.Body.String())
+	}
+
+	if !strings.Contains(redactedResponse.Body.String(), redactedSQL) {
+		t.Fatalf("Response missing redacted consolidated query: %v %v", redactedSQL, redactedResponse.Body.String())
+	}
 }

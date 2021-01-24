@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,14 +22,28 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 var (
-	// ErrNotSlave means there is no slave status.
-	// Returned by ShowSlaveStatus().
-	ErrNotSlave = errors.New("no slave status")
+	// ErrNotReplica means there is no replication status.
+	// Returned by ShowReplicationStatus().
+	ErrNotReplica = errors.New("no replication status")
+
+	// ErrNoMasterStatus means no status was returned by ShowMasterStatus().
+	ErrNoMasterStatus = errors.New("no master status")
+)
+
+const (
+	// mariaDBReplicationHackPrefix is the prefix of a version for MariaDB 10.0
+	// versions, to work around replication bugs.
+	mariaDBReplicationHackPrefix = "5.5.5-"
+	// mariaDBVersionString is present in
+	mariaDBVersionString = "MariaDB"
 )
 
 // flavor is the abstract interface for a flavor.
@@ -42,36 +56,54 @@ type flavor interface {
 	// masterGTIDSet returns the current GTIDSet of a server.
 	masterGTIDSet(c *Conn) (GTIDSet, error)
 
+	// startReplicationCommand returns the command to start the replication.
+	startReplicationCommand() string
+
+	// restartReplicationCommands returns the commands to stop, reset and start the replication.
+	restartReplicationCommands() []string
+
+	// startReplicationUntilAfter will restart replication, but only allow it
+	// to run until `pos` is reached. After reaching pos, replication will be stopped again
+	startReplicationUntilAfter(pos Position) string
+
+	// stopReplicationCommand returns the command to stop the replication.
+	stopReplicationCommand() string
+
+	// stopIOThreadCommand returns the command to stop the replica's io thread only.
+	stopIOThreadCommand() string
+
 	// sendBinlogDumpCommand sends the packet required to start
 	// dumping binlogs from the specified location.
-	sendBinlogDumpCommand(c *Conn, slaveID uint32, startPos Position) error
+	sendBinlogDumpCommand(c *Conn, serverID uint32, startPos Position) error
+
+	// readBinlogEvent reads the next BinlogEvent from the connection.
+	readBinlogEvent(c *Conn) (BinlogEvent, error)
 
 	// resetReplicationCommands returns the commands to completely reset
 	// replication on the host.
-	resetReplicationCommands() []string
+	resetReplicationCommands(c *Conn) []string
 
-	// setSlavePositionCommands returns the commands to set the
-	// replication position at which the slave will resume.
-	setSlavePositionCommands(pos Position) []string
+	// setReplicationPositionCommands returns the commands to set the
+	// replication position at which the replica will resume.
+	setReplicationPositionCommands(pos Position) []string
 
 	// changeMasterArg returns the specific parameter to add to
 	// a change master command.
 	changeMasterArg() string
 
-	// status returns the result of 'SHOW SLAVE STATUS',
+	// status returns the result of the appropriate status command,
 	// with parsed replication position.
-	status(c *Conn) (SlaveStatus, error)
+	status(c *Conn) (ReplicationStatus, error)
+
+	// masterStatus returns the result of 'SHOW MASTER STATUS',
+	// with parsed executed position.
+	masterStatus(c *Conn) (MasterStatus, error)
 
 	// waitUntilPositionCommand returns the SQL command to issue
 	// to wait until the given position, until the context
 	// expires.  The command returns -1 if it times out. It
 	// returns NULL if GTIDs are not enabled.
 	waitUntilPositionCommand(ctx context.Context, pos Position) (string, error)
-
-	// makeBinlogEvent takes a raw packet from the MySQL binlog
-	// stream connection and returns a BinlogEvent through which
-	// the packet can be examined.
-	makeBinlogEvent(buf []byte) BinlogEvent
 
 	// enableBinlogPlaybackCommand and disableBinlogPlaybackCommand return an
 	// optional command to run to enable or disable binlog
@@ -81,14 +113,14 @@ type flavor interface {
 	disableBinlogPlaybackCommand() string
 }
 
-// mariaDBReplicationHackPrefix is the prefix of a version for MariaDB 10.0
-// versions, to work around replication bugs.
-const mariaDBReplicationHackPrefix = "5.5.5-"
+// flavors maps flavor names to their implementation.
+// Flavors need to register only if they support being specified in the
+// connection parameters.
+var flavors = make(map[string]func() flavor)
 
-// mariaDBVersionString is present in
-const mariaDBVersionString = "MariaDB"
-
-// fillFlavor fills in c.Flavor based on c.ServerVersion.
+// fillFlavor fills in c.Flavor. If the params specify the flavor,
+// that is used. Otherwise, we auto-detect.
+//
 // This is the same logic as the ConnectorJ java client. We try to recognize
 // MariaDB as much as we can, but default to MySQL.
 //
@@ -98,14 +130,19 @@ const mariaDBVersionString = "MariaDB"
 // Note on such servers, 'select version()' would return 10.0.21-MariaDB-...
 // as well (not matching what c.ServerVersion is, but matching after we remove
 // the prefix).
-func (c *Conn) fillFlavor() {
+func (c *Conn) fillFlavor(params *ConnParams) {
+	if flavorFunc := flavors[params.Flavor]; flavorFunc != nil {
+		c.flavor = flavorFunc()
+		return
+	}
+
 	if strings.HasPrefix(c.ServerVersion, mariaDBReplicationHackPrefix) {
 		c.ServerVersion = c.ServerVersion[len(mariaDBReplicationHackPrefix):]
 		c.flavor = mariadbFlavor{}
 		return
 	}
 
-	if strings.Index(c.ServerVersion, mariaDBVersionString) != -1 {
+	if strings.Contains(c.ServerVersion, mariaDBVersionString) {
 		c.flavor = mariadbFlavor{}
 		return
 	}
@@ -137,24 +174,67 @@ func (c *Conn) MasterPosition() (Position, error) {
 	}, nil
 }
 
+// MasterFilePosition returns the current master's file based replication position.
+func (c *Conn) MasterFilePosition() (Position, error) {
+	filePosFlavor := filePosFlavor{}
+	gtidSet, err := filePosFlavor.masterGTIDSet(c)
+	if err != nil {
+		return Position{}, err
+	}
+	return Position{
+		GTIDSet: gtidSet,
+	}, nil
+}
+
+// StartReplicationCommand returns the command to start the replication.
+func (c *Conn) StartReplicationCommand() string {
+	return c.flavor.startReplicationCommand()
+}
+
+// RestartReplicationCommands returns the commands to stop, reset and start the replication.
+func (c *Conn) RestartReplicationCommands() []string {
+	return c.flavor.restartReplicationCommands()
+}
+
+// StartReplicationUntilAfterCommand returns the command to start the replication.
+func (c *Conn) StartReplicationUntilAfterCommand(pos Position) string {
+	return c.flavor.startReplicationUntilAfter(pos)
+}
+
+// StopReplicationCommand returns the command to stop the replication.
+func (c *Conn) StopReplicationCommand() string {
+	return c.flavor.stopReplicationCommand()
+}
+
+// StopIOThreadCommand returns the command to stop the replica's io thread.
+func (c *Conn) StopIOThreadCommand() string {
+	return c.flavor.stopIOThreadCommand()
+}
+
 // SendBinlogDumpCommand sends the flavor-specific version of
 // the COM_BINLOG_DUMP command to start dumping raw binlog
-// events over a slave connection, starting at a given GTID.
-func (c *Conn) SendBinlogDumpCommand(slaveID uint32, startPos Position) error {
-	return c.flavor.sendBinlogDumpCommand(c, slaveID, startPos)
+// events over a server connection, starting at a given GTID.
+func (c *Conn) SendBinlogDumpCommand(serverID uint32, startPos Position) error {
+	return c.flavor.sendBinlogDumpCommand(c, serverID, startPos)
+}
+
+// ReadBinlogEvent reads the next BinlogEvent. This must be used
+// in conjunction with SendBinlogDumpCommand.
+func (c *Conn) ReadBinlogEvent() (BinlogEvent, error) {
+	return c.flavor.readBinlogEvent(c)
 }
 
 // ResetReplicationCommands returns the commands to completely reset
 // replication on the host.
 func (c *Conn) ResetReplicationCommands() []string {
-	return c.flavor.resetReplicationCommands()
+	return c.flavor.resetReplicationCommands(c)
 }
 
-// SetSlavePositionCommands returns the commands to set the
-// replication position at which the slave will resume
+// SetReplicationPositionCommands returns the commands to set the
+// replication position at which the replica will resume
 // when it is later reparented with SetMasterCommands.
-func (c *Conn) SetSlavePositionCommands(pos Position) []string {
-	return c.flavor.setSlavePositionCommands(pos)
+func (c *Conn) SetReplicationPositionCommands(pos Position) []string {
+	return c.flavor.setReplicationPositionCommands(pos)
 }
 
 // SetMasterCommand returns the command to use the provided master
@@ -188,17 +268,17 @@ func (c *Conn) SetMasterCommand(params *ConnParams, masterHost string, masterPor
 	return "CHANGE MASTER TO\n  " + strings.Join(args, ",\n  ")
 }
 
-// resultToMap is a helper function used by ShowSlaveStatus.
+// resultToMap is a helper function used by ShowReplicationStatus.
 func resultToMap(qr *sqltypes.Result) (map[string]string, error) {
 	if len(qr.Rows) == 0 {
 		// The query succeeded, but there is no data.
 		return nil, nil
 	}
 	if len(qr.Rows) > 1 {
-		return nil, fmt.Errorf("query returned %d rows, expected 1", len(qr.Rows))
+		return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "query returned %d rows, expected 1", len(qr.Rows))
 	}
 	if len(qr.Fields) != len(qr.Rows[0]) {
-		return nil, fmt.Errorf("query returned %d column names, expected %d", len(qr.Fields), len(qr.Rows[0]))
+		return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "query returned %d column names, expected %d", len(qr.Fields), len(qr.Rows[0]))
 	}
 
 	result := make(map[string]string, len(qr.Fields))
@@ -208,12 +288,13 @@ func resultToMap(qr *sqltypes.Result) (map[string]string, error) {
 	return result, nil
 }
 
-// parseSlaveStatus parses the common fields of SHOW SLAVE STATUS.
-func parseSlaveStatus(fields map[string]string) SlaveStatus {
-	status := SlaveStatus{
-		MasterHost:      fields["Master_Host"],
-		SlaveIORunning:  fields["Slave_IO_Running"] == "Yes",
-		SlaveSQLRunning: fields["Slave_SQL_Running"] == "Yes",
+// parseReplicationStatus parses the common (non-flavor-specific) fields of ReplicationStatus
+func parseReplicationStatus(fields map[string]string) ReplicationStatus {
+	status := ReplicationStatus{
+		MasterHost: fields["Master_Host"],
+		// These fields are returned from the underlying DB and cannot be renamed
+		IOThreadRunning:  fields["Slave_IO_Running"] == "Yes" || fields["Slave_IO_Running"] == "Connecting",
+		SQLThreadRunning: fields["Slave_SQL_Running"] == "Yes",
 	}
 	parseInt, _ := strconv.ParseInt(fields["Master_Port"], 10, 0)
 	status.MasterPort = int(parseInt)
@@ -221,13 +302,64 @@ func parseSlaveStatus(fields map[string]string) SlaveStatus {
 	status.MasterConnectRetry = int(parseInt)
 	parseUint, _ := strconv.ParseUint(fields["Seconds_Behind_Master"], 10, 0)
 	status.SecondsBehindMaster = uint(parseUint)
+	parseUint, _ = strconv.ParseUint(fields["Master_Server_Id"], 10, 0)
+	status.MasterServerID = uint(parseUint)
+
+	execMasterLogPosStr := fields["Exec_Master_Log_Pos"]
+	file := fields["Relay_Master_Log_File"]
+	if file != "" && execMasterLogPosStr != "" {
+		filePos, err := strconv.Atoi(execMasterLogPosStr)
+		if err == nil {
+			status.FilePosition.GTIDSet = filePosGTID{
+				file: file,
+				pos:  filePos,
+			}
+		}
+	}
+
+	readMasterLogPosStr := fields["Read_Master_Log_Pos"]
+	file = fields["Master_Log_File"]
+	if file != "" && readMasterLogPosStr != "" {
+		fileRelayPos, err := strconv.Atoi(readMasterLogPosStr)
+		if err == nil {
+			status.FileRelayLogPosition.GTIDSet = filePosGTID{
+				file: file,
+				pos:  fileRelayPos,
+			}
+		}
+	}
 	return status
 }
 
-// ShowSlaveStatus executes the right SHOW SLAVE STATUS command,
-// and returns a parse Position with other fields.
-func (c *Conn) ShowSlaveStatus() (SlaveStatus, error) {
+// ShowReplicationStatus executes the right command to fetch replication status,
+// and returns a parsed Position with other fields.
+func (c *Conn) ShowReplicationStatus() (ReplicationStatus, error) {
 	return c.flavor.status(c)
+}
+
+// parseMasterStatus parses the common fields of SHOW MASTER STATUS.
+func parseMasterStatus(fields map[string]string) MasterStatus {
+	status := MasterStatus{}
+
+	fileExecPosStr := fields["Position"]
+	file := fields["File"]
+	if file != "" && fileExecPosStr != "" {
+		filePos, err := strconv.Atoi(fileExecPosStr)
+		if err == nil {
+			status.FilePosition.GTIDSet = filePosGTID{
+				file: file,
+				pos:  filePos,
+			}
+		}
+	}
+
+	return status
+}
+
+// ShowMasterStatus executes the right SHOW MASTER STATUS command,
+// and returns a parsed executed Position, as well as file based Position.
+func (c *Conn) ShowMasterStatus() (MasterStatus, error) {
+	return c.flavor.masterStatus(c)
 }
 
 // WaitUntilPositionCommand returns the SQL command to issue
@@ -238,11 +370,13 @@ func (c *Conn) WaitUntilPositionCommand(ctx context.Context, pos Position) (stri
 	return c.flavor.waitUntilPositionCommand(ctx, pos)
 }
 
-// MakeBinlogEvent takes a raw packet from the MySQL binlog
-// stream connection and returns a BinlogEvent through which
-// the packet can be examined.
-func (c *Conn) MakeBinlogEvent(buf []byte) BinlogEvent {
-	return c.flavor.makeBinlogEvent(buf)
+// WaitUntilFilePositionCommand returns the SQL command to issue
+// to wait until the given position, until the context
+// expires for the file position flavor.  The command returns -1 if it times out. It
+// returns NULL if GTIDs are not enabled.
+func (c *Conn) WaitUntilFilePositionCommand(ctx context.Context, pos Position) (string, error) {
+	filePosFlavor := filePosFlavor{}
+	return filePosFlavor.waitUntilPositionCommand(ctx, pos)
 }
 
 // EnableBinlogPlaybackCommand returns a command to run to enable

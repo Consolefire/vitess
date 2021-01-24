@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package stats is a wrapper for expvar. It addtionally
+// Package stats is a wrapper for expvar. It additionally
 // exports new types that can be used to track performance.
 // It also provides a callback hook that allows a program
 // to export the variables using methods other than /debug/vars.
@@ -33,16 +33,21 @@ import (
 	"flag"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/sync2"
+	"vitess.io/vitess/go/vt/log"
 )
 
-var emitStats = flag.Bool("emit_stats", false, "true iff we should emit stats to push-based monitoring/stats backends")
+var emitStats = flag.Bool("emit_stats", false, "If set, emit stats to push-based monitoring and stats backends")
 var statsEmitPeriod = flag.Duration("stats_emit_period", time.Duration(60*time.Second), "Interval between emitting stats to all registered backends")
-var statsBackend = flag.String("stats_backend", "influxdb", "The name of the registered push-based monitoring/stats backend to use")
+var statsBackend = flag.String("stats_backend", "", "The name of the registered push-based monitoring/stats backend to use")
+var combineDimensions = flag.String("stats_combine_dimensions", "", `List of dimensions to be combined into a single "all" value in exported stats vars`)
+var dropVariables = flag.String("stats_drop_variables", "", `Variables to be dropped from the list of exported variables.`)
+
+// StatsAllStr is the consolidated name if a dimension gets combined.
+const StatsAllStr = "all"
 
 // NewVarHook is the type of a hook to export variables in a different way
 type NewVarHook func(name string, v expvar.Var)
@@ -72,8 +77,12 @@ func (vg *varGroup) register(nvh NewVarHook) {
 }
 
 func (vg *varGroup) publish(name string, v expvar.Var) {
+	if isVarDropped(name) {
+		return
+	}
 	vg.Lock()
 	defer vg.Unlock()
+
 	expvar.Publish(name, v)
 	if vg.newVarHook != nil {
 		vg.newVarHook(name, v)
@@ -110,11 +119,14 @@ type PushBackend interface {
 }
 
 var pushBackends = make(map[string]PushBackend)
+var pushBackendsLock sync.Mutex
 var once sync.Once
 
 // RegisterPushBackend allows modules to register PushBackend implementations.
 // Should be called on init().
 func RegisterPushBackend(name string, backend PushBackend) {
+	pushBackendsLock.Lock()
+	defer pushBackendsLock.Unlock()
 	if _, ok := pushBackends[name]; ok {
 		log.Fatalf("PushBackend %s already exists; can't register the same name multiple times", name)
 	}
@@ -146,137 +158,18 @@ func emitToBackend(emitPeriod *time.Duration) {
 	}
 }
 
-// Float is expvar.Float+Get+hook
-type Float struct {
-	mu sync.Mutex
-	f  float64
-}
-
-// NewFloat creates a new Float and exports it.
-func NewFloat(name string) *Float {
-	v := new(Float)
-	publish(name, v)
-	return v
-}
-
-// Add adds the provided value to the Float
-func (v *Float) Add(delta float64) {
-	v.mu.Lock()
-	v.f += delta
-	v.mu.Unlock()
-}
-
-// Set sets the value
-func (v *Float) Set(value float64) {
-	v.mu.Lock()
-	v.f = value
-	v.mu.Unlock()
-}
-
-// Get returns the value
-func (v *Float) Get() float64 {
-	v.mu.Lock()
-	f := v.f
-	v.mu.Unlock()
-	return f
-}
-
-// String is the implementation of expvar.var
-func (v *Float) String() string {
-	return strconv.FormatFloat(v.Get(), 'g', -1, 64)
-}
-
 // FloatFunc converts a function that returns
 // a float64 as an expvar.
 type FloatFunc func() float64
 
+// Help returns the help string (undefined currently)
+func (f FloatFunc) Help() string {
+	return "help"
+}
+
 // String is the implementation of expvar.var
 func (f FloatFunc) String() string {
 	return strconv.FormatFloat(f(), 'g', -1, 64)
-}
-
-// Int is expvar.Int+Get+hook
-type Int struct {
-	i sync2.AtomicInt64
-}
-
-// NewInt returns a new Int
-func NewInt(name string) *Int {
-	v := new(Int)
-	if name != "" {
-		publish(name, v)
-	}
-	return v
-}
-
-// Add adds the provided value to the Int
-func (v *Int) Add(delta int64) {
-	v.i.Add(delta)
-}
-
-// Set sets the value
-func (v *Int) Set(value int64) {
-	v.i.Set(value)
-}
-
-// Get returns the value
-func (v *Int) Get() int64 {
-	return v.i.Get()
-}
-
-// String is the implementation of expvar.var
-func (v *Int) String() string {
-	return strconv.FormatInt(v.i.Get(), 10)
-}
-
-// Duration exports a time.Duration
-type Duration struct {
-	i sync2.AtomicDuration
-}
-
-// NewDuration returns a new Duration
-func NewDuration(name string) *Duration {
-	v := new(Duration)
-	publish(name, v)
-	return v
-}
-
-// Add adds the provided value to the Duration
-func (v *Duration) Add(delta time.Duration) {
-	v.i.Add(delta)
-}
-
-// Set sets the value
-func (v *Duration) Set(value time.Duration) {
-	v.i.Set(value)
-}
-
-// Get returns the value
-func (v *Duration) Get() time.Duration {
-	return v.i.Get()
-}
-
-// String is the implementation of expvar.var
-func (v *Duration) String() string {
-	return strconv.FormatInt(int64(v.i.Get()), 10)
-}
-
-// IntFunc converts a function that returns
-// an int64 as an expvar.
-type IntFunc func() int64
-
-// String is the implementation of expvar.var
-func (f IntFunc) String() string {
-	return strconv.FormatInt(f(), 10)
-}
-
-// DurationFunc converts a function that returns
-// an time.Duration as an expvar.
-type DurationFunc func() time.Duration
-
-// String is the implementation of expvar.var
-func (f DurationFunc) String() string {
-	return strconv.FormatInt(int64(f()), 10)
 }
 
 // String is expvar.String+Get+hook
@@ -336,41 +229,6 @@ func PublishJSONFunc(name string, f func() string) {
 	publish(name, JSONFunc(f))
 }
 
-// StringMap is a map of string -> string
-type StringMap struct {
-	mu     sync.Mutex
-	values map[string]string
-}
-
-// NewStringMap returns a new StringMap
-func NewStringMap(name string) *StringMap {
-	v := &StringMap{values: make(map[string]string)}
-	publish(name, v)
-	return v
-}
-
-// Set will set a value (existing or not)
-func (v *StringMap) Set(name, value string) {
-	v.mu.Lock()
-	v.values[name] = value
-	v.mu.Unlock()
-}
-
-// Get will return the value, or "" f not set.
-func (v *StringMap) Get(name string) string {
-	v.mu.Lock()
-	s := v.values[name]
-	v.mu.Unlock()
-	return s
-}
-
-// String is the implementation of expvar.Var
-func (v *StringMap) String() string {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return stringMapToString(v.values)
-}
-
 // StringMapFunc is the function equivalent of StringMap
 type StringMapFunc func() map[string]string
 
@@ -397,4 +255,65 @@ func stringMapToString(m map[string]string) string {
 	}
 	fmt.Fprintf(b, "}")
 	return b.String()
+}
+
+var (
+	varsMu             sync.Mutex
+	combinedDimensions map[string]bool
+	droppedVars        map[string]bool
+)
+
+// IsDimensionCombined returns true if the specified dimension should be combined.
+func IsDimensionCombined(name string) bool {
+	varsMu.Lock()
+	defer varsMu.Unlock()
+
+	if combinedDimensions == nil {
+		dims := strings.Split(*combineDimensions, ",")
+		combinedDimensions = make(map[string]bool, len(dims))
+		for _, dim := range dims {
+			if dim == "" {
+				continue
+			}
+			combinedDimensions[dim] = true
+		}
+	}
+	return combinedDimensions[name]
+}
+
+// safeJoinLabels joins the label values with ".", but first replaces any existing
+// "." characters in the labels with the proper replacement, to avoid issues parsing
+// them apart later. The function also replaces specific label values with "all"
+// if a dimenstion is marked as true in combinedLabels.
+func safeJoinLabels(labels []string, combinedLabels []bool) string {
+	sanitizedLabels := make([]string, len(labels))
+	for idx, label := range labels {
+		if combinedLabels != nil && combinedLabels[idx] {
+			sanitizedLabels[idx] = StatsAllStr
+		} else {
+			sanitizedLabels[idx] = safeLabel(label)
+		}
+	}
+	return strings.Join(sanitizedLabels, ".")
+}
+
+func safeLabel(label string) string {
+	return strings.Replace(label, ".", "_", -1)
+}
+
+func isVarDropped(name string) bool {
+	varsMu.Lock()
+	defer varsMu.Unlock()
+
+	if droppedVars == nil {
+		dims := strings.Split(*dropVariables, ",")
+		droppedVars = make(map[string]bool, len(dims))
+		for _, dim := range dims {
+			if dim == "" {
+				continue
+			}
+			droppedVars[dim] = true
+		}
+	}
+	return droppedVars[name]
 }

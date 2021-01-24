@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -20,89 +20,160 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/youtube/vitess/go/vt/sqlparser"
-	"github.com/youtube/vitess/go/vt/vtgate/engine"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
+
+	"vitess.io/vitess/go/mysql"
+
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/engine"
 )
 
-func buildUnionPlan(union *sqlparser.Union, vschema VSchema) (primitive engine.Primitive, err error) {
-	bindvars := sqlparser.GetBindvars(union)
-	bldr, err := processUnion(union, vschema, nil)
-	if err != nil {
+func buildUnionPlan(stmt sqlparser.Statement, vschema ContextVSchema) (engine.Primitive, error) {
+	union := stmt.(*sqlparser.Union)
+	// For unions, create a pb with anonymous scope.
+	pb := newPrimitiveBuilder(vschema, newJointab(sqlparser.GetBindvars(union)))
+	if err := pb.processUnion(union, nil); err != nil {
 		return nil, err
 	}
-	jt := newJointab(bindvars)
-	err = bldr.Wireup(bldr, jt)
-	if err != nil {
+	if err := pb.plan.Wireup(pb.plan, pb.jt); err != nil {
 		return nil, err
 	}
-	return bldr.Primitive(), nil
+	return pb.plan.Primitive(), nil
 }
 
-func processUnion(union *sqlparser.Union, vschema VSchema, outer builder) (builder, error) {
-	lbldr, err := processPart(union.Left, vschema, outer)
-	if err != nil {
-		return nil, err
+func (pb *primitiveBuilder) processUnion(union *sqlparser.Union, outer *symtab) error {
+	if err := pb.processPart(union.FirstStatement, outer, false); err != nil {
+		return err
 	}
-	rbldr, err := processPart(union.Right, vschema, outer)
-	if err != nil {
-		return nil, err
+	for _, us := range union.UnionSelects {
+		rpb := newPrimitiveBuilder(pb.vschema, pb.jt)
+		if err := rpb.processPart(us.Statement, outer, false); err != nil {
+			return err
+		}
+		err := unionRouteMerge(pb.plan, rpb.plan, us)
+		if err != nil {
+			// we are merging between two routes - let's check if we can see so that we have the same amount of columns on both sides of the union
+			lhsCols := len(pb.plan.ResultColumns())
+			rhsCols := len(rpb.plan.ResultColumns())
+			if lhsCols != rhsCols {
+				return &mysql.SQLError{
+					Num:     mysql.ERWrongNumberOfColumnsInSelect,
+					State:   "21000",
+					Message: "The used SELECT statements have a different number of columns",
+					Query:   sqlparser.String(union),
+				}
+			}
+
+			pb.plan = &concatenate{
+				lhs: pb.plan,
+				rhs: rpb.plan,
+			}
+
+			if us.Distinct {
+				pb.plan = newDistinct(pb.plan)
+			}
+		}
+		pb.st.Outer = outer
 	}
-	bldr, err := unionRouteMerge(union, lbldr, rbldr, vschema)
-	if err != nil {
-		return nil, err
+
+	if err := setLock(pb.plan, union.Lock); err != nil {
+		return err
 	}
-	if outer != nil {
-		bldr.Symtab().Outer = outer.Symtab()
+
+	if err := pb.pushOrderBy(union.OrderBy); err != nil {
+		return err
 	}
-	err = pushOrderBy(union.OrderBy, bldr)
-	if err != nil {
-		return nil, err
-	}
-	bldr, err = pushLimit(union.Limit, bldr)
-	if err != nil {
-		return nil, err
-	}
-	return bldr, nil
+	return pb.pushLimit(union.Limit)
 }
 
-func processPart(part sqlparser.SelectStatement, vschema VSchema, outer builder) (builder, error) {
-	var err error
-	var bldr builder
+func (pb *primitiveBuilder) processPart(part sqlparser.SelectStatement, outer *symtab, hasParens bool) error {
 	switch part := part.(type) {
 	case *sqlparser.Union:
-		bldr, err = processUnion(part, vschema, outer)
+		return pb.processUnion(part, outer)
 	case *sqlparser.Select:
-		bldr, err = processSelect(part, vschema, outer)
+		if part.SQLCalcFoundRows {
+			return vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "SQL_CALC_FOUND_ROWS not supported with union")
+		}
+		if !hasParens {
+			err := checkOrderByAndLimit(part)
+			if err != nil {
+				return err
+			}
+		}
+		return pb.processSelect(part, outer, "")
 	case *sqlparser.ParenSelect:
-		bldr, err = processPart(part.Select, vschema, outer)
-	default:
-		panic(fmt.Sprintf("BUG: unexpected SELECT type: %T", part))
+		err := pb.processPart(part.Select, outer, true)
+		if err != nil {
+			return err
+		}
+		// TODO: This is probably not a great idea. If we ended up with something other than a route, we'll lose the parens
+		routeOp, ok := pb.plan.(*route)
+		if ok {
+			routeOp.Select = &sqlparser.ParenSelect{Select: routeOp.Select}
+		}
+		return nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	return bldr, nil
+	return fmt.Errorf("BUG: unexpected SELECT type: %T", part)
 }
 
-func unionRouteMerge(union *sqlparser.Union, left, right builder, vschema VSchema) (builder, error) {
+func checkOrderByAndLimit(part *sqlparser.Select) error {
+	if part.OrderBy != nil {
+		return &mysql.SQLError{
+			Num:     mysql.ERWrongUsage,
+			State:   "21000",
+			Message: "Incorrect usage of UNION and ORDER BY - add parens to disambiguate your query",
+		}
+	}
+	if part.Limit != nil {
+		return &mysql.SQLError{
+			Num:     mysql.ERWrongUsage,
+			State:   "21000",
+			Message: "Incorrect usage of UNION and LIMIT - add parens to disambiguate your query",
+		}
+	}
+	return nil
+}
+
+// TODO (systay) we never use this as an actual error. we should rethink the return type
+func unionRouteMerge(left, right logicalPlan, us *sqlparser.UnionSelect) error {
 	lroute, ok := left.(*route)
 	if !ok {
-		return nil, errors.New("unsupported construct: SELECT of UNION is non-trivial")
+		return errors.New("unsupported: SELECT of UNION is non-trivial")
 	}
 	rroute, ok := right.(*route)
 	if !ok {
-		return nil, errors.New("unsupported construct: SELECT of UNION is non-trivial")
+		return errors.New("unsupported: SELECT of UNION is non-trivial")
 	}
-	if err := lroute.UnionCanMerge(rroute); err != nil {
-		return nil, err
+	mergeSuccess := lroute.MergeUnion(rroute, us.Distinct)
+	if !mergeSuccess {
+		return errors.New("unsupported: UNION cannot be executed as a single route")
 	}
-	rb := newRoute(
-		&sqlparser.Union{Type: union.Type, Left: union.Left, Right: union.Right, Lock: union.Lock},
-		lroute.ERoute,
-		lroute.condition,
-		vschema,
-	)
-	lroute.Redirect = rb
-	rroute.Redirect = rb
-	return rb, nil
+
+	switch n := lroute.Select.(type) {
+	case *sqlparser.Union:
+		n.UnionSelects = append(n.UnionSelects, us)
+	default:
+		lroute.Select = &sqlparser.Union{FirstStatement: lroute.Select, UnionSelects: []*sqlparser.UnionSelect{us}}
+	}
+
+	return nil
+}
+
+// planLock pushes "FOR UPDATE", "LOCK IN SHARE MODE" down to all routes
+func setLock(in logicalPlan, lock sqlparser.Lock) error {
+	_, err := visit(in, func(plan logicalPlan) (bool, logicalPlan, error) {
+		switch node := in.(type) {
+		case *route:
+			node.Select.SetLock(lock)
+			return false, node, nil
+		case *sqlCalcFoundRows, *vindexFunc:
+			return false, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "%T.locking: unreachable", in)
+		}
+		return true, plan, nil
+	})
+	if err != nil {
+		return err
+	}
+	return nil
 }

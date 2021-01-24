@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -20,11 +20,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/youtube/vitess/go/vt/discovery"
-	"github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/discovery"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func TestStatsUpdate(t *testing.T) {
@@ -146,7 +145,7 @@ func TestHeatmapData(t *testing.T) {
 				{float64(ts2.Stats.SecondsBehindMaster), float64(ts4.Stats.SecondsBehindMaster)},
 				{float64(ts1.Stats.SecondsBehindMaster), float64(-1)},
 			},
-			Aliases: [][]*topodata.TabletAlias{
+			Aliases: [][]*topodatapb.TabletAlias{
 				{nil, ts9.Tablet.Alias},
 				{ts6.Tablet.Alias, ts8.Tablet.Alias},
 				{ts5.Tablet.Alias, nil},
@@ -193,7 +192,7 @@ func TestHeatmapData(t *testing.T) {
 				{float64(ts3.Stats.SecondsBehindMaster), float64(-1)},
 				{float64(ts2.Stats.SecondsBehindMaster), float64(ts4.Stats.SecondsBehindMaster)},
 			},
-			Aliases: [][]*topodata.TabletAlias{
+			Aliases: [][]*topodatapb.TabletAlias{
 				{ts5.Tablet.Alias, nil},
 				{ts3.Tablet.Alias, nil},
 				{ts2.Tablet.Alias, ts4.Tablet.Alias},
@@ -233,7 +232,7 @@ func TestHeatmapData(t *testing.T) {
 				{float64(ts11.Stats.SecondsBehindMaster), float64(ts13.Stats.SecondsBehindMaster)},
 				{float64(ts10.Stats.SecondsBehindMaster), float64(-1)},
 			},
-			Aliases: [][]*topodata.TabletAlias{
+			Aliases: [][]*topodatapb.TabletAlias{
 				{ts12.Tablet.Alias, nil},
 				{ts11.Tablet.Alias, ts13.Tablet.Alias},
 				{ts10.Tablet.Alias, nil},
@@ -313,7 +312,7 @@ func TestHeatmapData(t *testing.T) {
 			Data: [][]float64{
 				{float64(-1), float64(ts7.Stats.SecondsBehindMaster)},
 			},
-			Aliases: [][]*topodata.TabletAlias{
+			Aliases: [][]*topodatapb.TabletAlias{
 				{nil, ts7.Tablet.Alias},
 			},
 			CellAndTypeLabels: []yLabel{
@@ -343,7 +342,7 @@ func TestTabletStats(t *testing.T) {
 	tabletStatsCache.StatsUpdate(ts1)
 	tabletStatsCache.StatsUpdate(ts2)
 
-	// Test 1: tablet1 and tablet2 are updated with the stats received by the HealthCheck module.
+	// Test 1: tablet1 and tablet2 are updated with the stats received by the LegacyHealthCheck module.
 	got1, err := tabletStatsCache.tabletStats(ts1.Tablet.Alias)
 	want1 := ts1
 	if err != nil || !got1.DeepEqual(want1) {
@@ -427,8 +426,8 @@ func TestTopologyInfo(t *testing.T) {
 	}
 }
 
-// tabletStats will create a discovery.TabletStats object.
-func tabletStats(keyspace, cell, shard string, tabletType topodatapb.TabletType, uid uint32) *discovery.TabletStats {
+// tabletStats will create a discovery.LegacyTabletStats object.
+func tabletStats(keyspace, cell, shard string, tabletType topodatapb.TabletType, uid uint32) *discovery.LegacyTabletStats {
 	target := &querypb.Target{
 		Keyspace:   keyspace,
 		Shard:      shard,
@@ -446,7 +445,7 @@ func tabletStats(keyspace, cell, shard string, tabletType topodatapb.TabletType,
 		// uid is used for SecondsBehindMaster to give it a unique value.
 		SecondsBehindMaster: uid,
 	}
-	stats := &discovery.TabletStats{
+	stats := &discovery.LegacyTabletStats{
 		Tablet:    tablet,
 		Target:    target,
 		Up:        true,

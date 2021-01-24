@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,14 +18,12 @@ package binlogplayer
 
 import (
 	"flag"
-	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	log "github.com/golang/glog"
-
-	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/log"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 /*
@@ -45,7 +43,7 @@ type BinlogTransactionStream interface {
 // Client is the interface all clients must satisfy
 type Client interface {
 	// Dial a server
-	Dial(tablet *topodatapb.Tablet, connTimeout time.Duration) error
+	Dial(tablet *topodatapb.Tablet) error
 
 	// Close the connection
 	Close()

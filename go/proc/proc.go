@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
 )
 
 const pidURL = "/debug/pid"
@@ -54,7 +54,7 @@ func Listen(port string) (l net.Listener, err error) {
 // SIGUSR1 signal and attempt to bind to the port the current server is using.
 func Wait() os.Signal {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGTERM, syscall.SIGUSR1)
+	signal.Notify(c, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGINT)
 
 	http.HandleFunc(pidURL, func(r http.ResponseWriter, req *http.Request) {
 		r.Write(strconv.AppendInt(nil, int64(os.Getpid()), 10))

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,16 +20,19 @@ import (
 	"fmt"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/stats"
-	"github.com/youtube/vitess/go/vt/key"
-	"github.com/youtube/vitess/go/vt/topo"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/topo"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // DiffType specifies why a specific row was found as different when comparing
@@ -74,7 +77,7 @@ type RowDiffer2 struct {
 	// aggregators are keyed by destination shard and DiffType.
 	aggregators [][]*RowAggregator
 	// equalRowsStatsCounters tracks per table how many rows are equal.
-	equalRowsStatsCounters *stats.Counters
+	equalRowsStatsCounters *stats.CountersWithSingleLabel
 	// tableName is required to update "equalRowsStatsCounters".
 	tableName string
 }
@@ -89,7 +92,7 @@ func NewRowDiffer2(ctx context.Context, left, right ResultReader, td *tabletmana
 	// Parameters required by RowRouter.
 	destinationShards []*topo.ShardInfo, keyResolver keyspaceIDResolver,
 	// Parameters required by RowAggregator.
-	insertChannels []chan string, abort <-chan struct{}, dbNames []string, writeQueryMaxRows, writeQueryMaxSize int, statsCounters []*stats.Counters) (*RowDiffer2, error) {
+	insertChannels []chan string, abort <-chan struct{}, dbNames []string, writeQueryMaxRows, writeQueryMaxSize int, statsCounters []*stats.CountersWithSingleLabel) (*RowDiffer2, error) {
 
 	if len(statsCounters) != len(DiffTypes) {
 		panic(fmt.Sprintf("statsCounter has the wrong number of elements. got = %v, want = %v", len(statsCounters), len(DiffTypes)))
@@ -125,11 +128,11 @@ func NewRowDiffer2(ctx context.Context, left, right ResultReader, td *tabletmana
 
 func compareFields(left, right []*querypb.Field) error {
 	if len(left) != len(right) {
-		return fmt.Errorf("Cannot diff inputs with different number of fields: left: %v right: %v", left, right)
+		return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "cannot diff inputs with different number of fields: left: %v right: %v", left, right)
 	}
 	for i, field := range left {
 		if field.Type != right[i].Type {
-			return fmt.Errorf("Cannot diff inputs with different types: field %v types are %v and %v", i, field.Type, right[i].Type)
+			return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "cannot diff inputs with different types: field %v types are %v and %v", i, field.Type, right[i].Type)
 		}
 	}
 	return nil
@@ -162,11 +165,11 @@ func (rd *RowDiffer2) Diff() (DiffReport, error) {
 			}
 			advanceRight = false
 		}
-		dr.processedRows++
 		if left == nil && right == nil {
 			// No more rows from either side. We're done.
 			break
 		}
+		dr.processedRows++
 		if left == nil {
 			// No more rows on the left side.
 			// We know we have at least one row on the right side left.
@@ -278,11 +281,11 @@ func (rd *RowDiffer2) reconcileRow(row []sqltypes.Value, typ DiffType) error {
 	}
 	destShardIndex, err := rd.router.Route(row)
 	if err != nil {
-		return fmt.Errorf("failed to route row (%v) to correct shard: %v", row, err)
+		return vterrors.Wrapf(err, "failed to route row (%v) to correct shard", row)
 	}
 
 	if err := rd.aggregators[destShardIndex][typ].Add(row); err != nil {
-		return fmt.Errorf("failed to add row update to RowAggregator: %v", err)
+		return vterrors.Wrap(err, "failed to add row update to RowAggregator")
 	}
 	// TODO(mberlin): Add more fine granular stats here.
 	rd.tableStatusList.addCopiedRows(rd.tableIndex, 1)
@@ -300,25 +303,25 @@ func (rd *RowDiffer2) updateRow(newRow, oldRow []sqltypes.Value, typ DiffType) e
 	}
 	destShardIndexOld, err := rd.router.Route(oldRow)
 	if err != nil {
-		return fmt.Errorf("failed to route old row (%v) to correct shard: %v", oldRow, err)
+		return vterrors.Wrapf(err, "failed to route old row (%v) to correct shard", oldRow)
 	}
 	destShardIndexNew, err := rd.router.Route(newRow)
 	if err != nil {
-		return fmt.Errorf("failed to route new row (%v) to correct shard: %v", newRow, err)
+		return vterrors.Wrapf(err, "failed to route new row (%v) to correct shard", newRow)
 	}
 
 	if destShardIndexOld == destShardIndexNew {
 		// keyspace_id has not changed. Update the row in place on the destination.
 		if err := rd.aggregators[destShardIndexNew][typ].Add(newRow); err != nil {
-			return fmt.Errorf("failed to add row update to RowAggregator (keyspace_id not changed): %v", err)
+			return vterrors.Wrap(err, "failed to add row update to RowAggregator (keyspace_id not changed)")
 		}
 	} else {
 		// keyspace_id has changed. Delete the old row and insert the new one.
 		if err := rd.aggregators[destShardIndexOld][DiffExtraneous].Add(oldRow); err != nil {
-			return fmt.Errorf("failed to add row update to RowAggregator (keyspace_id changed, deleting old row): %v", err)
+			return vterrors.Wrap(err, "failed to add row update to RowAggregator (keyspace_id changed, deleting old row)")
 		}
 		if err := rd.aggregators[destShardIndexNew][DiffMissing].Add(newRow); err != nil {
-			return fmt.Errorf("failed to add row update to RowAggregator (keyspace_id changed, inserting new row): %v", err)
+			return vterrors.Wrap(err, "failed to add row update to RowAggregator (keyspace_id changed, inserting new row)")
 		}
 	}
 
@@ -362,5 +365,5 @@ func (rr *RowRouter) Route(row []sqltypes.Value) (int, error) {
 			return i, nil
 		}
 	}
-	return -1, fmt.Errorf("no shard's key range includes the keyspace id: %v for the row: %#v", k, row)
+	return -1, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "no shard's key range includes the keyspace id: %v for the row: %#v", k, row)
 }

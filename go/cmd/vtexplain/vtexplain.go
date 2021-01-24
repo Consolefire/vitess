@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,26 +20,29 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"os"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/vtexplain"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vtexplain"
 )
 
 var (
-	sqlFlag         = flag.String("sql", "", "A list of semicolon-delimited SQL commands to analyze")
-	sqlFileFlag     = flag.String("sql-file", "", "Identifies the file that contains the SQL commands to analyze")
-	schemaFlag      = flag.String("schema", "", "The SQL table schema")
-	schemaFileFlag  = flag.String("schema-file", "", "Identifies the file that contains the SQL table schema")
-	vschemaFlag     = flag.String("vschema", "", "Identifies the VTGate routing schema")
-	vschemaFileFlag = flag.String("vschema-file", "", "Identifies the VTGate routing schema file")
-	numShards       = flag.Int("shards", 2, "Number of shards per keyspace")
-	replicationMode = flag.String("replication-mode", "ROW", "The replication mode to simulate -- must be set to either ROW or STATEMENT")
-	normalize       = flag.Bool("normalize", false, "Whether to enable vtgate normalization")
-	outputMode      = flag.String("output-mode", "text", "Output in human-friendly text or json")
+	sqlFlag            = flag.String("sql", "", "A list of semicolon-delimited SQL commands to analyze")
+	sqlFileFlag        = flag.String("sql-file", "", "Identifies the file that contains the SQL commands to analyze")
+	schemaFlag         = flag.String("schema", "", "The SQL table schema")
+	schemaFileFlag     = flag.String("schema-file", "", "Identifies the file that contains the SQL table schema")
+	vschemaFlag        = flag.String("vschema", "", "Identifies the VTGate routing schema")
+	vschemaFileFlag    = flag.String("vschema-file", "", "Identifies the VTGate routing schema file")
+	ksShardMapFlag     = flag.String("ks-shard-map", "", "JSON map of keyspace name -> shard name -> ShardReference object. The inner map is the same as the output of FindAllShardsInKeyspace")
+	ksShardMapFileFlag = flag.String("ks-shard-map-file", "", "File containing json blob of keyspace name -> shard name -> ShardReference object")
+	numShards          = flag.Int("shards", 2, "Number of shards per keyspace. Passing -ks-shard-map/-ks-shard-map-file causes this flag to be ignored.")
+	executionMode      = flag.String("execution-mode", "multi", "The execution mode to simulate -- must be set to multi, legacy-autocommit, or twopc")
+	replicationMode    = flag.String("replication-mode", "ROW", "The replication mode to simulate -- must be set to either ROW or STATEMENT")
+	normalize          = flag.Bool("normalize", false, "Whether to enable vtgate normalization")
+	outputMode         = flag.String("output-mode", "text", "Output in human-friendly text or json")
+	dbName             = flag.String("dbname", "", "Optional database target to override normal routing")
 
 	// vtexplainFlags lists all the flags that should show in usage
 	vtexplainFlags = []string{
@@ -53,6 +56,10 @@ var (
 		"sql-file",
 		"vschema",
 		"vschema-file",
+		"ks-shard-map",
+		"ks-shard-map-file",
+		"dbname",
+		"queryserver-config-passthrough-dmls",
 	}
 )
 
@@ -61,7 +68,7 @@ func usage() {
 	for _, name := range vtexplainFlags {
 		f := flag.Lookup(name)
 		if f == nil {
-			panic("unkown flag " + name)
+			panic("unknown flag " + name)
 		}
 		flagUsage(f)
 	}
@@ -101,7 +108,7 @@ func init() {
 
 // getFileParam returns a string containing either flag is not "",
 // or the content of the file named flagFile
-func getFileParam(flag, flagFile, name string) (string, error) {
+func getFileParam(flag, flagFile, name string, required bool) (string, error) {
 	if flag != "" {
 		if flagFile != "" {
 			return "", fmt.Errorf("action requires only one of %v or %v-file", name, name)
@@ -110,32 +117,25 @@ func getFileParam(flag, flagFile, name string) (string, error) {
 	}
 
 	if flagFile == "" {
-		return "", fmt.Errorf("action requires one of %v or %v-file", name, name)
+		if required {
+			return "", fmt.Errorf("action requires one of %v or %v-file", name, name)
+		}
+
+		return "", nil
 	}
 	data, err := ioutil.ReadFile(flagFile)
 	if err != nil {
-		return "", fmt.Errorf("Cannot read file %v: %v", flagFile, err)
+		return "", fmt.Errorf("cannot read file %v: %v", flagFile, err)
 	}
 	return string(data), nil
 }
 
 func main() {
+	defer vtexplain.Stop()
 	defer exit.RecoverAll()
 	defer logutil.Flush()
 
-	flag.Parse()
-
-	if *servenv.Version {
-		servenv.AppVersion.Print()
-		os.Exit(0)
-	}
-
-	args := flag.Args()
-
-	if len(args) != 0 {
-		flag.Usage()
-		exit.Return(1)
-	}
+	servenv.ParseFlags("vtexplain")
 
 	err := parseAndRun()
 	if err != nil {
@@ -145,32 +145,39 @@ func main() {
 }
 
 func parseAndRun() error {
-	sql, err := getFileParam(*sqlFlag, *sqlFileFlag, "sql")
+	sql, err := getFileParam(*sqlFlag, *sqlFileFlag, "sql", true)
 	if err != nil {
 		return err
 	}
 
-	schema, err := getFileParam(*schemaFlag, *schemaFileFlag, "schema")
+	schema, err := getFileParam(*schemaFlag, *schemaFileFlag, "schema", true)
 	if err != nil {
 		return err
 	}
 
-	vschema, err := getFileParam(*vschemaFlag, *vschemaFileFlag, "vschema")
+	vschema, err := getFileParam(*vschemaFlag, *vschemaFileFlag, "vschema", true)
+	if err != nil {
+		return err
+	}
+
+	ksShardMap, err := getFileParam(*ksShardMapFlag, *ksShardMapFileFlag, "ks-shard-map", false)
 	if err != nil {
 		return err
 	}
 
 	opts := &vtexplain.Options{
+		ExecutionMode:   *executionMode,
 		ReplicationMode: *replicationMode,
 		NumShards:       *numShards,
 		Normalize:       *normalize,
+		Target:          *dbName,
 	}
 
 	log.V(100).Infof("sql %s\n", sql)
 	log.V(100).Infof("schema %s\n", schema)
 	log.V(100).Infof("vschema %s\n", vschema)
 
-	err = vtexplain.Init(vschema, schema, opts)
+	err = vtexplain.Init(vschema, schema, ksShardMap, opts)
 	if err != nil {
 		return err
 	}

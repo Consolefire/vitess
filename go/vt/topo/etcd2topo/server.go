@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,88 +34,94 @@ We follow these conventions within this package:
 package etcd2topo
 
 import (
-	"path"
+	"flag"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/coreos/etcd/clientv3"
-	"golang.org/x/net/context"
+	"github.com/coreos/etcd/pkg/transport"
 
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo"
 )
+
+var (
+	clientCertPath = flag.String("topo_etcd_tls_cert", "", "path to the client cert to use to connect to the etcd topo server, requires topo_etcd_tls_key, enables TLS")
+	clientKeyPath  = flag.String("topo_etcd_tls_key", "", "path to the client key to use to connect to the etcd topo server, enables TLS")
+	serverCaPath   = flag.String("topo_etcd_tls_ca", "", "path to the ca to use to validate the server cert when connecting to the etcd topo server")
+)
+
+// Factory is the consul topo.Factory implementation.
+type Factory struct{}
+
+// HasGlobalReadOnlyCell is part of the topo.Factory interface.
+func (f Factory) HasGlobalReadOnlyCell(serverAddr, root string) bool {
+	return false
+}
+
+// Create is part of the topo.Factory interface.
+func (f Factory) Create(cell, serverAddr, root string) (topo.Conn, error) {
+	return NewServer(serverAddr, root)
+}
 
 // Server is the implementation of topo.Server for etcd.
 type Server struct {
-	// global is a client configured to talk to a list of etcd instances
-	// representing the global etcd cluster.
-	global *cellClient
+	// cli is the v3 client.
+	cli *clientv3.Client
 
-	// mu protects the cells variable.
-	mu sync.Mutex
-	// cells contains clients configured to talk to a list of
-	// etcd instances representing local etcd clusters. These
-	// should be accessed with the Server.clientForCell() method, which
-	// will read the list of addresses for that cell from the
-	// global cluster and create clients as needed.
-	cells map[string]*cellClient
+	// root is the root path for this client.
+	root string
 }
 
 // Close implements topo.Server.Close.
 // It will nil out the global and cells fields, so any attempt to
 // re-use this server will panic.
 func (s *Server) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, c := range s.cells {
-		c.close()
-	}
-	s.cells = nil
-
-	s.global.close()
-	s.global = nil
+	s.cli.Close()
+	s.cli = nil
 }
 
-// GetKnownCells implements topo.Server.GetKnownCells.
-func (s *Server) GetKnownCells(ctx context.Context) ([]string, error) {
-	nodePath := path.Join(s.global.root, cellsPath) + "/"
-	resp, err := s.global.cli.Get(ctx, nodePath,
-		clientv3.WithPrefix(),
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
-		clientv3.WithKeysOnly())
-	if err != nil {
-		return nil, convertError(err)
+func NewServerWithOpts(serverAddr, root, certPath, keyPath, caPath string) (*Server, error) {
+	// TODO: Rename this to NewServer and change NewServer to a name that signifies it uses the process-wide TLS settings.
+
+	config := clientv3.Config{
+		Endpoints:   strings.Split(serverAddr, ","),
+		DialTimeout: 5 * time.Second,
 	}
 
-	prefixLen := len(nodePath)
-	suffix := "/" + topo.CellInfoFile
-	suffixLen := len(suffix)
-
-	var result []string
-	for _, ev := range resp.Kvs {
-		p := string(ev.Key)
-		if strings.HasPrefix(p, nodePath) && strings.HasSuffix(p, suffix) {
-			p = p[prefixLen : len(p)-suffixLen]
-			result = append(result, p)
+	// If TLS is enabled, attach TLS config info.
+	if certPath != "" && keyPath != "" {
+		// Safe now to build up TLS info.
+		tlsInfo := transport.TLSInfo{
+			CertFile:      certPath,
+			KeyFile:       keyPath,
+			TrustedCAFile: caPath,
 		}
+
+		tlsConfig, err := tlsInfo.ClientConfig()
+		if err != nil {
+			return nil, err
+		}
+		config.TLS = tlsConfig
 	}
 
-	return result, nil
+	cli, err := clientv3.New(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Server{
+		cli:  cli,
+		root: root,
+	}, nil
 }
 
 // NewServer returns a new etcdtopo.Server.
 func NewServer(serverAddr, root string) (*Server, error) {
-	global, err := newCellClient(serverAddr, root)
-	if err != nil {
-		return nil, err
-	}
-	return &Server{
-		global: global,
-		cells:  make(map[string]*cellClient),
-	}, nil
+	// TODO: Rename this to a name to signifies this function uses the process-wide TLS settings.
+
+	return NewServerWithOpts(serverAddr, root, *clientCertPath, *clientKeyPath, *serverCaPath)
 }
 
 func init() {
-	topo.RegisterFactory("etcd2", func(serverAddr, root string) (topo.Impl, error) {
-		return NewServer(serverAddr, root)
-	})
+	topo.RegisterFactory("etcd2", Factory{})
 }

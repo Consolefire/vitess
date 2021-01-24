@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,10 +23,10 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
 )
 
 // TestCreateShard tests a few cases for topo.CreateShard
@@ -55,9 +55,11 @@ func TestCreateShard(t *testing.T) {
 	}
 }
 
-// TestCreateShardCustomSharding checks ServedTypes is set correctly
-// when creating multiple custom sharding shards
-func TestCreateShardCustomSharding(t *testing.T) {
+// TestCreateShardMultiUnsharded checks ServedTypes is set
+// only for the first created shard.
+// TODO(sougou): we should eventually disallow multiple shards
+// for unsharded keyspaces.
+func TestCreateShardMultiUnsharded(t *testing.T) {
 	ctx := context.Background()
 
 	// Set up topology.
@@ -77,7 +79,7 @@ func TestCreateShardCustomSharding(t *testing.T) {
 	if si, err := ts.GetShard(ctx, keyspace, shard0); err != nil {
 		t.Fatalf("GetShard(shard0) failed: %v", err)
 	} else {
-		if len(si.ServedTypes) != 3 {
+		if !si.IsMasterServing {
 			t.Fatalf("shard0 should have all 3 served types")
 		}
 	}
@@ -90,7 +92,7 @@ func TestCreateShardCustomSharding(t *testing.T) {
 	if si, err := ts.GetShard(ctx, keyspace, shard1); err != nil {
 		t.Fatalf("GetShard(shard1) failed: %v", err)
 	} else {
-		if len(si.ServedTypes) != 3 {
+		if si.IsMasterServing {
 			t.Fatalf("shard1 should have all 3 served types")
 		}
 	}
@@ -103,7 +105,8 @@ func TestGetOrCreateShard(t *testing.T) {
 	ctx := context.Background()
 
 	// Set up topology.
-	ts := memorytopo.NewServer("test_cell")
+	cell := "test_cell"
+	ts := memorytopo.NewServer(cell)
 
 	// and do massive parallel GetOrCreateShard
 	keyspace := "test_keyspace"

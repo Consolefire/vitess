@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +19,10 @@ package stats
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/youtube/vitess/go/sync2"
+	"vitess.io/vitess/go/sync2"
 )
 
 // Timings is meant to tracks timing data
@@ -32,34 +31,50 @@ type Timings struct {
 	totalCount sync2.AtomicInt64
 	totalTime  sync2.AtomicInt64
 
-	// mu protects get and set of hook and the map.
-	// Modification to the value in the map is not protected.
 	mu         sync.RWMutex
 	histograms map[string]*Histogram
-	hook       func(string, time.Duration)
+
+	help          string
+	label         string
+	labelCombined bool
 }
 
 // NewTimings creates a new Timings object, and publishes it if name is set.
 // categories is an optional list of categories to initialize to 0.
 // Categories that aren't initialized will be missing from the map until the
 // first time they are updated.
-func NewTimings(name string, categories ...string) *Timings {
-	t := &Timings{histograms: make(map[string]*Histogram)}
+func NewTimings(name, help, label string, categories ...string) *Timings {
+	t := &Timings{
+		histograms:    make(map[string]*Histogram),
+		help:          help,
+		label:         label,
+		labelCombined: IsDimensionCombined(label),
+	}
 	for _, cat := range categories {
-		t.histograms[cat] = NewGenericHistogram("", bucketCutoffs, bucketLabels, "Count", "Time")
+		t.histograms[cat] = NewGenericHistogram("", "", bucketCutoffs, bucketLabels, "Count", "Time")
 	}
 	if name != "" {
 		publish(name, t)
 	}
+
 	return t
+}
+
+// Reset will clear histograms: used during testing
+func (t *Timings) Reset() {
+	t.mu.RLock()
+	t.histograms = make(map[string]*Histogram)
+	t.mu.RUnlock()
 }
 
 // Add will add a new value to the named histogram.
 func (t *Timings) Add(name string, elapsed time.Duration) {
+	if t.labelCombined {
+		name = StatsAllStr
+	}
 	// Get existing Histogram.
 	t.mu.RLock()
 	hist, ok := t.histograms[name]
-	hook := t.hook
 	t.mu.RUnlock()
 
 	// Create Histogram if it does not exist.
@@ -67,7 +82,7 @@ func (t *Timings) Add(name string, elapsed time.Duration) {
 		t.mu.Lock()
 		hist, ok = t.histograms[name]
 		if !ok {
-			hist = NewGenericHistogram("", bucketCutoffs, bucketLabels, "Count", "Time")
+			hist = NewGenericHistogram("", "", bucketCutoffs, bucketLabels, "Count", "Time")
 			t.histograms[name] = hist
 		}
 		t.mu.Unlock()
@@ -77,15 +92,15 @@ func (t *Timings) Add(name string, elapsed time.Duration) {
 	hist.Add(elapsedNs)
 	t.totalCount.Add(1)
 	t.totalTime.Add(elapsedNs)
-	if hook != nil {
-		hook(name, elapsed)
-	}
 }
 
 // Record is a convenience function that records completion
 // timing data based on the provided start time of an event.
 func (t *Timings) Record(name string, startTime time.Time) {
-	t.Add(name, time.Now().Sub(startTime))
+	if t.labelCombined {
+		name = StatsAllStr
+	}
+	t.Add(name, time.Since(startTime))
 }
 
 // String is for expvar.
@@ -150,6 +165,16 @@ func (t *Timings) Cutoffs() []int64 {
 	return bucketCutoffs
 }
 
+// Help returns the help string.
+func (t *Timings) Help() string {
+	return t.help
+}
+
+// Label returns the label name.
+func (t *Timings) Label() string {
+	return t.label
+}
+
 var bucketCutoffs = []int64{5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9, 5e9, 1e10}
 
 var bucketLabels []string
@@ -167,18 +192,27 @@ func init() {
 // with joining multiple strings with '.'.
 type MultiTimings struct {
 	Timings
-	labels []string
+	labels         []string
+	combinedLabels []bool
 }
 
 // NewMultiTimings creates a new MultiTimings object.
-func NewMultiTimings(name string, labels []string) *MultiTimings {
+func NewMultiTimings(name string, help string, labels []string) *MultiTimings {
 	t := &MultiTimings{
-		Timings: Timings{histograms: make(map[string]*Histogram)},
-		labels:  labels,
+		Timings: Timings{
+			histograms: make(map[string]*Histogram),
+			help:       help,
+		},
+		labels:         labels,
+		combinedLabels: make([]bool, len(labels)),
+	}
+	for i, label := range labels {
+		t.combinedLabels[i] = IsDimensionCombined(label)
 	}
 	if name != "" {
 		publish(name, t)
 	}
+
 	return t
 }
 
@@ -192,7 +226,7 @@ func (mt *MultiTimings) Add(names []string, elapsed time.Duration) {
 	if len(names) != len(mt.labels) {
 		panic("MultiTimings: wrong number of values in Add")
 	}
-	mt.Timings.Add(strings.Join(names, "."), elapsed)
+	mt.Timings.Add(safeJoinLabels(names, mt.combinedLabels), elapsed)
 }
 
 // Record is a convenience function that records completion
@@ -201,7 +235,7 @@ func (mt *MultiTimings) Record(names []string, startTime time.Time) {
 	if len(names) != len(mt.labels) {
 		panic("MultiTimings: wrong number of values in Record")
 	}
-	mt.Timings.Record(strings.Join(names, "."), startTime)
+	mt.Timings.Record(safeJoinLabels(names, mt.combinedLabels), startTime)
 }
 
 // Cutoffs returns the cutoffs used in the component histograms.

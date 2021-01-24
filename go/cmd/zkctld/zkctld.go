@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,16 +25,16 @@ import (
 	"os/signal"
 	"syscall"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/zk/zkctl"
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/zkctl"
 )
 
 var (
 	zkCfg = flag.String("zk.cfg", "6@<hostname>:3801:3802:3803",
 		"zkid@server1:leaderPort1:electionPort1:clientPort1,...)")
-	myId = flag.Uint("zk.myid", 0,
+	myID = flag.Uint("zk.myid", 0,
 		"which server do you want to be? only needed when running multiple instance on one box, otherwise myid is implied by hostname")
 )
 
@@ -44,7 +44,7 @@ func main() {
 
 	flag.Parse()
 
-	zkConfig := zkctl.MakeZkConfigFromString(*zkCfg, uint32(*myId))
+	zkConfig := zkctl.MakeZkConfigFromString(*zkCfg, uint32(*myID))
 	zkd := zkctl.NewZkd(zkConfig)
 
 	if zkd.Inited() {
@@ -62,13 +62,18 @@ func main() {
 	}
 
 	log.Infof("waiting for signal or server shutdown...")
-	sig := make(chan os.Signal)
+	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case <-zkd.Done():
 		log.Infof("server shut down on its own")
 	case <-sig:
 		log.Infof("signal received, shutting down server")
-		zkd.Shutdown()
+
+		// Action to perform if there is an error
+		if err := zkd.Shutdown(); err != nil {
+			log.Errorf("error during shutdown:%v", err)
+			exit.Return(1)
+		}
 	}
 }

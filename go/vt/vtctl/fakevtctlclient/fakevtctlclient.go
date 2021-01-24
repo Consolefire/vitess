@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,10 @@ package fakevtctlclient
 import (
 	"time"
 
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/vtctl/vtctlclient"
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
 )
 
 // FakeVtctlClient is a fake which implements the vtctlclient interface.
@@ -38,7 +39,7 @@ func NewFakeVtctlClient() *FakeVtctlClient {
 }
 
 // FakeVtctlClientFactory always returns the current instance.
-func (f *FakeVtctlClient) FakeVtctlClientFactory(addr string, dialTimeout time.Duration) (vtctlclient.VtctlClient, error) {
+func (f *FakeVtctlClient) FakeVtctlClientFactory(addr string) (vtctlclient.VtctlClient, error) {
 	return f, nil
 }
 

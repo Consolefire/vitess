@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -20,14 +20,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
-	"golang.org/x/net/context"
+	"context"
 
-	workflowpb "github.com/youtube/vitess/go/vt/proto/workflow"
+	"vitess.io/vitess/go/vt/log"
+	workflowpb "vitess.io/vitess/go/vt/proto/workflow"
 )
 
 // This file contains the necessary object definitions and interfaces
@@ -139,6 +140,7 @@ type Node struct {
 	Path            string                   `json:"path"`
 	Children        []*Node                  `json:"children,omitempty"`
 	LastChanged     int64                    `json:"lastChanged"`
+	CreateTime      int64                    `json:"createTime"`
 	Progress        int                      `json:"progress"`
 	ProgressMessage string                   `json:"progressMsg"`
 	State           workflowpb.WorkflowState `json:"state"`
@@ -333,6 +335,9 @@ func (m *NodeManager) toJSON(index int) ([]byte, error) {
 	for _, n := range m.roots {
 		u.Nodes = append(u.Nodes, n)
 	}
+	sort.Slice(u.Nodes, func(i, j int) bool {
+		return u.Nodes[i].CreateTime < u.Nodes[j].CreateTime
+	})
 	return json.Marshal(u)
 }
 
@@ -436,7 +441,7 @@ func (m *NodeManager) Action(ctx context.Context, ap *ActionParameters) error {
 
 	if n.Listener == nil {
 		m.mu.Unlock()
-		return fmt.Errorf("Action %v is invoked on a node without listener (node path is %v)", ap.Name, ap.Path)
+		return fmt.Errorf("action %v is invoked on a node without listener (node path is %v)", ap.Name, ap.Path)
 	}
 	nodeListener := n.Listener
 	m.mu.Unlock()

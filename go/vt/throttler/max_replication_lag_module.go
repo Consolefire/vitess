@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,24 +22,23 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/golang/glog"
-
 	"github.com/golang/protobuf/proto"
 
-	"github.com/youtube/vitess/go/sync2"
-	"github.com/youtube/vitess/go/vt/discovery"
-	"github.com/youtube/vitess/go/vt/proto/throttlerdata"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo/topoproto"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	throttlerdatapb "vitess.io/vitess/go/vt/proto/throttlerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 type state string
 
 const (
 	stateIncreaseRate         state = "I"
-	stateDecreaseAndGuessRate       = "D"
-	stateEmergency                  = "E"
+	stateDecreaseAndGuessRate state = "D"
+	stateEmergency            state = "E"
 )
 
 type replicationLagChange int
@@ -55,7 +54,7 @@ const (
 // i.e. we'll ignore lag records with lower lag from other replicas while we're
 // waiting for the next record of this replica under test.
 type replicaUnderTest struct {
-	// key holds the discovery.TabletStats.Key value for the replica.
+	// key holds the discovery.LegacyTabletStats.Key value for the replica.
 	key        string
 	alias      string
 	tabletType topodatapb.TabletType
@@ -115,7 +114,7 @@ type MaxReplicationLagModule struct {
 	// max rate calculation has changed. The field is immutable (set in Start().)
 	rateUpdateChan chan<- struct{}
 
-	// lagRecords buffers the replication lag records received by the HealthCheck
+	// lagRecords buffers the replication lag records received by the LegacyHealthCheck
 	// listener. ProcessRecords() will process them.
 	lagRecords chan replicationLagRecord
 	wg         sync.WaitGroup
@@ -204,7 +203,7 @@ func (m *MaxReplicationLagModule) applyLatestConfig() {
 	}
 }
 
-func (m *MaxReplicationLagModule) getConfiguration() *throttlerdata.Configuration {
+func (m *MaxReplicationLagModule) getConfiguration() *throttlerdatapb.Configuration {
 	m.mutableConfigMu.Lock()
 	defer m.mutableConfigMu.Unlock()
 
@@ -212,14 +211,14 @@ func (m *MaxReplicationLagModule) getConfiguration() *throttlerdata.Configuratio
 	return &configCopy
 }
 
-func (m *MaxReplicationLagModule) updateConfiguration(configuration *throttlerdata.Configuration, copyZeroValues bool) error {
+func (m *MaxReplicationLagModule) updateConfiguration(configuration *throttlerdatapb.Configuration, copyZeroValues bool) error {
 	m.mutableConfigMu.Lock()
 	defer m.mutableConfigMu.Unlock()
 
 	newConfig := m.mutableConfig
 
 	if copyZeroValues {
-		newConfig.Configuration = *proto.Clone(configuration).(*throttlerdata.Configuration)
+		newConfig.Configuration = *proto.Clone(configuration).(*throttlerdatapb.Configuration)
 	} else {
 		proto.Merge(&newConfig.Configuration, configuration)
 	}
@@ -241,7 +240,7 @@ func (m *MaxReplicationLagModule) resetConfiguration() {
 }
 
 // RecordReplicationLag records the current replication lag for processing.
-func (m *MaxReplicationLagModule) RecordReplicationLag(t time.Time, ts *discovery.TabletStats) {
+func (m *MaxReplicationLagModule) RecordReplicationLag(t time.Time, ts *discovery.LegacyTabletStats) {
 	m.mutableConfigMu.Lock()
 	if m.mutableConfig.MaxReplicationLagSec == ReplicationLagModuleDisabled {
 		m.mutableConfigMu.Unlock()
@@ -249,7 +248,7 @@ func (m *MaxReplicationLagModule) RecordReplicationLag(t time.Time, ts *discover
 	}
 	m.mutableConfigMu.Unlock()
 
-	// Buffer data point for now to unblock the HealthCheck listener and process
+	// Buffer data point for now to unblock the LegacyHealthCheck listener and process
 	// it asynchronously in ProcessRecords().
 	m.lagRecords <- replicationLagRecord{t, *ts}
 }
@@ -405,7 +404,7 @@ func (m *MaxReplicationLagModule) clearReplicaUnderTest(now time.Time, testedSta
 		return true, "it is no longer actively tracked"
 	}
 	if lr.LastError != nil {
-		// LastError is set i.e. HealthCheck module cannot connect and the cached
+		// LastError is set i.e. LegacyHealthCheck module cannot connect and the cached
 		// data for the replica might be outdated.
 		return true, "it has LastError set i.e. is no longer correctly tracked"
 	}
@@ -486,7 +485,7 @@ func (m *MaxReplicationLagModule) increaseRate(r *result, now time.Time, lagReco
 		return
 	}
 
-	// Calculate new rate based on the previous (preferrably highest good) rate.
+	// Calculate new rate based on the previous (preferably highest good) rate.
 	highestGood := m.memory.highestGood()
 	previousRateSource := "highest known good rate"
 	previousRate := float64(highestGood)
@@ -558,7 +557,7 @@ func (m *MaxReplicationLagModule) minTestDurationUntilNextIncrease(increase floa
 }
 
 func (m *MaxReplicationLagModule) decreaseAndGuessRate(r *result, now time.Time, lagRecordNow replicationLagRecord) {
-	// Guess slave rate based on the difference in the replication lag of this
+	// Guess replication rate based on the difference in the replication lag of this
 	// particular replica.
 	lagRecordBefore := m.lagCache(lagRecordNow).atOrAfter(lagRecordNow.Key, m.lastRateChange)
 	if lagRecordBefore.isZero() {
@@ -571,7 +570,7 @@ func (m *MaxReplicationLagModule) decreaseAndGuessRate(r *result, now time.Time,
 	if lagRecordBefore.time == lagRecordNow.time {
 		// No lag record for this replica in the time span
 		// [last rate change, current lag record).
-		// Without it we won't be able to guess the slave rate.
+		// Without it we won't be able to guess the replication rate.
 		// We err on the side of caution and reduce the rate by half the emergency
 		// decrease percentage.
 		decreaseReason := fmt.Sprintf("no previous lag record for this replica available since the last rate change (%.1f seconds ago)", now.Sub(m.lastRateChange).Seconds())
@@ -595,7 +594,7 @@ func (m *MaxReplicationLagModule) decreaseAndGuessRate(r *result, now time.Time,
 
 	if replicationLagChange == equal {
 		// The replication lag did not change. Keep going at the current rate.
-		r.Reason = fmt.Sprintf("did not decrease the rate because the lag did not change (assuming a 1s error margin)")
+		r.Reason = fmt.Sprintf("did not decrease the rate because the lag did not change (assuming a 1s error margin)") //nolint
 		return
 	}
 
@@ -619,43 +618,43 @@ func (m *MaxReplicationLagModule) decreaseAndGuessRate(r *result, now time.Time,
 		d = lagDifference
 	}
 
-	// Guess the slave capacity based on the replication lag change.
-	rate, reason := m.guessSlaveRate(r, avgMasterRate, lagBefore, lagNow, lagDifference, d)
+	// Guess the replica capacity based on the replication lag change.
+	rate, reason := m.guessReplicationRate(r, avgMasterRate, lagBefore, lagNow, lagDifference, d)
 
 	m.updateRate(r, stateDecreaseAndGuessRate, rate, reason, now, lagRecordNow, m.config.MinDurationBetweenDecreases())
 }
 
-// guessSlaveRate guesses the actual slave rate based on the new bac
+// guessReplicationRate guesses the actual replication rate based on the new bac
 // Note that "lagDifference" can be positive (lag increased) or negative (lag
 // decreased).
-func (m *MaxReplicationLagModule) guessSlaveRate(r *result, avgMasterRate float64, lagBefore, lagNow int64, lagDifference, d time.Duration) (int64, string) {
-	// avgSlaveRate is the average rate (per second) at which the slave
+func (m *MaxReplicationLagModule) guessReplicationRate(r *result, avgMasterRate float64, lagBefore, lagNow int64, lagDifference, d time.Duration) (int64, string) {
+	// avgReplicationRate is the average rate (per second) at which the replica
 	// applied transactions from the replication stream. We infer the value
 	// from the relative change in the replication lag.
-	avgSlaveRate := avgMasterRate * (d - lagDifference).Seconds() / d.Seconds()
-	if avgSlaveRate <= 0 {
-		log.Warningf("guessed slave rate was <= 0 (%v). master rate: %v d: %.1f lag difference: %.1f", avgSlaveRate, avgMasterRate, d.Seconds(), lagDifference.Seconds())
-		avgSlaveRate = 1
+	avgReplicationRate := avgMasterRate * (d - lagDifference).Seconds() / d.Seconds()
+	if avgReplicationRate <= 0 {
+		log.Warningf("guessed Replication rate was <= 0 (%v). master rate: %v d: %.1f lag difference: %.1f", avgReplicationRate, avgMasterRate, d.Seconds(), lagDifference.Seconds())
+		avgReplicationRate = 1
 	}
 	r.MasterRate = int64(avgMasterRate)
-	r.GuessedSlaveRate = int64(avgSlaveRate)
+	r.GuessedReplicationRate = int64(avgReplicationRate)
 
 	oldRequestsBehind := 0.0
-	// If the old lag was > 0s, the slave needs to catch up on that as well.
+	// If the old lag was > 0s, the replica needs to catch up on that as well.
 	if lagNow > lagBefore {
-		oldRequestsBehind = avgSlaveRate * float64(lagBefore)
+		oldRequestsBehind = avgReplicationRate * float64(lagBefore)
 	}
 	newRequestsBehind := 0.0
-	// If the lag increased (i.e. slave rate was slower), the slave must make up
+	// If the lag increased (i.e. replication rate was slower), the replica must make up
 	// for the difference in the future.
-	if avgSlaveRate < avgMasterRate {
-		newRequestsBehind = (avgMasterRate - avgSlaveRate) * d.Seconds()
+	if avgReplicationRate < avgMasterRate {
+		newRequestsBehind = (avgMasterRate - avgReplicationRate) * d.Seconds()
 	}
 	requestsBehind := oldRequestsBehind + newRequestsBehind
-	r.GuessedSlaveBacklogOld = int(oldRequestsBehind)
-	r.GuessedSlaveBacklogNew = int(newRequestsBehind)
+	r.GuessedReplicationBacklogOld = int(oldRequestsBehind)
+	r.GuessedReplicationBacklogNew = int(newRequestsBehind)
 
-	newRate := avgSlaveRate
+	newRate := avgReplicationRate
 	// Reduce the new rate such that it has time to catch up the requests it's
 	// behind within the next interval.
 	futureRequests := newRate * m.config.SpreadBacklogAcross().Seconds()
@@ -665,9 +664,9 @@ func (m *MaxReplicationLagModule) guessSlaveRate(r *result, avgMasterRate float6
 		// Backlog is too high. Reduce rate to 1 request/second.
 		// TODO(mberlin): Make this a constant.
 		newRate = 1
-		reason = fmt.Sprintf("based on the guessed slave rate of: %v the slave won't be able to process the guessed backlog of %d requests within the next %.f seconds", int64(avgSlaveRate), int64(requestsBehind), m.config.SpreadBacklogAcross().Seconds())
+		reason = fmt.Sprintf("based on the guessed replication rate of: %v the replica won't be able to process the guessed backlog of %d requests within the next %.f seconds", int64(avgReplicationRate), int64(requestsBehind), m.config.SpreadBacklogAcross().Seconds())
 	} else {
-		reason = fmt.Sprintf("new rate is %d lower than the guessed slave rate to account for a guessed backlog of %d requests over %.f seconds", int64(avgSlaveRate-newRate), int64(requestsBehind), m.config.SpreadBacklogAcross().Seconds())
+		reason = fmt.Sprintf("new rate is %d lower than the guessed replication rate to account for a guessed backlog of %d requests over %.f seconds", int64(avgReplicationRate-newRate), int64(requestsBehind), m.config.SpreadBacklogAcross().Seconds())
 	}
 
 	return int64(newRate), reason

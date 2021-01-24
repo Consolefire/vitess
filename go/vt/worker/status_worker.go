@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -49,6 +49,9 @@ const (
 
 	// WorkerStateDiff is set when the worker compares the data.
 	WorkerStateDiff StatusWorkerState = "running the diff"
+
+	// WorkerStateDiffWillFail is set when the worker is still comparing the data, but we have already found discrepancies.
+	WorkerStateDiffWillFail StatusWorkerState = "running the diff, already found differences"
 
 	// WorkerStateDebugRunning is set when an internal command (e.g. Block or Ping) is currently running.
 	WorkerStateDebugRunning StatusWorkerState = "running an internal debug command"

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,11 +22,11 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/youtube/vitess/go/vt/binlog/binlogplayertest"
-	"github.com/youtube/vitess/go/vt/binlog/grpcbinlogstreamer"
+	"vitess.io/vitess/go/vt/binlog/binlogplayertest"
+	"vitess.io/vitess/go/vt/binlog/grpcbinlogstreamer"
 
-	binlogservicepb "github.com/youtube/vitess/go/vt/proto/binlogservice"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	binlogservicepb "vitess.io/vitess/go/vt/proto/binlogservice"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // the test here creates a fake server implementation, a fake client

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,13 +22,13 @@ import (
 	"fmt"
 	"time"
 
-	log "github.com/golang/glog"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
 )
 
-// vtctlClientProtocol specifices which RPC client implementation should be used.
+// vtctlClientProtocol specifics which RPC client implementation should be used.
 var vtctlClientProtocol = flag.String("vtctl_client_protocol", "grpc", "the protocol to use to talk to the vtctl server")
 
 // VtctlClient defines the interface used to send remote vtctl commands
@@ -42,7 +42,7 @@ type VtctlClient interface {
 }
 
 // Factory functions are registered by client implementations
-type Factory func(addr string, connectTimeout time.Duration) (VtctlClient, error)
+type Factory func(addr string) (VtctlClient, error)
 
 var factories = make(map[string]Factory)
 
@@ -66,10 +66,10 @@ func UnregisterFactoryForTest(name string) {
 }
 
 // New allows a user of the client library to get its implementation.
-func New(addr string, connectTimeout time.Duration) (VtctlClient, error) {
+func New(addr string) (VtctlClient, error) {
 	factory, ok := factories[*vtctlClientProtocol]
 	if !ok {
 		return nil, fmt.Errorf("unknown vtctl client protocol: %v", *vtctlClientProtocol)
 	}
-	return factory(addr, connectTimeout)
+	return factory(addr)
 }

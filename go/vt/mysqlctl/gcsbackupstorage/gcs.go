@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,19 +26,19 @@ import (
 	"strings"
 	"sync"
 
+	"context"
+
 	"cloud.google.com/go/storage"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
-	"github.com/youtube/vitess/go/trace"
-	"github.com/youtube/vitess/go/vt/mysqlctl/backupstorage"
+	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 )
 
 var (
-	_ = flag.String("gcs_backup_storage_project", "", "This flag is unused and deprecated. It will be removed entirely in a future release.")
-
 	// bucket is where the backups will go.
 	bucket = flag.String("gcs_backup_storage_bucket", "", "Google Cloud Storage bucket to use for backups")
 
@@ -53,6 +53,22 @@ type GCSBackupHandle struct {
 	dir      string
 	name     string
 	readOnly bool
+	errors   concurrency.AllErrorRecorder
+}
+
+// RecordError is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) RecordError(err error) {
+	bh.errors.RecordError(err)
+}
+
+// HasErrors is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) HasErrors() bool {
+	return bh.errors.HasErrors()
+}
+
+// Error is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) Error() error {
+	return bh.errors.Error()
 }
 
 // Directory implements BackupHandle.
@@ -66,7 +82,7 @@ func (bh *GCSBackupHandle) Name() string {
 }
 
 // AddFile implements BackupHandle.
-func (bh *GCSBackupHandle) AddFile(ctx context.Context, filename string) (io.WriteCloser, error) {
+func (bh *GCSBackupHandle) AddFile(ctx context.Context, filename string, filesize int64) (io.WriteCloser, error) {
 	if bh.readOnly {
 		return nil, fmt.Errorf("AddFile cannot be called on read-only backup")
 	}
@@ -117,7 +133,14 @@ func (bs *GCSBackupStorage) ListBackups(ctx context.Context, dir string) ([]back
 
 	// List prefixes that begin with dir (i.e. list subdirs).
 	var subdirs []string
-	searchPrefix := objName(dir, "" /* include trailing slash */)
+
+	var searchPrefix string
+	if dir == "/" {
+		searchPrefix = ""
+	} else {
+		searchPrefix = objName(dir, "" /* include trailing slash */)
+	}
+
 	query := &storage.Query{
 		Delimiter: "/",
 		Prefix:    searchPrefix,
@@ -230,7 +253,7 @@ func (bs *GCSBackupStorage) client(ctx context.Context) (*storage.Client, error)
 		// the creation context, so we create a new one, but
 		// keep the span information.
 		ctx = trace.CopySpan(context.Background(), ctx)
-		authClient, err := google.DefaultClient(ctx)
+		authClient, err := google.DefaultClient(ctx, storage.ScopeFullControl)
 		if err != nil {
 			return nil, err
 		}

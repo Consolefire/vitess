@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,13 +29,13 @@ var (
 )
 
 func truncateQuery(query string, max int) string {
-	sql, comments := SplitTrailingComments(query)
+	sql, comments := SplitMarginComments(query)
 
 	if max == 0 || len(sql) <= max {
-		return sql + comments
+		return comments.Leading + sql + comments.Trailing
 	}
 
-	return sql[:max-12] + " [TRUNCATED]" + comments
+	return comments.Leading + sql[:max-12] + " [TRUNCATED]" + comments.Trailing
 }
 
 // TruncateForUI is used when displaying queries on various Vitess status pages

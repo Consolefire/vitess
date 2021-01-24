@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,19 +30,18 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"github.com/youtube/vitess/go/vt/vtctl/vtctlclient"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	// import the gRPC client implementation for tablet manager
-	_ "github.com/youtube/vitess/go/vt/vttablet/grpctmclient"
+	_ "vitess.io/vitess/go/vt/vttablet/grpctmclient"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func init() {
@@ -52,12 +51,12 @@ func init() {
 }
 
 // CreateTopoServer returns the test topo server properly configured
-func CreateTopoServer(t *testing.T) topo.Server {
+func CreateTopoServer(t *testing.T) *topo.Server {
 	return memorytopo.NewServer("cell1")
 }
 
 // TestSuite runs the test suite on the given topo server and client
-func TestSuite(t *testing.T, ts topo.Server, client vtctlclient.VtctlClient) {
+func TestSuite(t *testing.T, ts *topo.Server, client vtctlclient.VtctlClient) {
 	ctx := context.Background()
 
 	// Create a fake tablet
@@ -68,12 +67,12 @@ func TestSuite(t *testing.T, ts topo.Server, client vtctlclient.VtctlClient) {
 		PortMap: map[string]int32{
 			"vt": 3333,
 		},
-
-		Tags:     map[string]string{"tag": "value"},
-		Keyspace: "test_keyspace",
-		Type:     topodatapb.TabletType_MASTER,
+		MasterTermStartTime: logutil.TimeToProto(time.Date(1970, 1, 1, 1, 1, 1, 1, time.UTC)),
+		Tags:                map[string]string{"tag": "value"},
+		Keyspace:            "test_keyspace",
+		Type:                topodatapb.TabletType_MASTER,
 	}
-	topoproto.SetMysqlPort(tablet, 3334)
+	tablet.MysqlPort = 3334
 	if err := ts.CreateTablet(ctx, tablet); err != nil {
 		t.Errorf("CreateTablet: %v", err)
 	}
@@ -88,7 +87,7 @@ func TestSuite(t *testing.T, ts topo.Server, client vtctlclient.VtctlClient) {
 	if err != nil {
 		t.Fatalf("failed to get first line: %v", err)
 	}
-	expected := "cell1-0000000001 test_keyspace <null> master localhost:3333 localhost:3334 [tag: \"value\"]\n"
+	expected := "cell1-0000000001 test_keyspace <null> master localhost:3333 localhost:3334 [tag: \"value\"] 1970-01-01T01:01:01Z\n"
 	if logutil.EventString(got) != expected {
 		t.Errorf("Got unexpected log line '%v' expected '%v'", got.String(), expected)
 	}
@@ -104,7 +103,7 @@ func TestSuite(t *testing.T, ts topo.Server, client vtctlclient.VtctlClient) {
 		t.Fatalf("Remote error: %v", err)
 	}
 
-	got, err = stream.Recv()
+	_, err = stream.Recv()
 	expected = "node doesn't exist"
 	if err == nil || !strings.Contains(err.Error(), expected) {
 		t.Fatalf("Unexpected remote error, got: '%v' was expecting to find '%v'", err, expected)
@@ -116,7 +115,7 @@ func TestSuite(t *testing.T, ts topo.Server, client vtctlclient.VtctlClient) {
 		t.Fatalf("Remote error: %v", err)
 	}
 
-	got, err = stream.Recv()
+	_, err = stream.Recv()
 	expected1 := "this command panics on purpose"
 	expected2 := "uncaught vtctl panic"
 	if err == nil || !strings.Contains(err.Error(), expected1) || !strings.Contains(err.Error(), expected2) {

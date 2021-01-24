@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,9 @@ limitations under the License.
 package vitessdriver
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"net"
 	"os"
@@ -25,9 +28,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
-	"github.com/youtube/vitess/go/vt/vtgate/grpcvtgateservice"
+	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/vtgate/grpcvtgateservice"
 )
 
 var (
@@ -73,8 +81,9 @@ func TestOpen(t *testing.T) {
 			connStr: fmt.Sprintf(`{"address": "%s", "target": "@replica", "timeout": %d}`, testAddress, int64(30*time.Second)),
 			conn: &conn{
 				Configuration: Configuration{
-					Target:  "@replica",
-					Timeout: 30 * time.Second,
+					Protocol:   "grpc",
+					DriverName: "vitess",
+					Target:     "@replica",
 				},
 				convert: &converter{
 					location: time.UTC,
@@ -86,7 +95,8 @@ func TestOpen(t *testing.T) {
 			connStr: fmt.Sprintf(`{"address": "%s", "timeout": %d}`, testAddress, int64(30*time.Second)),
 			conn: &conn{
 				Configuration: Configuration{
-					Timeout: 30 * time.Second,
+					Protocol:   "grpc",
+					DriverName: "vitess",
 				},
 				convert: &converter{
 					location: time.UTC,
@@ -98,9 +108,9 @@ func TestOpen(t *testing.T) {
 			connStr: fmt.Sprintf(`{"protocol": "grpc", "address": "%s", "target": "ks:0@replica", "timeout": %d}`, testAddress, int64(30*time.Second)),
 			conn: &conn{
 				Configuration: Configuration{
-					Protocol: "grpc",
-					Target:   "ks:0@replica",
-					Timeout:  30 * time.Second,
+					Protocol:   "grpc",
+					DriverName: "vitess",
+					Target:     "ks:0@replica",
 				},
 				convert: &converter{
 					location: time.UTC,
@@ -114,7 +124,8 @@ func TestOpen(t *testing.T) {
 				testAddress, int64(30*time.Second)),
 			conn: &conn{
 				Configuration: Configuration{
-					Timeout:         30 * time.Second,
+					Protocol:        "grpc",
+					DriverName:      "vitess",
 					DefaultLocation: "America/Los_Angeles",
 				},
 				convert: &converter{
@@ -158,13 +169,19 @@ func TestOpen_InvalidJson(t *testing.T) {
 	}
 }
 
-func TestExec(t *testing.T) {
-	config := Configuration{
-		Target:  "@rdonly",
-		Timeout: 30 * time.Second,
+func TestBeginIsolation(t *testing.T) {
+	db, err := Open(testAddress, "@master")
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	want := errIsolationUnsupported.Error()
+	if err == nil || err.Error() != want {
+		t.Errorf("Begin: %v, want %s", err, want)
 	}
+}
 
-	db, err := Open(testAddress, "@rdonly", config.Timeout)
+func TestExec(t *testing.T) {
+	db, err := Open(testAddress, "@rdonly")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,10 +222,9 @@ func TestConfigurationToJSON(t *testing.T) {
 		Protocol:        "some-invalid-protocol",
 		Target:          "ks2",
 		Streaming:       true,
-		Timeout:         1 * time.Second,
 		DefaultLocation: "Local",
 	}
-	want := `{"Protocol":"some-invalid-protocol","Address":"","Target":"ks2","Streaming":true,"Timeout":1000000000,"DefaultLocation":"Local"}`
+	want := `{"Protocol":"some-invalid-protocol","Address":"","Target":"ks2","Streaming":true,"DefaultLocation":"Local"}`
 
 	json, err := config.toJSON()
 	if err != nil {
@@ -220,7 +236,7 @@ func TestConfigurationToJSON(t *testing.T) {
 }
 
 func TestExecStreamingNotAllowed(t *testing.T) {
-	db, err := OpenForStreaming(testAddress, "@rdonly", 30*time.Second)
+	db, err := OpenForStreaming(testAddress, "@rdonly")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +266,6 @@ func TestQuery(t *testing.T) {
 				Protocol: "grpc",
 				Address:  testAddress,
 				Target:   "@rdonly",
-				Timeout:  30 * time.Second,
 			},
 			requestName: "request",
 		},
@@ -260,7 +275,6 @@ func TestQuery(t *testing.T) {
 				Protocol:  "grpc",
 				Address:   testAddress,
 				Target:    "@rdonly",
-				Timeout:   30 * time.Second,
 				Streaming: true,
 			},
 			requestName: "request",
@@ -342,6 +356,89 @@ func TestQuery(t *testing.T) {
 	}
 }
 
+func TestBindVars(t *testing.T) {
+	var testcases = []struct {
+		desc   string
+		in     []driver.NamedValue
+		out    map[string]*querypb.BindVariable
+		outErr string
+	}{{
+		desc: "all names",
+		in: []driver.NamedValue{{
+			Name:  "n1",
+			Value: int64(0),
+		}, {
+			Name:  "n2",
+			Value: "abcd",
+		}},
+		out: map[string]*querypb.BindVariable{
+			"n1": sqltypes.Int64BindVariable(0),
+			"n2": sqltypes.StringBindVariable("abcd"),
+		},
+	}, {
+		desc: "prefixed names",
+		in: []driver.NamedValue{{
+			Name:  ":n1",
+			Value: int64(0),
+		}, {
+			Name:  "@n2",
+			Value: "abcd",
+		}},
+		out: map[string]*querypb.BindVariable{
+			"n1": sqltypes.Int64BindVariable(0),
+			"n2": sqltypes.StringBindVariable("abcd"),
+		},
+	}, {
+		desc: "all positional",
+		in: []driver.NamedValue{{
+			Ordinal: 1,
+			Value:   int64(0),
+		}, {
+			Ordinal: 2,
+			Value:   "abcd",
+		}},
+		out: map[string]*querypb.BindVariable{
+			"v1": sqltypes.Int64BindVariable(0),
+			"v2": sqltypes.StringBindVariable("abcd"),
+		},
+	}, {
+		desc: "name, then position",
+		in: []driver.NamedValue{{
+			Name:  "n1",
+			Value: int64(0),
+		}, {
+			Ordinal: 2,
+			Value:   "abcd",
+		}},
+		outErr: errNoIntermixing.Error(),
+	}, {
+		desc: "position, then name",
+		in: []driver.NamedValue{{
+			Ordinal: 1,
+			Value:   int64(0),
+		}, {
+			Name:  "n2",
+			Value: "abcd",
+		}},
+		outErr: errNoIntermixing.Error(),
+	}}
+
+	converter := &converter{}
+
+	for _, tc := range testcases {
+		t.Run(tc.desc, func(t *testing.T) {
+			bv, err := converter.bindVarsFromNamedValues(tc.in)
+			if tc.outErr != "" {
+				assert.EqualError(t, err, tc.outErr)
+			} else {
+				if !reflect.DeepEqual(bv, tc.out) {
+					t.Errorf("%s: %v, want %v", tc.desc, bv, tc.out)
+				}
+			}
+		})
+	}
+}
+
 func TestDatetimeQuery(t *testing.T) {
 	var testcases = []struct {
 		desc        string
@@ -354,7 +451,6 @@ func TestDatetimeQuery(t *testing.T) {
 				Protocol: "grpc",
 				Address:  testAddress,
 				Target:   "@rdonly",
-				Timeout:  30 * time.Second,
 			},
 			requestName: "requestDates",
 		},
@@ -364,7 +460,6 @@ func TestDatetimeQuery(t *testing.T) {
 				Protocol:        "grpc",
 				Address:         testAddress,
 				Target:          "@rdonly",
-				Timeout:         30 * time.Second,
 				DefaultLocation: "Local",
 			},
 			requestName: "requestDates",
@@ -375,7 +470,6 @@ func TestDatetimeQuery(t *testing.T) {
 				Protocol:  "grpc",
 				Address:   testAddress,
 				Target:    "@rdonly",
-				Timeout:   30 * time.Second,
 				Streaming: true,
 			},
 			requestName: "requestDates",
@@ -460,7 +554,6 @@ func TestTx(t *testing.T) {
 		Protocol: "grpc",
 		Address:  testAddress,
 		Target:   "@master",
-		Timeout:  30 * time.Second,
 	}
 
 	db, err := OpenWithConfiguration(c)
@@ -490,9 +583,8 @@ func TestTx(t *testing.T) {
 	// Commit on committed transaction is caught by Golang sql package.
 	// We actually don't have to cover this in our code.
 	err = tx.Commit()
-	want := "sql: Transaction has already been committed or rolled back"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("err: %v, does not contain %s", err, want)
+	if err != sql.ErrTxDone {
+		t.Errorf("err: %v, not ErrTxDone", err)
 	}
 
 	// Test rollback now.
@@ -515,14 +607,13 @@ func TestTx(t *testing.T) {
 	// Rollback on rolled back transaction is caught by Golang sql package.
 	// We actually don't have to cover this in our code.
 	err = tx.Rollback()
-	want = "sql: Transaction has already been committed or rolled back"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("err: %v, does not contain %s", err, want)
+	if err != sql.ErrTxDone {
+		t.Errorf("err: %v, not ErrTxDone", err)
 	}
 }
 
 func TestTxExecStreamingNotAllowed(t *testing.T) {
-	db, err := OpenForStreaming(testAddress, "@rdonly", 30*time.Second)
+	db, err := OpenForStreaming(testAddress, "@rdonly")
 	if err != nil {
 		t.Fatal(err)
 	}

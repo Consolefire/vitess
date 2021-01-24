@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,13 +26,24 @@ type ConnParams struct {
 	UnixSocket string `json:"unix_socket"`
 	Charset    string `json:"charset"`
 	Flags      uint64 `json:"flags"`
+	Flavor     string `json:"flavor,omitempty"`
 
 	// The following SSL flags are only used when flags |= 2048
 	// is set (CapabilityClientSSL).
-	SslCa     string `json:"ssl_ca"`
-	SslCaPath string `json:"ssl_ca_path"`
-	SslCert   string `json:"ssl_cert"`
-	SslKey    string `json:"ssl_key"`
+	SslCa            string `json:"ssl_ca"`
+	SslCaPath        string `json:"ssl_ca_path"`
+	SslCert          string `json:"ssl_cert"`
+	SslKey           string `json:"ssl_key"`
+	ServerName       string `json:"server_name"`
+	ConnectTimeoutMs uint64 `json:"connect_timeout_ms"`
+
+	// The following is only set when the deprecated "dbname" flags are
+	// supplied and will be removed.
+	DeprecatedDBName string
+
+	// The following is only set to force the client to connect without
+	// using CapabilityClientDeprecateEOF
+	DisableClientDeprecateEOF bool
 }
 
 // EnableSSL will set the right flag on the parameters.

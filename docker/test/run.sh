@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2017 Google Inc.
+# Copyright 2019 The Vitess Authors.
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -98,7 +98,8 @@ while true ; do
 done
 # Positional flags.
 flavor=$1
-cmd=$2
+version=${2:-0}
+cmd=$3
 args=
 
 if [[ -z "$flavor" ]]; then
@@ -111,11 +112,11 @@ if [[ -z "$cmd" ]]; then
 fi
 
 if [[ ! -f bootstrap.sh ]]; then
-  echo "This script should be run from the root of the Vitess source tree - e.g. ~/src/github.com/youtube/vitess"
+  echo "This script should be run from the root of the Vitess source tree - e.g. ~/src/vitess.io/vitess"
   exit 1
 fi
 
-image=vitess/bootstrap:$flavor
+image=vitess/bootstrap:$version-$flavor
 if [[ -n "$existing_cache_image" ]]; then
   image=$existing_cache_image
 fi
@@ -124,6 +125,11 @@ fi
 # Mirror permissions to "other" from the owning group (for which we assume it has at least rX permissions).
 chmod -R o=g .
 
+# This is required by the vtctld_web_test.py test.
+# Otherwise, /usr/bin/chromium will crash with the error:
+# "Failed to move to new namespace: PID namespaces supported, Network namespace supported, but failed: errno = Operation not permitted"
+args="$args --cap-add=SYS_ADMIN"
+
 args="$args -v /dev/log:/dev/log"
 args="$args -v $PWD:/tmp/src"
 
@@ -131,6 +137,10 @@ args="$args -v $PWD:/tmp/src"
 mkdir -p /tmp/mavencache
 chmod 777 /tmp/mavencache
 args="$args -v /tmp/mavencache:/home/vitess/.m2"
+
+# Add in the vitess user
+args="$args --user vitess"
+args="$args -v $PWD/test/bin:/tmp/bin"
 
 # Mount in host VTDATAROOT if one exists, since it might be a RAM disk or SSD.
 if [[ -n "$VTDATAROOT" ]]; then
@@ -152,31 +162,32 @@ case "$mode" in
   "create_cache") echo "Creating cache image $cache_image ..." ;;
 esac
 
-# Construct "cp" command to copy the source code.
-#
-# TODO(mberlin): Copy vendor/vendor.json file such that we can run a diff against the file on the image.
-# Copy the full source tree except:
-# - php/vendor
-# - vendor
-# That's because these directories are already part of the image.
-#
-# Note that we're using the Bash extended Glob support "(!php|vendor)" on
-# purpose here to minimize the size of the cache image: With this trick,
-# we do not move or overwrite the existing files while copying the other
-# directories. Therefore, the existing files do not count as changed and will
-# not be part of the new Docker layer of the cache image.
-copy_src_cmd="cp -R /tmp/src/!(php|vendor) . && cp -R /tmp/src/php/!(vendor) php/"
-# Copy the .git directory because travis/check_make_proto.sh needs a working
-# Git repository.
-copy_src_cmd=$(append_cmd "$copy_src_cmd" "cp -R /tmp/src/.git .")
+bashcmd=""
 
-# Construct the command we will actually run.
-#
-# Uncomment the next line if you need to debug "bashcmd".
-#bashcmd="set -x"
 if [[ -z "$existing_cache_image" ]]; then
-  bashcmd=$(append_cmd "$bashcmd" "$copy_src_cmd")
+
+  # Construct "cp" command to copy the source code.
+  bashcmd=$(append_cmd "$bashcmd" "cp -R /tmp/src/!(vtdataroot|dist|bin|lib|vthook) . && cp -R /tmp/src/.git .")
+
 fi
+
+# Reset the environment if this was an old bootstrap. We can detect this from VTTOP presence.
+bashcmd=$(append_cmd "$bashcmd" "export VTROOT=/vt/src/vitess.io/vitess")
+bashcmd=$(append_cmd "$bashcmd" "export VTDATAROOT=/vt/vtdataroot")
+bashcmd=$(append_cmd "$bashcmd" "export EXTRA_BIN=/tmp/bin")
+
+bashcmd=$(append_cmd "$bashcmd" "mkdir -p dist; mkdir -p bin; mkdir -p lib; mkdir -p vthook")
+bashcmd=$(append_cmd "$bashcmd" "rm -rf /vt/dist; ln -s /vt/src/vitess.io/vitess/dist /vt/dist")
+bashcmd=$(append_cmd "$bashcmd" "rm -rf /vt/bin; ln -s /vt/src/vitess.io/vitess/bin /vt/bin")
+bashcmd=$(append_cmd "$bashcmd" "rm -rf /vt/lib; ln -s /vt/src/vitess.io/vitess/lib /vt/lib")
+bashcmd=$(append_cmd "$bashcmd" "rm -rf /vt/vthook; ln -s /vt/src/vitess.io/vitess/vthook /vt/vthook")
+
+# Maven was setup in /vt/dist, may need to reinstall it.
+bashcmd=$(append_cmd "$bashcmd" "echo 'Checking if mvn needs installing...'; if [[ ! \$(command -v mvn) ]]; then echo 'install maven'; curl -sL --connect-timeout 10 --retry 3 http://www-us.apache.org/dist/maven/maven-3/3.3.9/binaries/apache-maven-3.3.9-bin.tar.gz | tar -xz && mv apache-maven-3.3.9 /vt/dist/maven; fi; echo 'mvn check done'")
+
+# Run bootstrap every time now
+bashcmd=$(append_cmd "$bashcmd" "./bootstrap.sh")
+
 # At last, append the user's command.
 bashcmd=$(append_cmd "$bashcmd" "$cmd")
 

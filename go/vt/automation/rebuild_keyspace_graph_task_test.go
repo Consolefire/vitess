@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ import (
 	"flag"
 	"testing"
 
-	"github.com/youtube/vitess/go/vt/vtctl/fakevtctlclient"
-	"github.com/youtube/vitess/go/vt/vtctl/vtctlclient"
+	"vitess.io/vitess/go/vt/vtctl/fakevtctlclient"
+	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
 )
 
 func TestRebuildKeyspaceGraphTask(t *testing.T) {

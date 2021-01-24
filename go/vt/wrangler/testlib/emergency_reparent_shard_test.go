@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,55 +17,89 @@ limitations under the License.
 package testlib
 
 import (
-	"strings"
+	"context"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
 
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/wrangler"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/wrangler"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func TestEmergencyReparentShard(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ts := memorytopo.NewServer("cell1", "cell2")
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 	vp := NewVtctlPipe(t, ts)
 	defer vp.Close()
 
-	// Create a master, a couple good slaves
+	// Create a master, a couple good replicas
 	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, nil)
 	newMaster := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, nil)
-	goodSlave1 := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
-	goodSlave2 := NewFakeTablet(t, wr, "cell2", 3, topodatapb.TabletType_REPLICA, nil)
+	goodReplica1 := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
+	goodReplica2 := NewFakeTablet(t, wr, "cell2", 3, topodatapb.TabletType_REPLICA, nil)
+
+	oldMaster.FakeMysqlDaemon.Replicating = false
+	oldMaster.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 456,
+			},
+		},
+	}
+	currentMasterFilePosition, _ := mysql.ParseFilePosGTIDSet("mariadb-bin.000010:456")
+	oldMaster.FakeMysqlDaemon.CurrentMasterFilePosition = mysql.Position{
+		GTIDSet: currentMasterFilePosition,
+	}
 
 	// new master
 	newMaster.FakeMysqlDaemon.ReadOnly = true
 	newMaster.FakeMysqlDaemon.Replicating = true
 	newMaster.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTID{
-			Domain:   2,
-			Server:   123,
-			Sequence: 456,
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 456,
+			},
 		},
 	}
+	newMasterRelayLogPos, _ := mysql.ParseFilePosGTIDSet("relay-bin.000004:456")
+	newMaster.FakeMysqlDaemon.CurrentMasterFilePosition = mysql.Position{
+		GTIDSet: newMasterRelayLogPos,
+	}
+	newMaster.FakeMysqlDaemon.WaitMasterPosition = newMaster.FakeMysqlDaemon.CurrentMasterFilePosition
 	newMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
+		"STOP SLAVE IO_THREAD",
 		"CREATE DATABASE IF NOT EXISTS _vt",
 		"SUBCREATE TABLE IF NOT EXISTS _vt.reparent_journal",
 		"SUBINSERT INTO _vt.reparent_journal (time_created_ns, action_name, master_alias, replication_position) VALUES",
 	}
-	newMaster.FakeMysqlDaemon.PromoteSlaveResult = mysql.Position{
-		GTIDSet: mysql.MariadbGTID{
-			Domain:   2,
-			Server:   123,
-			Sequence: 456,
+	newMaster.FakeMysqlDaemon.PromoteResult = mysql.Position{
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 456,
+			},
 		},
 	}
 	newMaster.StartActionLoop(t, wr)
@@ -73,142 +107,182 @@ func TestEmergencyReparentShard(t *testing.T) {
 
 	// old master, will be scrapped
 	oldMaster.FakeMysqlDaemon.ReadOnly = false
+	oldMaster.FakeMysqlDaemon.ReplicationStatusError = mysql.ErrNotReplica
+	oldMaster.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
+	oldMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		"STOP SLAVE",
+	}
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
-	// good slave 1 is replicating
-	goodSlave1.FakeMysqlDaemon.ReadOnly = true
-	goodSlave1.FakeMysqlDaemon.Replicating = true
-	goodSlave1.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTID{
-			Domain:   2,
-			Server:   123,
-			Sequence: 455,
+	// good replica 1 is replicating
+	goodReplica1.FakeMysqlDaemon.ReadOnly = true
+	goodReplica1.FakeMysqlDaemon.Replicating = true
+	goodReplica1.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 455,
+			},
 		},
 	}
-	goodSlave1.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
-	goodSlave1.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+	goodReplica1RelayLogPos, _ := mysql.ParseFilePosGTIDSet("relay-bin.000004:455")
+	goodReplica1.FakeMysqlDaemon.CurrentMasterFilePosition = mysql.Position{
+		GTIDSet: goodReplica1RelayLogPos,
+	}
+	goodReplica1.FakeMysqlDaemon.WaitMasterPosition = goodReplica1.FakeMysqlDaemon.CurrentMasterFilePosition
+	goodReplica1.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
+	goodReplica1.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		"STOP SLAVE IO_THREAD",
 		"STOP SLAVE",
 		"FAKE SET MASTER",
 		"START SLAVE",
 	}
-	goodSlave1.StartActionLoop(t, wr)
-	defer goodSlave1.StopActionLoop(t)
+	goodReplica1.StartActionLoop(t, wr)
+	defer goodReplica1.StopActionLoop(t)
 
-	// good slave 2 is not replicating
-	goodSlave2.FakeMysqlDaemon.ReadOnly = true
-	goodSlave2.FakeMysqlDaemon.Replicating = false
-	goodSlave2.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTID{
-			Domain:   2,
-			Server:   123,
-			Sequence: 454,
+	// good replica 2 is not replicating
+	goodReplica2.FakeMysqlDaemon.ReadOnly = true
+	goodReplica2.FakeMysqlDaemon.Replicating = false
+	goodReplica2.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 454,
+			},
 		},
 	}
-	goodSlave2.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
-	goodSlave2.StartActionLoop(t, wr)
-	goodSlave2.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+	goodReplica2RelayLogPos, _ := mysql.ParseFilePosGTIDSet("relay-bin.000004:454")
+	goodReplica2.FakeMysqlDaemon.CurrentMasterFilePosition = mysql.Position{
+		GTIDSet: goodReplica2RelayLogPos,
+	}
+	goodReplica2.FakeMysqlDaemon.WaitMasterPosition = goodReplica2.FakeMysqlDaemon.CurrentMasterFilePosition
+	goodReplica2.FakeMysqlDaemon.SetMasterInput = topoproto.MysqlAddr(newMaster.Tablet)
+	goodReplica2.StartActionLoop(t, wr)
+	goodReplica2.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE SET MASTER",
 	}
-	defer goodSlave2.StopActionLoop(t)
+	defer goodReplica2.StopActionLoop(t)
 
 	// run EmergencyReparentShard
-	if err := vp.Run([]string{"EmergencyReparentShard", "-wait_slave_timeout", "10s", newMaster.Tablet.Keyspace + "/" + newMaster.Tablet.Shard, topoproto.TabletAliasString(newMaster.Tablet.Alias)}); err != nil {
-		t.Fatalf("EmergencyReparentShard failed: %v", err)
-	}
-
+	// using deprecated flag until it is removed completely. at that time this should be replaced with -wait_replicas_timeout
+	waitReplicaTimeout := time.Second * 2
+	err := vp.Run([]string{"EmergencyReparentShard", "-wait_replicas_timeout", waitReplicaTimeout.String(), newMaster.Tablet.Keyspace + "/" + newMaster.Tablet.Shard,
+		topoproto.TabletAliasString(newMaster.Tablet.Alias)})
+	require.NoError(t, err)
 	// check what was run
-	if err := newMaster.FakeMysqlDaemon.CheckSuperQueryList(); err != nil {
-		t.Fatalf("newMaster.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
-	}
-	if err := oldMaster.FakeMysqlDaemon.CheckSuperQueryList(); err != nil {
-		t.Fatalf("oldMaster.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
-	}
-	if err := goodSlave1.FakeMysqlDaemon.CheckSuperQueryList(); err != nil {
-		t.Fatalf("goodSlave1.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
-	}
-	if err := goodSlave2.FakeMysqlDaemon.CheckSuperQueryList(); err != nil {
-		t.Fatalf("goodSlave2.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
-	}
-	if newMaster.FakeMysqlDaemon.ReadOnly {
-		t.Errorf("newMaster.FakeMysqlDaemon.ReadOnly set")
-	}
-	// old master read-only flag doesn't matter, it is scrapped
-	if !goodSlave1.FakeMysqlDaemon.ReadOnly {
-		t.Errorf("goodSlave1.FakeMysqlDaemon.ReadOnly not set")
-	}
-	if !goodSlave2.FakeMysqlDaemon.ReadOnly {
-		t.Errorf("goodSlave2.FakeMysqlDaemon.ReadOnly not set")
-	}
-	if !goodSlave1.FakeMysqlDaemon.Replicating {
-		t.Errorf("goodSlave1.FakeMysqlDaemon.Replicating not set")
-	}
-	if goodSlave2.FakeMysqlDaemon.Replicating {
-		t.Errorf("goodSlave2.FakeMysqlDaemon.Replicating set")
-	}
+	err = newMaster.FakeMysqlDaemon.CheckSuperQueryList()
+	require.NoError(t, err)
+
+	assert.False(t, newMaster.FakeMysqlDaemon.ReadOnly, "newMaster.FakeMysqlDaemon.ReadOnly set")
 	checkSemiSyncEnabled(t, true, true, newMaster)
-	checkSemiSyncEnabled(t, false, true, goodSlave1, goodSlave2)
 }
 
 // TestEmergencyReparentShardMasterElectNotBest tries to emergency reparent
 // to a host that is not the latest in replication position.
 func TestEmergencyReparentShardMasterElectNotBest(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	ts := memorytopo.NewServer("cell1", "cell2")
 	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 
-	// Create a master, a couple good slaves
+	// Create a master, a couple good replicas
 	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, nil)
 	newMaster := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, nil)
-	moreAdvancedSlave := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
+	moreAdvancedReplica := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
 
 	// new master
 	newMaster.FakeMysqlDaemon.Replicating = true
+	// this server has executed upto 455, which is the highest among replicas
 	newMaster.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTID{
-			Domain:   2,
-			Server:   123,
-			Sequence: 456,
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 455,
+			},
 		},
 	}
+	// It has more transactions in its relay log, but not as many as
+	// moreAdvancedReplica
+	newMaster.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 456,
+			},
+		},
+	}
+	newMasterRelayLogPos, _ := mysql.ParseFilePosGTIDSet("relay-bin.000004:456")
+	newMaster.FakeMysqlDaemon.CurrentMasterFilePosition = mysql.Position{
+		GTIDSet: newMasterRelayLogPos,
+	}
+	newMaster.FakeMysqlDaemon.WaitMasterPosition = newMaster.FakeMysqlDaemon.CurrentMasterFilePosition
 	newMaster.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
+		"STOP SLAVE IO_THREAD",
 	}
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	// old master, will be scrapped
+	oldMaster.FakeMysqlDaemon.ReplicationStatusError = mysql.ErrNotReplica
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
-	// more advanced slave
-	moreAdvancedSlave.FakeMysqlDaemon.Replicating = true
-	moreAdvancedSlave.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTID{
-			Domain:   2,
-			Server:   123,
-			Sequence: 457,
+	// more advanced replica
+	moreAdvancedReplica.FakeMysqlDaemon.Replicating = true
+	// position up to which this replica has executed is behind desired new master
+	moreAdvancedReplica.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 454,
+			},
 		},
 	}
-	moreAdvancedSlave.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
+	// relay log position is more advanced than desired new master
+	moreAdvancedReplica.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
+		GTIDSet: mysql.MariadbGTIDSet{
+			2: mysql.MariadbGTID{
+				Domain:   2,
+				Server:   123,
+				Sequence: 457,
+			},
+		},
 	}
-	moreAdvancedSlave.StartActionLoop(t, wr)
-	defer moreAdvancedSlave.StopActionLoop(t)
+	moreAdvancedReplicaLogPos, _ := mysql.ParseFilePosGTIDSet("relay-bin.000004:457")
+	moreAdvancedReplica.FakeMysqlDaemon.CurrentMasterFilePosition = mysql.Position{
+		GTIDSet: moreAdvancedReplicaLogPos,
+	}
+	moreAdvancedReplica.FakeMysqlDaemon.WaitMasterPosition = moreAdvancedReplica.FakeMysqlDaemon.CurrentMasterFilePosition
+	moreAdvancedReplica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		"STOP SLAVE IO_THREAD",
+	}
+	moreAdvancedReplica.StartActionLoop(t, wr)
+	defer moreAdvancedReplica.StopActionLoop(t)
 
 	// run EmergencyReparentShard
-	if err := wr.EmergencyReparentShard(ctx, newMaster.Tablet.Keyspace, newMaster.Tablet.Shard, newMaster.Tablet.Alias, 10*time.Second); err == nil || !strings.Contains(err.Error(), "is more advanced than master elect tablet") {
-		t.Fatalf("EmergencyReparentShard returned the wrong error: %v", err)
-	}
+	err := wr.EmergencyReparentShard(ctx, newMaster.Tablet.Keyspace, newMaster.Tablet.Shard, newMaster.Tablet.Alias, 10*time.Second, sets.NewString())
+	cancel()
 
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "is not fully caught up")
 	// check what was run
-	if err := newMaster.FakeMysqlDaemon.CheckSuperQueryList(); err != nil {
-		t.Fatalf("newMaster.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
-	}
-	if err := oldMaster.FakeMysqlDaemon.CheckSuperQueryList(); err != nil {
-		t.Fatalf("oldMaster.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
-	}
-	if err := moreAdvancedSlave.FakeMysqlDaemon.CheckSuperQueryList(); err != nil {
-		t.Fatalf("moreAdvancedSlave.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
-	}
+	err = newMaster.FakeMysqlDaemon.CheckSuperQueryList()
+	require.NoError(t, err)
+	err = oldMaster.FakeMysqlDaemon.CheckSuperQueryList()
+	require.NoError(t, err)
+	err = moreAdvancedReplica.FakeMysqlDaemon.CheckSuperQueryList()
+	require.NoError(t, err)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 // Functions in this file should only be used for testing.
@@ -56,15 +56,20 @@ func MakeTestFields(names, types string) []*querypb.Field {
 //     "10|abcd",
 //   )
 // The field type values are set as the types for the rows built.
-// Spaces are trimmed from row values.
+// Spaces are trimmed from row values. "null" is treated as NULL.
 func MakeTestResult(fields []*querypb.Field, rows ...string) *Result {
 	result := &Result{
 		Fields: fields,
-		Rows:   make([][]Value, len(rows)),
+	}
+	if len(rows) > 0 {
+		result.Rows = make([][]Value, len(rows))
 	}
 	for i, row := range rows {
 		result.Rows[i] = make([]Value, len(fields))
 		for j, col := range split(row) {
+			if col == "null" {
+				continue
+			}
 			result.Rows[i][j] = MakeTrusted(fields[j].Type, []byte(col))
 		}
 	}

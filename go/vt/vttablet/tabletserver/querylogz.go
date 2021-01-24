@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,11 +25,11 @@ import (
 	"text/template"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/acl"
-	"github.com/youtube/vitess/go/vt/logz"
-	"github.com/youtube/vitess/go/vt/sqlparser"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/acl"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logz"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 var (
@@ -52,6 +52,7 @@ var (
 				<th>RowsAffected</th>
 				<th>Response Size</th>
 				<th>Transaction ID</th>
+				<th>Reserved ID</th>
 				<th>Error</th>
 			</tr>
 		</thead>
@@ -80,6 +81,7 @@ var (
 			<td>{{.RowsAffected}}</td>
 			<td>{{.SizeOfResponse}}</td>
 			<td>{{.TransactionID}}</td>
+			<td>{{.ReservedID}}</td>
 			<td>{{.ErrorStr}}</td>
 		</tr>
 	`))
@@ -117,7 +119,7 @@ func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Reques
 			}
 			stats, ok := out.(*tabletenv.LogStats)
 			if !ok {
-				err := fmt.Errorf("Unexpected value in %s: %#v (expecting value of type %T)", tabletenv.TxLogger.Name(), out, &tabletenv.LogStats{})
+				err := fmt.Errorf("unexpected value in %s: %#v (expecting value of type %T)", tabletenv.TxLogger.Name(), out, &tabletenv.LogStats{})
 				io.WriteString(w, `<tr class="error">`)
 				io.WriteString(w, err.Error())
 				io.WriteString(w, "</tr>")

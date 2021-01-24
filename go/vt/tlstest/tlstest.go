@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -25,7 +25,7 @@ import (
 	"os/exec"
 	"path"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
 )
 
 const (
@@ -34,42 +34,55 @@ const (
 
 	caConfig = `
 [ req ]
- default_bits           = 1024
+ default_bits           = 4096
  default_keyfile        = keyfile.pem
  distinguished_name     = req_distinguished_name
  attributes             = req_attributes
+ x509_extensions       = req_ext
  prompt                 = no
  output_password        = mypass
 [ req_distinguished_name ]
  C                      = US
  ST                     = California
  L                      = Mountain View
- O                      = Google
+ O                      = Vitessio
  OU                     = Vitess
  CN                     = CA
  emailAddress           = test@email.address
 [ req_attributes ]
  challengePassword      = A challenge password
+[ req_ext ]
+ basicConstraints       = CA:TRUE
+
 `
 
 	certConfig = `
 [ req ]
- default_bits           = 1024
+ default_bits           = 4096
  default_keyfile        = keyfile.pem
  distinguished_name     = req_distinguished_name
  attributes             = req_attributes
+ req_extensions        = req_ext
  prompt                 = no
  output_password        = mypass
 [ req_distinguished_name ]
  C                      = US
  ST                     = California
  L                      = Mountain View
- O                      = Google
+ O                      = Vitessio
  OU                     = Vitess
  CN                     = %s
  emailAddress           = test@email.address
 [ req_attributes ]
  challengePassword      = A challenge password
+[ req_ext ]
+ basicConstraints       = CA:TRUE
+ subjectAltName         = @alternate_names
+ extendedKeyUsage       =serverAuth,clientAuth
+[ alternate_names ]
+ DNS.1                  = localhost
+ DNS.2                  = 127.0.0.1
+ DNS.3                  = %s
 `
 )
 
@@ -116,7 +129,7 @@ func CreateSignedCert(root, parent, serial, name, commonName string) {
 	req := path.Join(root, name+"-req.pem")
 
 	config := path.Join(root, name+".config")
-	if err := ioutil.WriteFile(config, []byte(fmt.Sprintf(certConfig, commonName)), os.ModePerm); err != nil {
+	if err := ioutil.WriteFile(config, []byte(fmt.Sprintf(certConfig, commonName, commonName)), os.ModePerm); err != nil {
 		log.Fatalf("cannot write file %v: %v", config, err)
 	}
 	openssl("req", "-newkey", "rsa:2048", "-days", "3600", "-nodes",
@@ -130,5 +143,55 @@ func CreateSignedCert(root, parent, serial, name, commonName string) {
 		"-CA", caCert,
 		"-CAkey", caKey,
 		"-set_serial", serial,
+		"-extensions", "req_ext",
+		"-extfile", config,
 		"-out", cert)
+}
+
+type ClientServerKeyPairs struct {
+	ServerCert string
+	ServerKey  string
+	ServerCA   string
+	ServerName string
+	ClientCert string
+	ClientKey  string
+	ClientCA   string
+}
+
+var serialCounter = 0
+
+func CreateClientServerCertPairs(root string) ClientServerKeyPairs {
+	// Create the certs and configs.
+	CreateCA(root)
+
+	serverSerial := fmt.Sprintf("%03d", serialCounter*2+1)
+	clientSerial := fmt.Sprintf("%03d", serialCounter*2+2)
+
+	serialCounter = serialCounter + 1
+
+	serverName := fmt.Sprintf("server-%s", serverSerial)
+	serverCACommonName := fmt.Sprintf("Server %s CA", serverSerial)
+	serverCertName := fmt.Sprintf("server-instance-%s", serverSerial)
+	serverCertCommonName := fmt.Sprintf("server%s.example.com", serverSerial)
+
+	clientName := fmt.Sprintf("clients-%s", serverSerial)
+	clientCACommonName := fmt.Sprintf("Clients %s CA", serverSerial)
+	clientCertName := fmt.Sprintf("client-instance-%s", serverSerial)
+	clientCertCommonName := fmt.Sprintf("Client Instance %s", serverSerial)
+
+	CreateSignedCert(root, CA, serverSerial, serverName, serverCACommonName)
+	CreateSignedCert(root, serverName, serverSerial, serverCertName, serverCertCommonName)
+
+	CreateSignedCert(root, CA, clientSerial, clientName, clientCACommonName)
+	CreateSignedCert(root, clientName, serverSerial, clientCertName, clientCertCommonName)
+
+	return ClientServerKeyPairs{
+		ServerCert: path.Join(root, fmt.Sprintf("%s-cert.pem", serverCertName)),
+		ServerKey:  path.Join(root, fmt.Sprintf("%s-key.pem", serverCertName)),
+		ServerCA:   path.Join(root, fmt.Sprintf("%s-cert.pem", serverName)),
+		ClientCert: path.Join(root, fmt.Sprintf("%s-cert.pem", clientCertName)),
+		ClientKey:  path.Join(root, fmt.Sprintf("%s-key.pem", clientCertName)),
+		ClientCA:   path.Join(root, fmt.Sprintf("%s-cert.pem", clientName)),
+		ServerName: serverCertCommonName,
+	}
 }

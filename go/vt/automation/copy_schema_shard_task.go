@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ limitations under the License.
 package automation
 
 import (
-	automationpb "github.com/youtube/vitess/go/vt/proto/automation"
-	"golang.org/x/net/context"
+	"context"
+
+	automationpb "vitess.io/vitess/go/vt/proto/automation"
 )
 
 // CopySchemaShardTask runs vtctl CopySchemaShard to copy the schema from one shard to another.

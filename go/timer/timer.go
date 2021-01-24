@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/youtube/vitess/go/sync2"
+	"vitess.io/vitess/go/sync2"
 )
 
 // Out-of-band messages
@@ -87,16 +87,20 @@ func (tm *Timer) Start(keephouse func()) {
 }
 
 func (tm *Timer) run(keephouse func()) {
+	var timer *time.Timer
 	for {
 		var ch <-chan time.Time
 		interval := tm.interval.Get()
-		if interval <= 0 {
-			ch = nil
-		} else {
-			ch = time.After(interval)
+		if interval > 0 {
+			timer = time.NewTimer(interval)
+			ch = timer.C
 		}
 		select {
 		case action := <-tm.msg:
+			if timer != nil {
+				timer.Stop()
+				timer = nil
+			}
 			switch action {
 			case timerStop:
 				return
@@ -152,4 +156,10 @@ func (tm *Timer) Stop() {
 // Interval returns the current interval.
 func (tm *Timer) Interval() time.Duration {
 	return tm.interval.Get()
+}
+
+func (tm *Timer) Running() bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.running
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,8 +16,7 @@ limitations under the License.
 
 package mysqlctl
 
-// Import the gRPC mysqlctl client.
-
 import (
-	_ "github.com/youtube/vitess/go/vt/mysqlctl/grpcmysqlctlclient"
+	// Register the gRPC mysqlctl client.
+	_ "vitess.io/vitess/go/vt/mysqlctl/grpcmysqlctlclient"
 )

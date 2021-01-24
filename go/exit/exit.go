@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -50,8 +50,8 @@ package exit
 import (
 	"os"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/tb"
+	"vitess.io/vitess/go/tb"
+	"vitess.io/vitess/go/vt/log"
 )
 
 type exitCode int

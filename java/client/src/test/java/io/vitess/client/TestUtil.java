@@ -1,12 +1,12 @@
 /*
- * Copyright 2017 Google Inc.
- * 
+ * Copyright 2019 The Vitess Authors.
+
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,23 +19,26 @@ package io.vitess.client;
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
+
+import io.vitess.proto.Query;
+import io.vitess.proto.Topodata.TabletType;
+
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Type;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.joda.time.Duration;
 import org.junit.Assert;
 import vttest.Vttest.VTTestTopology;
 
-import io.vitess.proto.Query;
-import io.vitess.proto.Topodata.TabletType;
-
 public class TestUtil {
-  static final Logger logger = LogManager.getLogger(TestUtil.class.getName());
+
+  static final Logger logger = LogManager.getLogger(TestUtil.class);
   public static final String PROPERTY_KEY_CLIENT_TEST_ENV = "vitess.client.testEnv";
   public static final String PROPERTY_KEY_CLIENT_TEST_PORT = "vitess.client.testEnv.portName";
   public static final String PROPERTY_KEY_CLIENT_FACTORY_CLASS = "vitess.client.factory";
@@ -60,10 +63,12 @@ public class TestUtil {
         continue;
       }
       try {
-        Type mapType = new TypeToken<Map<String, Object>>() {}.getType();
+        Type mapType = new TypeToken<Map<String, Object>>() {
+        }.getType();
         Map<String, Object> map = new Gson().fromJson(line, mapType);
         testEnv.setPythonScriptProcess(p);
-        testEnv.setPort(((Double)map.get(System.getProperty(PROPERTY_KEY_CLIENT_TEST_PORT))).intValue());
+        testEnv.setPort(
+            ((Double) map.get(System.getProperty(PROPERTY_KEY_CLIENT_TEST_PORT))).intValue());
         return;
       } catch (JsonSyntaxException e) {
         logger.error("JsonSyntaxException parsing setup command output: " + line, e);
@@ -110,31 +115,10 @@ public class TestUtil {
     }
   }
 
-  public static VTGateBlockingConn getBlockingConn(TestEnv testEnv) {
+  public static VTGateBlockingConnection getBlockingConn(TestEnv testEnv) {
     // Dial timeout
     Context ctx = Context.getDefault().withDeadlineAfter(Duration.millis(5000));
-    return new VTGateBlockingConn(
-        getRpcClientFactory().create(ctx, "localhost:" +  testEnv.getPort()),
-        testEnv.getKeyspace());
-  }
-
-  public static void insertRows(TestEnv testEnv, int startId, int count) throws Exception {
-    try (VTGateBlockingConn conn = getBlockingConn(testEnv)) {
-      // Deadline for the overall insert loop
-      Context ctx = Context.getDefault().withDeadlineAfter(Duration.millis(5000));
-
-      VTGateBlockingTx tx = conn.begin(ctx);
-      String insertSql = "insert into vtgate_test "
-          + "(id, name, age, percent) values (:id, :name, :age, :percent)";
-      Map<String, Object> bindVars = new HashMap<>();
-      for (int id = startId; id - startId < count; id++) {
-        bindVars.put("id", id);
-        bindVars.put("name", "name_" + id);
-        bindVars.put("age", id % 10);
-        bindVars.put("percent", id / 100.0);
-        tx.execute(ctx, insertSql, bindVars, TabletType.MASTER, Query.ExecuteOptions.IncludedFields.ALL);
-      }
-      tx.commit(ctx);
-    }
+    return new VTGateBlockingConnection(
+        getRpcClientFactory().create(ctx, "localhost:" + testEnv.getPort()));
   }
 }

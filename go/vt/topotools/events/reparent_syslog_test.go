@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,16 +20,16 @@ import (
 	"log/syslog"
 	"testing"
 
-	base "github.com/youtube/vitess/go/vt/events"
-	"github.com/youtube/vitess/go/vt/topo"
+	base "vitess.io/vitess/go/vt/events"
+	"vitess.io/vitess/go/vt/topo"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func TestReparentSyslog(t *testing.T) {
 	wantSev, wantMsg := syslog.LOG_INFO, "keyspace-123/shard-123 [reparent cell-0000012345 -> cell-0000054321] status (123-456-789)"
 	tc := &Reparent{
-		ShardInfo: *topo.NewShardInfo("keyspace-123", "shard-123", nil, -1),
+		ShardInfo: *topo.NewShardInfo("keyspace-123", "shard-123", nil, nil),
 		OldMaster: topodatapb.Tablet{
 			Alias: &topodatapb.TabletAlias{
 				Cell: "cell",

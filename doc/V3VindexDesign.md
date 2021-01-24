@@ -12,7 +12,7 @@ Some changes have been made to the system since the last time the doc was writte
 * There's one VSchema per keyspace instead of a global one.
 * The concept of Table Class has been eliminated.
 * A new `sequence` table has been introduced, and sequences are orthogonal to vindexes. Any column can now be tied to a sequence.
-* We've introduced the concept of a pinned table, which allows an unsharded table to be pinned to a keypsace id, allowing you to avoid creating a separate keyspace for tiny tables. This is yet to be implemented.
+* We've introduced the concept of a pinned table, which allows an unsharded table to be pinned to a keyspace id, allowing you to avoid creating a separate keyspace for tiny tables. This is yet to be implemented.
 * Instead of a vschema editor, the DDL language will be extended to manage vindexes, and the DDL deployment tools will perform the necessary work.
 
 ## Objective
@@ -68,19 +68,19 @@ We introduce the new term ‘vindex’ so that we can differentiate from the tra
 
 The vindex type is basically an indexing scheme represented by code. It can be a lookup index, or a hash, or anything else. A vindex type has a name that’s indicative of what kind of algorithm it implements to map a value to a keyspace id. A vindex type is not associated to any particular keyspace id or table. The list of vindex types is a very static list. New types have to be compiled into vitess.
 
-For example, a “lookup\_hash\_unique\_autoinc” index is one that will use a lookup table to convert a value, and hash it to compute the keyspace\_id. Additionally, it ensures that the values are unique, and it’s also capable of generating new values if needed.
+For example, a “lookup\_unique\_autoinc” index is one that will use a lookup table to convert a value, and hash it to compute the keyspace\_id. Additionally, it ensures that the values are unique, and it’s also capable of generating new values if needed.
 
-There is a hint here that there may be a “lookup\_hash\_autoinc”. Indeed there is. Just like database indexes, there are practical justifications for non-unique vindexes. In the future, we can also explore composite vindexes.
+There is a hint here that there may be a “lookup\_autoinc”. Indeed there is. Just like database indexes, there are practical justifications for non-unique vindexes. In the future, we can also explore composite vindexes.
 
 This is the currently supported list of vindex types:
 
 * **numeric**: binpack a uint64 into a keyspace_id
 * **hash**: hashes a uint64 into a keyspace_id
 * **hash_autoinc**: Same as hash, but can generate autoincrement values
-* **lookup\_hash**: Uses a lookup table, and hashes the result to generate a keyspace\_id. It’s non-unique.
-* **lookup\_hash\_unique**: lookup\_hash, but unique
-* **lookup\_hash\_autoinc**
-* **lookup\_hash\_unique\_autoinc**
+* **lookup**: Uses a lookup table, and hashes the result to generate a keyspace\_id. It’s non-unique.
+* **lookup\_unique**: lookup, but unique
+* **lookup\_autoinc**
+* **lookup\_unique\_autoinc**
 
 In the future, if we decide to go with our alternate sharding scheme where we require the main id to be stored with each table instead of the keyspace_id, the above list covers those needs also.
 
@@ -197,7 +197,7 @@ One of the results of the initial analysis of a query is whether it requires pos
 
 #### updates
 
-The routing of updates is similar to select. We use the same strategy. However, multi-keyspace-id updates are not allowed because our resharding tools cannot handle such statements. Also, VTGate will currently not allow you to modify a ColVindex column. This is because such changes could effectively require us to migrate a row from one shard to another. However, this is definitely something we can look at supporting in the future.
+The routing of updates is similar to select. We use the same strategy. However, multi-keyspace-id updates are not allowed because our resharding tools cannot handle such statements.
 
 #### inserts
 
@@ -251,7 +251,7 @@ When you fire up the schema editor, it should take you to the load workflow. The
 
 The schema picks up the loaded JSON, parse it and display the various components of the schema in a page where the relationships are easily visualized. The vschema has four main components: keyspaces, tables, table classes and vindexes.
 
-Keyspaces can be on a left navbar. Once you select the keyspaces, it will display the the rest of the three components in one column each.
+Keyspaces can be on a left navbar. Once you select the keyspaces, it will display the rest of the three components in one column each.
 
 The schema editor will sanity check the JSON file for inconsistencies and flag them using various color codes:
 

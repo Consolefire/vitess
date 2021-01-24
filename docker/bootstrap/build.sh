@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2017 Google Inc.
+# Copyright 2019 The Vitess Authors.
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,18 +15,24 @@
 # limitations under the License.
 
 flavor=$1
-
 if [[ -z "$flavor" ]]; then
   echo "Flavor must be specified as first argument."
   exit 1
 fi
 
+# Set default version of 0
+version="${2:-0}"
+
 if [[ ! -f bootstrap.sh ]]; then
-  echo "This script should be run from the root of the Vitess source tree - e.g. ~/src/github.com/youtube/vitess"
+  echo "This script should be run from the root of the Vitess source tree - e.g. ~/src/vitess.io/vitess"
   exit 1
 fi
 
 # To avoid AUFS permission issues, files must allow access by "other"
 chmod -R o=g *
 
-docker build --no-cache -f docker/bootstrap/Dockerfile.$flavor -t vitess/bootstrap:$flavor .
+arch=$(uname -m)
+[ "$arch" == "aarch64" ] && [ $flavor != "common" ] && arch_ext='-arm64v8'
+if [ -f "docker/bootstrap/Dockerfile.$flavor$arch_ext" ]; then
+    docker build --no-cache -f docker/bootstrap/Dockerfile.$flavor$arch_ext -t vitess/bootstrap:$version-$flavor$arch_ext --build-arg bootstrap_version=$version .
+fi

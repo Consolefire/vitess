@@ -11,6 +11,9 @@
 *.swp
 tags
 
+# emacs
+*~
+
 # Eclipse files
 .classpath
 .project
@@ -21,11 +24,11 @@ tags
 *.iml
 .idea
 
+# vscode
+.vscode/
+
 # C build dirs
 **/build
-
-# site-local example files
-/examples/kubernetes/config.sh
 
 # generated protobuf files
 /go/vt/.proto.tmp
@@ -49,8 +52,11 @@ tags
 /php/composer.phar
 /php/vendor
 
-## vitess.io preview site
+# vitess.io preview site
 /preview-vitess.io/
+
+# vitess.io generated site files
+/docs/
 
 # test.go output files
 _test/
@@ -59,8 +65,23 @@ _test/
 # Go vendored libs
 /vendor/*/
 
+# release folder
+releases
+
 # Angular2 Bower Libs
 /web/vtctld2/.bowerrc~
 /web/vtctld2/bower.json~
 /web/vtctld2/public/bower_components/
 
+
+# Vagrant
+.vagrant
+
+/dist/
+/vthook/
+/bin/
+/vtdataroot/
+venv
+
+.scannerwork
+report

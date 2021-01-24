@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,150 +18,327 @@ package planbuilder
 
 import (
 	"errors"
-	"fmt"
+	"sort"
 
-	"github.com/youtube/vitess/go/vt/sqlparser"
-	"github.com/youtube/vitess/go/vt/vtgate/engine"
-	"github.com/youtube/vitess/go/vt/vtgate/vindexes"
+	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/vtgate/semantics"
+
+	"vitess.io/vitess/go/vt/vterrors"
+
+	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-// builder defines the interface that a primitive must
-// satisfy.
-type builder interface {
-	// Symtab returns the associated symtab.
-	Symtab() *symtab
-
-	// MaxOrder must return the order number of the
-	// highest columnOriginator within the current sub-tree.
-	// The originators are numbered by their execution order.
-	// When two trees are brought together into a join,
-	// the MaxOrder from the left is used as starting point
-	// to renumber the originators on the right. Execution order
-	// always goes from left to right. A node that contains
-	// sub-nodes (like a join), can cache these values
-	// and use them for efficient b-tree style traversal.
-	MaxOrder() int
-
-	// SetOrder reassigns order for the primitive and its sub-primitives.
-	// The input is the max order of the previous primitive that should
-	// execute before this one.
-	SetOrder(int)
-
-	// Primitve returns the underlying primitive.
-	Primitive() engine.Primitive
-
-	// Leftmost returns the leftmost columnOriginator.
-	Leftmost() columnOriginator
-
-	// ResultColumns returns the list of result columns the
-	// primitive returns.
-	ResultColumns() []*resultColumn
-
-	// PushFilter pushes a WHERE or HAVING clause expression
-	// to the specified origin.
-	PushFilter(filter sqlparser.Expr, whereType string, origin columnOriginator) error
-
-	// PushSelect pushes the select expression to the specified
-	// originator. If successful, the originator must create
-	// a resultColumn entry and return it. The top level caller
-	// must accumulate these result columns and set the symtab
-	// after analysis.
-	PushSelect(expr *sqlparser.AliasedExpr, origin columnOriginator) (rc *resultColumn, colnum int, err error)
-
-	// PushOrderByNull pushes the special case ORDER By NULL to
-	// all primitives. It's safe to push down this clause because it's
-	// just on optimization hint.
-	PushOrderByNull()
-
-	// SetUpperLimit is an optimization hint that tells that primitive
-	// that it does not need to return more than the specified number of rows.
-	// A primitive that cannot perform this can ignore the request.
-	SetUpperLimit(count *sqlparser.SQLVal)
-
-	// PushMisc pushes miscelleaneous constructs to all the primitives.
-	PushMisc(sel *sqlparser.Select)
-
-	// Wireup performs the wire-up work. Nodes should be traversed
-	// from right to left because the rhs nodes can request vars from
-	// the lhs nodes.
-	Wireup(bldr builder, jt *jointab) error
-
-	// SupplyVar finds the common root between from and to. If it's
-	// the common root, it supplies the requested var to the rhs tree.
-	// If the primitive already has the column in its list, it should
-	// just supply it to the 'to' node. Otherwise, it should request
-	// for it by calling SupplyCol on the 'from' sub-tree to request the
-	// column, and then supply it to the 'to' node.
-	SupplyVar(from, to int, col *sqlparser.ColName, varname string)
-
-	// SupplyCol is meant to be used for the wire-up process. This function
-	// changes the primitive to supply the requested column and returns
-	// the resultColumn and column number of the result. SupplyCol
-	// is different from PushSelect because it may reuse an existing
-	// resultColumn, whereas PushSelect guarantees the addition of a new
-	// result column and returns a distinct symbol for it.
-	SupplyCol(col *sqlparser.ColName) (rc *resultColumn, colnum int)
-}
-
-// columnOriginator is a builder that originates
-// column symbols.
-type columnOriginator interface {
-	builder
-	Order() int
-}
-
-// VSchema defines the interface for this package to fetch
+// ContextVSchema defines the interface for this package to fetch
 // info about tables.
-type VSchema interface {
-	Find(tablename sqlparser.TableName) (table *vindexes.Table, err error)
+type ContextVSchema interface {
+	FindTable(tablename sqlparser.TableName) (*vindexes.Table, string, topodatapb.TabletType, key.Destination, error)
+	FindTableOrVindex(tablename sqlparser.TableName) (*vindexes.Table, vindexes.Vindex, string, topodatapb.TabletType, key.Destination, error)
 	DefaultKeyspace() (*vindexes.Keyspace, error)
+	TargetString() string
+	Destination() key.Destination
+	TabletType() topodatapb.TabletType
+	TargetDestination(qualifier string) (key.Destination, *vindexes.Keyspace, topodatapb.TabletType, error)
+	AnyKeyspace() (*vindexes.Keyspace, error)
+	FirstSortedKeyspace() (*vindexes.Keyspace, error)
+	SysVarSetEnabled() bool
+	KeyspaceExists(keyspace string) bool
+	AllKeyspace() ([]*vindexes.Keyspace, error)
+	GetSemTable() *semantics.SemTable
+	Planner() PlannerVersion
 }
 
-// Build builds a plan for a query based on the specified vschema.
-// It's the main entry point for this package.
-func Build(query string, vschema VSchema) (*engine.Plan, error) {
+// PlannerVersion is an alias here to make the code more readable
+type PlannerVersion = querypb.ExecuteOptions_PlannerVersion
+
+const (
+	// V3 is also the default planner
+	V3 = querypb.ExecuteOptions_V3
+	// V4 uses the default V4 planner, which is the greedy planner
+	V4 = querypb.ExecuteOptions_V4
+	// V4GreedyOnly uses only the faster greedy planner
+	V4GreedyOnly = querypb.ExecuteOptions_V4Greedy
+	// V4Left2Right tries to emulate the V3 planner by only joining plans in the order they are listed in the FROM-clause
+	V4Left2Right = querypb.ExecuteOptions_V4Left2Right
+)
+
+type truncater interface {
+	SetTruncateColumnCount(int)
+}
+
+// TestBuilder builds a plan for a query based on the specified vschema.
+// This method is only used from tests
+func TestBuilder(query string, vschema ContextVSchema) (*engine.Plan, error) {
 	stmt, err := sqlparser.Parse(query)
 	if err != nil {
 		return nil, err
 	}
-	return BuildFromStmt(query, stmt, vschema)
-}
-
-// BuildFromStmt builds a plan based on the AST provided.
-// TODO(sougou): The query input is trusted as the source
-// of the AST. Maybe this function just returns instructions
-// and engine.Plan can be built by the caller.
-func BuildFromStmt(query string, stmt sqlparser.Statement, vschema VSchema) (*engine.Plan, error) {
-	var err error
-	plan := &engine.Plan{
-		Original: query,
-	}
-	switch stmt := stmt.(type) {
-	case *sqlparser.Select:
-		plan.Instructions, err = buildSelectPlan(stmt, vschema)
-	case *sqlparser.Insert:
-		plan.Instructions, err = buildInsertPlan(stmt, vschema)
-	case *sqlparser.Update:
-		plan.Instructions, err = buildUpdatePlan(stmt, vschema)
-	case *sqlparser.Delete:
-		plan.Instructions, err = buildDeletePlan(stmt, vschema)
-	case *sqlparser.Union:
-		plan.Instructions, err = buildUnionPlan(stmt, vschema)
-	case *sqlparser.Set:
-		return nil, errors.New("unsupported construct: set")
-	case *sqlparser.Show:
-		return nil, errors.New("unsupported construct: show")
-	case *sqlparser.DDL:
-		return nil, errors.New("unsupported construct: ddl")
-	case *sqlparser.OtherRead:
-		return nil, errors.New("unsupported construct: other read")
-	case *sqlparser.OtherAdmin:
-		return nil, errors.New("unsupported construct: other admin")
-	default:
-		panic(fmt.Sprintf("BUG: unexpected statement type: %T", stmt))
-	}
+	result, err := sqlparser.RewriteAST(stmt, "")
 	if err != nil {
 		return nil, err
 	}
+
+	return BuildFromStmt(query, result.AST, vschema, result.BindVarNeeds)
+}
+
+// ErrPlanNotSupported is an error for plan building not supported
+var ErrPlanNotSupported = errors.New("plan building not supported")
+
+// BuildFromStmt builds a plan based on the AST provided.
+func BuildFromStmt(query string, stmt sqlparser.Statement, vschema ContextVSchema, bindVarNeeds *sqlparser.BindVarNeeds) (*engine.Plan, error) {
+	instruction, err := createInstructionFor(query, stmt, vschema)
+	if err != nil {
+		return nil, err
+	}
+	plan := &engine.Plan{
+		Type:         sqlparser.ASTToStatementType(stmt),
+		Original:     query,
+		Instructions: instruction,
+		BindVarNeeds: bindVarNeeds,
+	}
 	return plan, nil
+}
+
+func buildRoutePlan(stmt sqlparser.Statement, vschema ContextVSchema, f func(statement sqlparser.Statement, schema ContextVSchema) (engine.Primitive, error)) (engine.Primitive, error) {
+	if vschema.Destination() != nil {
+		return buildPlanForBypass(stmt, vschema)
+	}
+	return f(stmt, vschema)
+}
+
+func createInstructionFor(query string, stmt sqlparser.Statement, vschema ContextVSchema) (engine.Primitive, error) {
+	switch stmt := stmt.(type) {
+	case *sqlparser.Select:
+		return buildRoutePlan(stmt, vschema, buildSelectPlan(query))
+	case *sqlparser.Insert:
+		return buildRoutePlan(stmt, vschema, buildInsertPlan)
+	case *sqlparser.Update:
+		return buildRoutePlan(stmt, vschema, buildUpdatePlan)
+	case *sqlparser.Delete:
+		return buildRoutePlan(stmt, vschema, buildDeletePlan)
+	case *sqlparser.Union:
+		return buildRoutePlan(stmt, vschema, buildUnionPlan)
+	case sqlparser.DDLStatement:
+		return buildGeneralDDLPlan(query, stmt, vschema)
+	case *sqlparser.AlterVschema:
+		return buildVSchemaDDLPlan(stmt, vschema)
+	case *sqlparser.Use:
+		return buildUsePlan(stmt, vschema)
+	case *sqlparser.Explain:
+		if stmt.Type == sqlparser.VitessType {
+			innerInstruction, err := createInstructionFor(query, stmt.Statement, vschema)
+			if err != nil {
+				return nil, err
+			}
+			return buildExplainPlan(innerInstruction)
+		}
+		return buildOtherReadAndAdmin(query, vschema)
+	case *sqlparser.OtherRead, *sqlparser.OtherAdmin:
+		return buildOtherReadAndAdmin(query, vschema)
+	case *sqlparser.Set:
+		return buildSetPlan(stmt, vschema)
+	case *sqlparser.Load:
+		return buildLoadPlan(query, vschema)
+	case sqlparser.DBDDLStatement:
+		return buildRoutePlan(stmt, vschema, buildDBDDLPlan)
+	case *sqlparser.SetTransaction:
+		return nil, ErrPlanNotSupported
+	case *sqlparser.Begin, *sqlparser.Commit, *sqlparser.Rollback, *sqlparser.Savepoint, *sqlparser.SRollback, *sqlparser.Release:
+		// Empty by design. Not executed by a plan
+		return nil, nil
+	case *sqlparser.Show:
+		return buildShowPlan(stmt, vschema)
+	case *sqlparser.LockTables:
+		return buildRoutePlan(stmt, vschema, buildLockPlan)
+	case *sqlparser.UnlockTables:
+		return buildRoutePlan(stmt, vschema, buildUnlockPlan)
+	case *sqlparser.Flush:
+		return buildFlushPlan(stmt, vschema)
+	}
+
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unexpected statement type: %T", stmt)
+}
+
+func buildDBDDLPlan(stmt sqlparser.Statement, vschema ContextVSchema) (engine.Primitive, error) {
+	dbDDLstmt := stmt.(sqlparser.DBDDLStatement)
+	ksName := dbDDLstmt.GetDatabaseName()
+	if ksName == "" {
+		ks, err := vschema.DefaultKeyspace()
+		if err != nil {
+			return nil, err
+		}
+		ksName = ks.Name
+	}
+	ksExists := vschema.KeyspaceExists(ksName)
+
+	switch dbDDL := dbDDLstmt.(type) {
+	case *sqlparser.DropDatabase:
+		if dbDDL.IfExists && !ksExists {
+			return engine.NewRowsPrimitive(make([][]sqltypes.Value, 0), make([]*querypb.Field, 0)), nil
+		}
+		if !ksExists {
+			return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cannot drop database '%s'; database does not exists", ksName)
+		}
+		return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "drop database not allowed")
+	case *sqlparser.AlterDatabase:
+		if !ksExists {
+			return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cannot alter database '%s'; database does not exists", ksName)
+		}
+		return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "alter database not allowed")
+	case *sqlparser.CreateDatabase:
+		if dbDDL.IfNotExists && ksExists {
+			return engine.NewRowsPrimitive(make([][]sqltypes.Value, 0), make([]*querypb.Field, 0)), nil
+		}
+		if !dbDDL.IfNotExists && ksExists {
+			return nil, vterrors.Errorf(vtrpcpb.Code_ALREADY_EXISTS, "cannot create database '%s'; database exists", ksName)
+		}
+		return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "create database not allowed")
+	}
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unreachable code path: %s", sqlparser.String(dbDDLstmt))
+}
+
+func buildLoadPlan(query string, vschema ContextVSchema) (engine.Primitive, error) {
+	keyspace, err := vschema.DefaultKeyspace()
+	if err != nil {
+		return nil, err
+	}
+
+	destination := vschema.Destination()
+	if destination == nil {
+		if keyspace.Sharded {
+			return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: this construct is not supported on sharded keyspace")
+		}
+		destination = key.DestinationAnyShard{}
+	}
+
+	return &engine.Send{
+		Keyspace:          keyspace,
+		TargetDestination: destination,
+		Query:             query,
+		IsDML:             true,
+		SingleShardOnly:   true,
+	}, nil
+}
+
+func buildVSchemaDDLPlan(stmt *sqlparser.AlterVschema, vschema ContextVSchema) (engine.Primitive, error) {
+	_, keyspace, _, err := vschema.TargetDestination(stmt.Table.Qualifier.String())
+	if err != nil {
+		return nil, err
+	}
+	return &engine.AlterVSchema{
+		Keyspace:        keyspace,
+		AlterVschemaDDL: stmt,
+	}, nil
+}
+
+func buildFlushPlan(stmt *sqlparser.Flush, vschema ContextVSchema) (engine.Primitive, error) {
+	if len(stmt.TableNames) == 0 {
+		return buildFlushOptions(stmt, vschema)
+	}
+	return buildFlushTables(stmt, vschema)
+}
+
+func buildFlushOptions(stmt *sqlparser.Flush, vschema ContextVSchema) (engine.Primitive, error) {
+	destination, keyspace, _, err := vschema.TargetDestination("")
+	if err != nil {
+		return nil, err
+	}
+	return &engine.Send{
+		Keyspace:          keyspace,
+		TargetDestination: destination,
+		Query:             sqlparser.String(stmt),
+		IsDML:             false,
+		SingleShardOnly:   false,
+	}, nil
+}
+
+func buildFlushTables(stmt *sqlparser.Flush, vschema ContextVSchema) (engine.Primitive, error) {
+	type sendDest struct {
+		ks   *vindexes.Keyspace
+		dest key.Destination
+	}
+
+	flushStatements := map[sendDest]*sqlparser.Flush{}
+	for i, tab := range stmt.TableNames {
+		var destinationTab key.Destination
+		var keyspaceTab *vindexes.Keyspace
+		var table *vindexes.Table
+		var err error
+		table, _, _, _, destinationTab, err = vschema.FindTableOrVindex(tab)
+
+		if err != nil {
+			return nil, err
+		}
+		if table == nil {
+			return nil, vindexes.NotFoundError{TableName: tab.Name.String()}
+		}
+		keyspaceTab = table.Keyspace
+		stmt.TableNames[i] = sqlparser.TableName{
+			Name: table.Name,
+		}
+		if destinationTab == nil {
+			destinationTab = key.DestinationAllShards{}
+		}
+
+		flush, isAvail := flushStatements[sendDest{keyspaceTab, destinationTab}]
+		if isAvail {
+			flush.TableNames = append(flush.TableNames, stmt.TableNames[i])
+		} else {
+			flush = &sqlparser.Flush{
+				IsLocal:      stmt.IsLocal,
+				FlushOptions: nil,
+				TableNames:   sqlparser.TableNames{stmt.TableNames[i]},
+				WithLock:     stmt.WithLock,
+				ForExport:    stmt.ForExport,
+			}
+		}
+		flushStatements[sendDest{keyspaceTab, destinationTab}] = flush
+	}
+
+	if len(flushStatements) == 1 {
+		for sendDest, flush := range flushStatements {
+			return &engine.Send{
+				Keyspace:          sendDest.ks,
+				TargetDestination: sendDest.dest,
+				Query:             sqlparser.String(flush),
+				IsDML:             false,
+				SingleShardOnly:   false,
+			}, nil
+		}
+	}
+
+	keys := make([]sendDest, len(flushStatements))
+
+	// Collect keys of the map
+	i := 0
+	for k := range flushStatements {
+		keys[i] = k
+		i++
+	}
+
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].ks.Name < keys[j].ks.Name
+	})
+
+	finalPlan := &engine.Concatenate{
+		Sources: nil,
+	}
+	for _, sendDest := range keys {
+		plan := &engine.Send{
+			Keyspace:          sendDest.ks,
+			TargetDestination: sendDest.dest,
+			Query:             sqlparser.String(flushStatements[sendDest]),
+			IsDML:             false,
+			SingleShardOnly:   false,
+		}
+		finalPlan.Sources = append(finalPlan.Sources, plan)
+	}
+
+	return finalPlan, nil
 }

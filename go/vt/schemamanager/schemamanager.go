@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,10 +21,10 @@ import (
 	"fmt"
 	"time"
 
-	log "github.com/golang/glog"
-	"golang.org/x/net/context"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/log"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 const (
@@ -87,7 +87,7 @@ type ShardResult struct {
 	Shard  string
 	Result *querypb.QueryResult
 	// Position is a replication position that is guaranteed to be after the
-	// schema change was applied. It can be used to wait for slaves to receive
+	// schema change was applied. It can be used to wait for replicas to receive
 	// the schema change via replication.
 	Position string
 }
@@ -132,7 +132,7 @@ func Run(ctx context.Context, controller Controller, executor Executor) error {
 	}
 	if result.ExecutorErr != "" || len(result.FailedShards) > 0 {
 		out, _ := json.MarshalIndent(result, "", "  ")
-		return fmt.Errorf("Schema change failed, ExecuteResult: %v\n", string(out))
+		return fmt.Errorf("schema change failed, ExecuteResult: %v", string(out))
 	}
 	return nil
 }

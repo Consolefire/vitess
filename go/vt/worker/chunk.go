@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,15 +19,20 @@ package worker
 import (
 	"fmt"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
-	"github.com/youtube/vitess/go/sqlescape"
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"github.com/youtube/vitess/go/vt/wrangler"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"context"
+
+	"vitess.io/vitess/go/sqlescape"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/wrangler"
+
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var (
@@ -95,15 +100,15 @@ func generateChunks(ctx context.Context, wr *wrangler.Wrangler, tablet *topodata
 	qr, err := wr.TabletManagerClient().ExecuteFetchAsApp(shortCtx, tablet, true, []byte(query), 1)
 	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("Cannot determine MIN and MAX of the first primary key column. ExecuteFetchAsApp: %v", err)
+		return nil, vterrors.Wrapf(err, "tablet: %v, table: %v: cannot determine MIN and MAX of the first primary key column. ExecuteFetchAsApp", topoproto.TabletAliasString(tablet.Alias), td.Name)
 	}
 	if len(qr.Rows) != 1 {
-		return nil, fmt.Errorf("Cannot determine MIN and MAX of the first primary key column. Zero rows were returned for the following query: %v", query)
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "tablet: %v, table: %v: cannot determine MIN and MAX of the first primary key column. Zero rows were returned", topoproto.TabletAliasString(tablet.Alias), td.Name)
 	}
 
 	result := sqltypes.Proto3ToResult(qr)
-	min, _ := sqltypes.ToNative(result.Rows[0][0])
-	max, _ := sqltypes.ToNative(result.Rows[0][1])
+	min, _ := evalengine.ToNative(result.Rows[0][0])
+	max, _ := evalengine.ToNative(result.Rows[0][1])
 
 	if min == nil || max == nil {
 		wr.Logger().Infof("table=%v: Not splitting the table into multiple chunks, min or max is NULL: %v", td.Name, qr.Rows[0])
@@ -155,7 +160,7 @@ func generateChunks(ctx context.Context, wr *wrangler.Wrangler, tablet *topodata
 		end := add(start, interval)
 		chunk, err := toChunk(start, end, i+1, chunkCount)
 		if err != nil {
-			return nil, err
+			return nil, vterrors.Wrapf(err, "tablet: %v, table: %v", topoproto.TabletAliasString(tablet.Alias), td.Name)
 		}
 		chunks[i] = chunk
 		start = end
@@ -185,11 +190,11 @@ func add(start, interval interface{}) interface{} {
 func toChunk(start, end interface{}, number, total int) (chunk, error) {
 	startValue, err := sqltypes.InterfaceToValue(start)
 	if err != nil {
-		return chunk{}, fmt.Errorf("Failed to convert calculated start value (%v) into internal sqltypes.Value: %v", start, err)
+		return chunk{}, vterrors.Wrapf(err, "failed to convert calculated start value (%v) into internal sqltypes.Value", start)
 	}
 	endValue, err := sqltypes.InterfaceToValue(end)
 	if err != nil {
-		return chunk{}, fmt.Errorf("Failed to convert calculated end value (%v) into internal sqltypes.Value: %v", end, err)
+		return chunk{}, vterrors.Wrapf(err, "failed to convert calculated end value (%v) into internal sqltypes.Value", end)
 	}
 	return chunk{startValue, endValue, number, total}, nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,10 +19,9 @@ package vterrors
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 var errGeneric = "generic error"
@@ -96,7 +95,7 @@ func TestAggregateVtGateErrors(t *testing.T) {
 	}
 	for _, tc := range testcases {
 		out := Aggregate(tc.input)
-		if !reflect.DeepEqual(out, tc.expected) {
+		if !Equals(out, tc.expected) {
 			t.Errorf("AggregateVtGateErrors(%+v) = %+v \nwant: %+v",
 				tc.input, out, tc.expected)
 		}

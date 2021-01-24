@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,9 +22,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 //
@@ -119,6 +120,21 @@ func EvenShardsKeyRange(i, n int) (*topodatapb.KeyRange, error) {
 	return &topodatapb.KeyRange{Start: startBytes, End: endBytes}, nil
 }
 
+// KeyRangeAdd adds two adjacent keyranges into a single value.
+// If the values are not adjacent, it returns false.
+func KeyRangeAdd(first, second *topodatapb.KeyRange) (*topodatapb.KeyRange, bool) {
+	if first == nil || second == nil {
+		return nil, false
+	}
+	if len(first.End) != 0 && bytes.Equal(first.End, second.Start) {
+		return &topodatapb.KeyRange{Start: first.Start, End: second.End}, true
+	}
+	if len(second.End) != 0 && bytes.Equal(second.End, first.Start) {
+		return &topodatapb.KeyRange{Start: second.Start, End: first.End}, true
+	}
+	return nil, false
+}
+
 // KeyRangeContains returns true if the provided id is in the keyrange.
 func KeyRangeContains(kr *topodatapb.KeyRange, id []byte) bool {
 	if kr == nil {
@@ -144,7 +160,7 @@ func ParseKeyRangeParts(start, end string) (*topodatapb.KeyRange, error) {
 // KeyRangeString prints a topodatapb.KeyRange
 func KeyRangeString(k *topodatapb.KeyRange) string {
 	if k == nil {
-		return "<nil>"
+		return "-"
 	}
 	return hex.EncodeToString(k.Start) + "-" + hex.EncodeToString(k.End)
 }
@@ -165,8 +181,19 @@ func KeyRangeEqual(left, right *topodatapb.KeyRange) bool {
 	if right == nil {
 		return len(left.Start) == 0 && len(left.End) == 0
 	}
-	return bytes.Compare(left.Start, right.Start) == 0 &&
-		bytes.Compare(left.End, right.End) == 0
+	return bytes.Equal(left.Start, right.Start) &&
+		bytes.Equal(left.End, right.End)
+}
+
+// KeyRangeStartEqual returns true if right's keyrange start is _after_ left's start
+func KeyRangeStartSmaller(left, right *topodatapb.KeyRange) bool {
+	if left == nil {
+		return right != nil
+	}
+	if right == nil {
+		return false
+	}
+	return bytes.Compare(left.Start, right.Start) < 0
 }
 
 // KeyRangeStartEqual returns true if both key ranges have the same start
@@ -177,7 +204,7 @@ func KeyRangeStartEqual(left, right *topodatapb.KeyRange) bool {
 	if right == nil {
 		return len(left.Start) == 0
 	}
-	return bytes.Compare(left.Start, right.Start) == 0
+	return bytes.Equal(left.Start, right.Start)
 }
 
 // KeyRangeEndEqual returns true if both key ranges have the same end
@@ -188,7 +215,7 @@ func KeyRangeEndEqual(left, right *topodatapb.KeyRange) bool {
 	if right == nil {
 		return len(left.End) == 0
 	}
-	return bytes.Compare(left.End, right.End) == 0
+	return bytes.Equal(left.End, right.End)
 }
 
 // For more info on the following functions, see:
@@ -262,10 +289,16 @@ func KeyRangeIncludes(big, small *topodatapb.KeyRange) bool {
 // specification. a-b-c-d will be parsed as a-b, b-c, c-d. The empty
 // string may serve both as the start and end of the keyspace: -a-b-
 // will be parsed as start-a, a-b, b-end.
+// "0" is treated as "-", to allow us to not have to special-case
+// client code.
 func ParseShardingSpec(spec string) ([]*topodatapb.KeyRange, error) {
 	parts := strings.Split(spec, "-")
 	if len(parts) == 1 {
-		return nil, fmt.Errorf("malformed spec: doesn't define a range: %q", spec)
+		if spec == "0" {
+			parts = []string{"", ""}
+		} else {
+			return nil, fmt.Errorf("malformed spec: doesn't define a range: %q", spec)
+		}
 	}
 	old := parts[0]
 	ranges := make([]*topodatapb.KeyRange, len(parts)-1)
@@ -295,4 +328,11 @@ func ParseShardingSpec(spec string) ([]*topodatapb.KeyRange, error) {
 		old = p
 	}
 	return ranges, nil
+}
+
+var krRegexp = regexp.MustCompile(`^[0-9a-fA-F]*-[0-9a-fA-F]*$`)
+
+// IsKeyRange returns true if the string represents a keyrange.
+func IsKeyRange(kr string) bool {
+	return krRegexp.MatchString(kr)
 }

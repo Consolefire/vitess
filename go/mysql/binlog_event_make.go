@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -16,7 +16,9 @@ limitations under the License.
 
 package mysql
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+)
 
 // This file contains utility methods to create binlog replication
 // packets. They are mostly used for testing.
@@ -127,7 +129,7 @@ func NewFormatDescriptionEvent(f BinlogFormat, s *FakeBinlogStream) BinlogEvent 
 		1 // (undocumented) checksum algorithm
 	data := make([]byte, length)
 	binary.LittleEndian.PutUint16(data[0:2], f.FormatVersion)
-	copy(data[2:52], []byte(f.ServerVersion))
+	copy(data[2:52], f.ServerVersion)
 	binary.LittleEndian.PutUint32(data[52:56], s.Timestamp)
 	data[56] = f.HeaderLength
 	copy(data[57:], f.HeaderSizes)
@@ -149,7 +151,7 @@ func NewInvalidFormatDescriptionEvent(f BinlogFormat, s *FakeBinlogStream) Binlo
 }
 
 // NewRotateEvent returns a RotateEvent.
-// The timestmap of such an event should be zero, so we patch it in.
+// The timestamp of such an event should be zero, so we patch it in.
 func NewRotateEvent(f BinlogFormat, s *FakeBinlogStream, position uint64, filename string) BinlogEvent {
 	length := 8 + // position
 		len(filename)
@@ -170,7 +172,7 @@ func NewQueryEvent(f BinlogFormat, s *FakeBinlogStream, q Query) BinlogEvent {
 	if q.Charset != nil {
 		statusVarLength += 1 + 2 + 2 + 2
 	}
-	length := 4 + // slave proxy id
+	length := 4 + // proxy id
 		4 + // execution time
 		1 + // schema length
 		2 + // error code
@@ -197,7 +199,7 @@ func NewQueryEvent(f BinlogFormat, s *FakeBinlogStream, q Query) BinlogEvent {
 		data[pos+6] = byte(q.Charset.Server >> 8)
 		pos += 7
 	}
-	pos += copy(data[pos:pos+len(q.Database)], []byte(q.Database))
+	pos += copy(data[pos:pos+len(q.Database)], q.Database)
 	data[pos] = 0
 	pos++
 	copy(data[pos:], q.SQL)
@@ -310,11 +312,11 @@ func NewTableMapEvent(f BinlogFormat, s *FakeBinlogStream, tableID uint64, tm *T
 	data[6] = byte(tm.Flags)
 	data[7] = byte(tm.Flags >> 8)
 	data[8] = byte(len(tm.Database))
-	pos := 6 + 2 + 1 + copy(data[9:], []byte(tm.Database))
+	pos := 6 + 2 + 1 + copy(data[9:], tm.Database)
 	data[pos] = 0
 	pos++
 	data[pos] = byte(len(tm.Name))
-	pos += 1 + copy(data[pos+1:], []byte(tm.Name))
+	pos += 1 + copy(data[pos+1:], tm.Name)
 	data[pos] = 0
 	pos++
 

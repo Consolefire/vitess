@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 
-	"github.com/youtube/vitess/go/sqltypes"
-
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 var _ Primitive = (*Join)(nil)
@@ -49,8 +49,9 @@ type Join struct {
 }
 
 // Execute performs a non-streaming exec.
-func (jn *Join) Execute(vcursor VCursor, bindVars, joinVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	lresult, err := jn.Left.Execute(vcursor, bindVars, joinVars, wantfields)
+func (jn *Join) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	joinVars := make(map[string]*querypb.BindVariable)
+	lresult, err := jn.Left.Execute(vcursor, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +60,7 @@ func (jn *Join) Execute(vcursor VCursor, bindVars, joinVars map[string]*querypb.
 		for k := range jn.Vars {
 			joinVars[k] = sqltypes.NullBindVariable
 		}
-		rresult, err := jn.Right.GetFields(vcursor, bindVars, joinVars)
+		rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
 		if err != nil {
 			return nil, err
 		}
@@ -70,7 +71,7 @@ func (jn *Join) Execute(vcursor VCursor, bindVars, joinVars map[string]*querypb.
 		for k, col := range jn.Vars {
 			joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 		}
-		rresult, err := jn.Right.Execute(vcursor, bindVars, joinVars, wantfields)
+		rresult, err := jn.Right.Execute(vcursor, combineVars(bindVars, joinVars), wantfields)
 		if err != nil {
 			return nil, err
 		}
@@ -87,21 +88,28 @@ func (jn *Join) Execute(vcursor VCursor, bindVars, joinVars map[string]*querypb.
 		} else {
 			result.RowsAffected += uint64(len(rresult.Rows))
 		}
+		if vcursor.ExceedsMaxMemoryRows(len(result.Rows)) {
+			return nil, fmt.Errorf("in-memory row count exceeded allowed limit of %d", vcursor.MaxMemoryRows())
+		}
 	}
 	return result, nil
 }
 
 // StreamExecute performs a streaming exec.
-func (jn *Join) StreamExecute(vcursor VCursor, bindVars, joinVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	err := jn.Left.StreamExecute(vcursor, bindVars, joinVars, wantfields, func(lresult *sqltypes.Result) error {
+func (jn *Join) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	joinVars := make(map[string]*querypb.BindVariable)
+	err := jn.Left.StreamExecute(vcursor, bindVars, wantfields, func(lresult *sqltypes.Result) error {
 		for _, lrow := range lresult.Rows {
 			for k, col := range jn.Vars {
 				joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 			}
 			rowSent := false
-			err := jn.Right.StreamExecute(vcursor, bindVars, joinVars, wantfields, func(rresult *sqltypes.Result) error {
+			err := jn.Right.StreamExecute(vcursor, combineVars(bindVars, joinVars), wantfields, func(rresult *sqltypes.Result) error {
 				result := &sqltypes.Result{}
 				if wantfields {
+					// This code is currently unreachable because the first result
+					// will always be just the field info, which will cause the outer
+					// wantfields code path to be executed. But this may change in the future.
 					wantfields = false
 					result.Fields = joinFields(lresult.Fields, rresult.Fields, jn.Cols)
 				}
@@ -115,10 +123,6 @@ func (jn *Join) StreamExecute(vcursor VCursor, bindVars, joinVars map[string]*qu
 			})
 			if err != nil {
 				return err
-			}
-			if wantfields {
-				// TODO(sougou): remove after testing
-				panic("unexptected")
 			}
 			if jn.Opcode == LeftJoin && !rowSent {
 				result := &sqltypes.Result{}
@@ -136,7 +140,7 @@ func (jn *Join) StreamExecute(vcursor VCursor, bindVars, joinVars map[string]*qu
 				joinVars[k] = sqltypes.NullBindVariable
 			}
 			result := &sqltypes.Result{}
-			rresult, err := jn.Right.GetFields(vcursor, bindVars, joinVars)
+			rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
 			if err != nil {
 				return err
 			}
@@ -149,8 +153,9 @@ func (jn *Join) StreamExecute(vcursor VCursor, bindVars, joinVars map[string]*qu
 }
 
 // GetFields fetches the field info.
-func (jn *Join) GetFields(vcursor VCursor, bindVars, joinVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	lresult, err := jn.Left.GetFields(vcursor, bindVars, joinVars)
+func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	joinVars := make(map[string]*querypb.BindVariable)
+	lresult, err := jn.Left.GetFields(vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
@@ -158,12 +163,17 @@ func (jn *Join) GetFields(vcursor VCursor, bindVars, joinVars map[string]*queryp
 	for k := range jn.Vars {
 		joinVars[k] = sqltypes.NullBindVariable
 	}
-	rresult, err := jn.Right.GetFields(vcursor, bindVars, joinVars)
+	rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
 	if err != nil {
 		return nil, err
 	}
 	result.Fields = joinFields(lresult.Fields, rresult.Fields, jn.Cols)
 	return result, nil
+}
+
+// Inputs returns the input primitives for this join
+func (jn *Join) Inputs() []Primitive {
+	return []Primitive{jn.Left, jn.Right}
 }
 
 func joinFields(lfields, rfields []*querypb.Field, cols []int) []*querypb.Field {
@@ -214,4 +224,49 @@ func (code JoinOpcode) String() string {
 // It's used for testing and diagnostics.
 func (code JoinOpcode) MarshalJSON() ([]byte, error) {
 	return ([]byte)(fmt.Sprintf("\"%s\"", code.String())), nil
+}
+
+// RouteType returns a description of the query routing type used by the primitive
+func (jn *Join) RouteType() string {
+	return "Join"
+}
+
+// GetKeyspaceName specifies the Keyspace that this primitive routes to.
+func (jn *Join) GetKeyspaceName() string {
+	if jn.Left.GetKeyspaceName() == jn.Right.GetKeyspaceName() {
+		return jn.Left.GetKeyspaceName()
+	}
+	return jn.Left.GetKeyspaceName() + "_" + jn.Right.GetKeyspaceName()
+}
+
+// GetTableName specifies the table that this primitive routes to.
+func (jn *Join) GetTableName() string {
+	return jn.Left.GetTableName() + "_" + jn.Right.GetTableName()
+}
+
+func (jn *Join) NeedsTransaction() bool {
+	return jn.Right.NeedsTransaction() || jn.Left.NeedsTransaction()
+}
+
+func combineVars(bv1, bv2 map[string]*querypb.BindVariable) map[string]*querypb.BindVariable {
+	out := make(map[string]*querypb.BindVariable)
+	for k, v := range bv1 {
+		out[k] = v
+	}
+	for k, v := range bv2 {
+		out[k] = v
+	}
+	return out
+}
+
+func (jn *Join) description() PrimitiveDescription {
+	other := map[string]interface{}{
+		"TableName":         jn.GetTableName(),
+		"JoinColumnIndexes": strings.Trim(strings.Join(strings.Fields(fmt.Sprint(jn.Cols)), ","), "[]"),
+	}
+	return PrimitiveDescription{
+		OperatorType: "Join",
+		Variant:      jn.Opcode.String(),
+		Other:        other,
+	}
 }

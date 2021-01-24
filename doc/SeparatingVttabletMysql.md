@@ -20,13 +20,13 @@ The following adjustments need to be made to VTTablet command line parameters:
 
 * Do not use `-mycnf_socket_file`. There is no local MySQL unix socket file.
 
-* Specify the host and port of the MySQL daemon for the `-db-config-XXX-host`
-  and `-db-config-XXX-port` command line parameters. Do not specify
-  `-db-config-XXX-unixsocket` parameters.
+* Specify the host and port of the MySQL daemon for the `-db\_host`
+  and `-db\_port` command line parameters. Do not specify
+  `-db\_socket` parameters.
 
 * Disable restores / backups, by not passing any backup command line
   parameters. Specifically, `-restore_from_backup` and
-  `-backup_storage_implementation` shoud not be set.
+  `-backup_storage_implementation` should not be set.
 
 Since master management and replication are not handled by Vitess, we just need
 to make sure the tablet type in the topology is correct before running

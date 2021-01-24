@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,15 +19,14 @@ package automation
 import (
 	"bytes"
 	"fmt"
-	"time"
 
-	log "github.com/golang/glog"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/vtctl/vtctlclient"
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
 
-	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
+	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
 )
 
 // ExecuteVtctl runs vtctl using vtctlclient. The stream of Event
@@ -45,8 +44,6 @@ func ExecuteVtctl(ctx context.Context, server string, args []string) (string, er
 
 	err := vtctlclient.RunCommandAndWait(
 		ctx, server, args,
-		// TODO(mberlin): Should this value be configurable as flags?
-		time.Hour, // actionTimeout
 		loggerToBufferFunc)
 
 	endMsg := fmt.Sprintf("Executed remote vtctl command: %v server: %v err: %v", args, server, err)

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,9 @@ limitations under the License.
 package main
 
 import (
-	"flag"
-	"os"
-
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vtctld"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtctld"
 )
 
 func init() {
@@ -31,18 +28,13 @@ func init() {
 
 // used at runtime by plug-ins
 var (
-	ts topo.Server
+	ts *topo.Server
 )
 
 func main() {
-	flag.Parse()
+	servenv.ParseFlags("vtctld")
 	servenv.Init()
 	defer servenv.Close()
-
-	if *servenv.Version {
-		servenv.AppVersion.Print()
-		os.Exit(0)
-	}
 
 	ts = topo.Open()
 	defer ts.Close()

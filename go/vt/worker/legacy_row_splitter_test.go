@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,10 +25,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/topo"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func hki(hexValue string) []byte {
@@ -47,7 +47,7 @@ func si(start, end string) *topo.ShardInfo {
 			Start: s,
 			End:   e,
 		},
-	}, 0)
+	}, nil)
 }
 
 func TestRowSplitterUint64(t *testing.T) {
@@ -103,7 +103,7 @@ func siBytes(start, end string) *topo.ShardInfo {
 			Start: []byte(start),
 			End:   []byte(end),
 		},
-	}, 0)
+	}, nil)
 }
 
 func TestRowSplitterString(t *testing.T) {

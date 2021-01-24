@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,9 +21,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/youtube/vitess/go/vt/mysqlctl/tmutils"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 )
 
 // tableStatusList contains the status for each table of a schema.
@@ -46,7 +48,7 @@ func (t *tableStatusList) initialize(schema *tabletmanagerdatapb.SchemaDefinitio
 	defer t.mu.Unlock()
 
 	if t.initialized {
-		panic(fmt.Errorf("tableStatusList is already initialized: %v", t.tableStatuses))
+		panic(vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "tableStatusList is already initialized: %v", t.tableStatuses))
 	}
 
 	t.tableStatuses = make([]*tableStatus, len(schema.TableDefinitions))

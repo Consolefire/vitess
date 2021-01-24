@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,13 @@ package proc
 import (
 	"net"
 
-	"github.com/youtube/vitess/go/stats"
+	"vitess.io/vitess/go/stats"
 )
 
 type CountingListener struct {
 	net.Listener
-	ConnCount, ConnAccept *stats.Int
+	ConnCount  *stats.Gauge
+	ConnAccept *stats.Counter
 }
 
 type countingConnection struct {
@@ -37,8 +38,8 @@ type countingConnection struct {
 func Published(l net.Listener, countTag, acceptTag string) net.Listener {
 	return &CountingListener{
 		Listener:   l,
-		ConnCount:  stats.NewInt(countTag),
-		ConnAccept: stats.NewInt(acceptTag),
+		ConnCount:  stats.NewGauge(countTag, "Active connections accepted by counting listener"),
+		ConnAccept: stats.NewCounter(acceptTag, "Count of connections accepted by the counting listener"),
 	}
 }
 

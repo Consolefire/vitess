@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -37,15 +37,18 @@ import (
 	"errors"
 	"fmt"
 
-	"golang.org/x/net/context"
+	"context"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/vt/hook"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
+	"github.com/golang/protobuf/proto"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/hook"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/proto/vttime"
 )
 
 // ConfigureTabletHook configures the right parameters for a hook
@@ -61,11 +64,27 @@ func ConfigureTabletHook(hk *hook.Hook, tabletAlias *topodatapb.TabletAlias) {
 // transitions need to be forced from time to time.
 //
 // If successful, the updated tablet record is returned.
-func ChangeType(ctx context.Context, ts topo.Server, tabletAlias *topodatapb.TabletAlias, newType topodatapb.TabletType) (*topodatapb.Tablet, error) {
-	return ts.UpdateTabletFields(ctx, tabletAlias, func(tablet *topodatapb.Tablet) error {
+func ChangeType(ctx context.Context, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, newType topodatapb.TabletType, masterTermStartTime *vttime.Time) (*topodatapb.Tablet, error) {
+	var result *topodatapb.Tablet
+	// Always clear out the master timestamp if not master.
+	if newType != topodatapb.TabletType_MASTER {
+		masterTermStartTime = nil
+	}
+	_, err := ts.UpdateTabletFields(ctx, tabletAlias, func(tablet *topodatapb.Tablet) error {
+		// Save the most recent tablet value so we can return it
+		// either if the update succeeds or if no update is needed.
+		result = tablet
+		if tablet.Type == newType && proto.Equal(tablet.MasterTermStartTime, masterTermStartTime) {
+			return topo.NewError(topo.NoUpdateNeeded, topoproto.TabletAliasString(tabletAlias))
+		}
 		tablet.Type = newType
+		tablet.MasterTermStartTime = masterTermStartTime
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // CheckOwnership returns nil iff the Hostname and port match on oldTablet and
@@ -87,10 +106,10 @@ func CheckOwnership(oldTablet, newTablet *topodatapb.Tablet) error {
 // DeleteTablet removes a tablet record from the topology:
 // - the replication data record if any
 // - the tablet record
-func DeleteTablet(ctx context.Context, ts topo.Server, tablet *topodatapb.Tablet) error {
+func DeleteTablet(ctx context.Context, ts *topo.Server, tablet *topodatapb.Tablet) error {
 	// try to remove replication data, no fatal if we fail
 	if err := topo.DeleteTabletReplicationData(ctx, ts, tablet); err != nil {
-		if err == topo.ErrNoNode {
+		if topo.IsErrType(err, topo.NoNode) {
 			log.V(6).Infof("no ShardReplication object for cell %v", tablet.Alias.Cell)
 			err = nil
 		}

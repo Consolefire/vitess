@@ -1,5 +1,5 @@
 /*
-Copyright 2017 GitHub Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package vttest contains helpers to set up Vitess for testing.
 package vttest
 
 import (
@@ -22,9 +23,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path"
+	"strings"
 	"syscall"
 	"time"
+
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 
 	"github.com/golang/protobuf/proto"
 )
@@ -52,11 +56,11 @@ type VtProcess struct {
 	exit chan error
 }
 
-// GetVars returns the JSON contents of the `/debug/vars` endpoint
+// getVars returns the JSON contents of the `/debug/vars` endpoint
 // of this Vitess-based process. If an error is returned, it probably
 // means that the Vitess service has not started successfully.
-func (vtp *VtProcess) GetVars() ([]byte, error) {
-	url := fmt.Sprintf("http://%s/debug/vars", vtp.Address())
+func getVars(addr string) ([]byte, error) {
+	url := fmt.Sprintf("http://%s/debug/vars", addr)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -65,14 +69,21 @@ func (vtp *VtProcess) GetVars() ([]byte, error) {
 	return ioutil.ReadAll(resp.Body)
 }
 
+// defaultHealthCheck checks the health of the Vitess process using getVars.
+// It is used when VtProcess.HealthCheck is nil.
+func defaultHealthCheck(addr string) bool {
+	_, err := getVars(addr)
+	return err == nil
+}
+
 // IsHealthy returns whether the monitored Vitess process has started
 // successfully.
 func (vtp *VtProcess) IsHealthy() bool {
-	if vtp.HealthCheck != nil && !vtp.HealthCheck(vtp.Address()) {
-		return false
+	healthCheck := vtp.HealthCheck
+	if healthCheck == nil {
+		healthCheck = defaultHealthCheck
 	}
-	_, err := vtp.GetVars()
-	return err == nil
+	return healthCheck(vtp.Address())
 }
 
 // Address returns the main address for this Vitess process.
@@ -81,7 +92,7 @@ func (vtp *VtProcess) Address() string {
 	return fmt.Sprintf("localhost:%d", vtp.Port)
 }
 
-// WaitTerminate attemps to gracefully shutdown the Vitess process by sending
+// WaitTerminate attempts to gracefully shutdown the Vitess process by sending
 // a SIGTERM, then wait for up to 10s for it to exit. If the process hasn't
 // exited cleanly after 10s, a SIGKILL is forced and the corresponding exit
 // error is returned to the user
@@ -126,15 +137,16 @@ func (vtp *VtProcess) WaitStart() (err error) {
 
 	vtp.proc.Args = append(vtp.proc.Args, vtp.ExtraArgs...)
 
-	logfile := path.Join(vtp.LogDirectory, fmt.Sprintf("%s.%d.log", vtp.Name, vtp.Port))
-	vtp.proc.Stderr, err = os.Create(logfile)
-	if err != nil {
-		return
-	}
+	vtp.proc.Stderr = os.Stderr
+	vtp.proc.Stdout = os.Stdout
 
 	vtp.proc.Env = append(vtp.proc.Env, os.Environ()...)
 	vtp.proc.Env = append(vtp.proc.Env, vtp.Env...)
 
+	vtp.proc.Stderr = os.Stderr
+	vtp.proc.Stderr = os.Stdout
+
+	log.Infof("%v %v", strings.Join(vtp.proc.Args, " "))
 	err = vtp.proc.Start()
 	if err != nil {
 		return
@@ -200,12 +212,11 @@ func VtcomboProcess(env Environment, args *Config, mysql MySQLManager) *VtProces
 	}
 
 	vt.ExtraArgs = append(vt.ExtraArgs, []string{
-		"-db-config-app-charset", charset,
-		"-db-config-app-uname", user,
-		"-db-config-app-pass", pass,
-		"-db-config-dba-charset", charset,
-		"-db-config-dba-uname", user,
-		"-db-config-dba-pass", pass,
+		"-db_charset", charset,
+		"-db_app_user", user,
+		"-db_app_password", pass,
+		"-db_dba_user", user,
+		"-db_dba_password", pass,
 		"-proto_topo", proto.CompactTextString(args.Topology),
 		"-mycnf_server_id", "1",
 		"-mycnf_socket_file", socket,
@@ -218,35 +229,49 @@ func VtcomboProcess(env Environment, args *Config, mysql MySQLManager) *VtProces
 	if args.SchemaDir != "" {
 		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-schema_dir", args.SchemaDir}...)
 	}
-	if args.WebDir != "" {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-web_dir", args.WebDir}...)
+	if args.TransactionMode != "" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-transaction_mode", args.TransactionMode}...)
 	}
-	if args.WebDir2 != "" {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-web_dir2", args.WebDir2}...)
+	if args.TransactionTimeout != 0 {
+		vt.ExtraArgs = append(vt.ExtraArgs, "-queryserver-config-transaction-timeout", fmt.Sprintf("%f", args.TransactionTimeout))
+	}
+	if args.TabletHostName != "" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-tablet_hostname", args.TabletHostName}...)
+	}
+	if *servenv.GRPCAuth == "mtls" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-grpc_auth_mode", *servenv.GRPCAuth, "-grpc_key", *servenv.GRPCKey, "-grpc_cert", *servenv.GRPCCert, "-grpc_ca", *servenv.GRPCCA, "-grpc_auth_mtls_allowed_substrings", *servenv.ClientCertSubstrings}...)
+	}
+	if args.InitWorkflowManager {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-workflow_manager_init"}...)
+	}
+	if args.VSchemaDDLAuthorizedUsers != "" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-vschema_ddl_authorized_users", args.VSchemaDDLAuthorizedUsers}...)
 	}
 
 	if socket != "" {
 		vt.ExtraArgs = append(vt.ExtraArgs, []string{
-			"-db-config-app-unixsocket", socket,
-			"-db-config-dba-unixsocket", socket,
+			"-db_socket", socket,
 		}...)
 	} else {
 		hostname, p := mysql.Address()
 		port := fmt.Sprintf("%d", p)
 
 		vt.ExtraArgs = append(vt.ExtraArgs, []string{
-			"-db-config-app-host", hostname,
-			"-db-config-app-port", port,
-			"-db-config-dba-host", hostname,
-			"-db-config-dba-port", port,
+			"-db_host", hostname,
+			"-db_port", port,
 		}...)
 	}
 
 	vtcomboMysqlPort := env.PortForProtocol("vtcombo_mysql_port", "")
+	vtcomboMysqlBindAddress := "localhost"
+	if args.MySQLBindHost != "" {
+		vtcomboMysqlBindAddress = args.MySQLBindHost
+	}
+
 	vt.ExtraArgs = append(vt.ExtraArgs, []string{
 		"-mysql_auth_server_impl", "none",
 		"-mysql_server_port", fmt.Sprintf("%d", vtcomboMysqlPort),
-		"-mysql_server_bind_address", "localhost",
+		"-mysql_server_bind_address", vtcomboMysqlBindAddress,
 	}...)
 
 	return vt

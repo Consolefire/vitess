@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,9 @@ import (
 	"database/sql/driver"
 	"errors"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/sqltypes"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 // streamingRows creates a database/sql/driver compliant Row iterator
@@ -34,15 +33,13 @@ type streamingRows struct {
 	fields  []*querypb.Field
 	qr      *sqltypes.Result
 	index   int
-	cancel  context.CancelFunc
 	convert *converter
 }
 
 // newStreamingRows creates a new streamingRows from stream.
-func newStreamingRows(stream sqltypes.ResultStream, cancel context.CancelFunc, conv *converter) driver.Rows {
+func newStreamingRows(stream sqltypes.ResultStream, conv *converter) driver.Rows {
 	return &streamingRows{
 		stream:  stream,
-		cancel:  cancel,
 		convert: conv,
 	}
 }
@@ -63,9 +60,6 @@ func (ri *streamingRows) Columns() []string {
 }
 
 func (ri *streamingRows) Close() error {
-	if ri.cancel != nil {
-		ri.cancel()
-	}
 	return nil
 }
 

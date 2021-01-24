@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,8 +23,7 @@ import (
 
 func TestLimiter1(t *testing.T) {
 	rl := NewRateLimiter(1, 10*time.Millisecond)
-	var result bool
-	result = rl.Allow()
+	result := rl.Allow()
 	if !result {
 		t.Error("Allow: false, want true")
 	}

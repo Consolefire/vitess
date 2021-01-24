@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,13 @@ package etcd2topo
 import (
 	"errors"
 
+	"context"
+
 	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/youtube/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo"
 )
 
 // Errors specific to this package.
@@ -39,7 +40,7 @@ var (
 
 // convertError converts an etcd error into a topo error. All errors
 // are either application-level errors, or context errors.
-func convertError(err error) error {
+func convertError(err error, nodePath string) error {
 	if err == nil {
 		return nil
 	}
@@ -47,7 +48,7 @@ func convertError(err error) error {
 	if typeErr, ok := err.(rpctypes.EtcdError); ok {
 		switch typeErr.Code() {
 		case codes.NotFound:
-			return topo.ErrNoNode
+			return topo.NewError(topo.NoNode, nodePath)
 		case codes.Unavailable, codes.DeadlineExceeded:
 			// The etcd2 client library may return this error:
 			// grpc.Errorf(codes.Unavailable,
@@ -59,7 +60,7 @@ func convertError(err error) error {
 			// The other reasons for codes.Unavailable are when
 			// etcd master election is failing, so timeout
 			// also sounds reasonable there.
-			return topo.ErrTimeout
+			return topo.NewError(topo.Timeout, nodePath)
 		}
 		return err
 	}
@@ -68,11 +69,11 @@ func convertError(err error) error {
 		// This is a gRPC error.
 		switch s.Code() {
 		case codes.NotFound:
-			return topo.ErrNoNode
+			return topo.NewError(topo.NoNode, nodePath)
 		case codes.Canceled:
-			return topo.ErrInterrupted
+			return topo.NewError(topo.Interrupted, nodePath)
 		case codes.DeadlineExceeded:
-			return topo.ErrTimeout
+			return topo.NewError(topo.Timeout, nodePath)
 		default:
 			return err
 		}
@@ -80,9 +81,9 @@ func convertError(err error) error {
 
 	switch err {
 	case context.Canceled:
-		return topo.ErrInterrupted
+		return topo.NewError(topo.Interrupted, nodePath)
 	case context.DeadlineExceeded:
-		return topo.ErrTimeout
+		return topo.NewError(topo.Timeout, nodePath)
 	default:
 		return err
 	}

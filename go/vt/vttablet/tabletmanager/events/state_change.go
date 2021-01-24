@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ limitations under the License.
 // Package events contains event structs used by the tabletmanager package.
 package events
 
-import topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+import topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 
 // StateChange is an event that describes state changes in the tablet as seen
 // by the TabletManager. It is triggered after the tablet has processed a state

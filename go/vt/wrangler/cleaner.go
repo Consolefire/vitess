@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/youtube/vitess/go/vt/concurrency"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"golang.org/x/net/context"
+	"context"
 
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+)
+
+const (
+	// ChangeTabletTypeActionName is the name of the action to change a tablet type
+	// (can be used to find such an action by name)
+	ChangeTabletTypeActionName = "ChangeTabletTypeAction"
+
+	// TabletTagActionName is the name of the Tag action
+	TabletTagActionName = "TabletTagAction"
+
+	// StartReplicationActionName is the name of the start replication action
+	StartReplicationActionName = "StartReplicationAction"
+
+	// VReplicationActionName is the name of the action to execute VReplication commands
+	VReplicationActionName = "VReplicationAction"
 )
 
 // Cleaner remembers a list of cleanup steps to perform.  Just record
@@ -93,7 +109,7 @@ func (cleaner *Cleaner) CleanUp(wr *Wrangler) error {
 		if err != nil {
 			helper.err = err
 			rec.RecordError(err)
-			wr.Logger().Errorf("action %v failed on %v: %v", actionReference.name, actionReference.target, err)
+			wr.Logger().Errorf2(err, "action %v failed on %v", actionReference.name, actionReference.target)
 		} else {
 			wr.Logger().Infof("action %v successful on %v", actionReference.name, actionReference.target)
 		}
@@ -103,38 +119,10 @@ func (cleaner *Cleaner) CleanUp(wr *Wrangler) error {
 	return rec.Error()
 }
 
-// RemoveActionByName removes an action from the cleaner list
-func (cleaner *Cleaner) RemoveActionByName(name, target string) error {
-	cleaner.mu.Lock()
-	defer cleaner.mu.Unlock()
-	for i, action := range cleaner.actions {
-		if action.name == name && action.target == target {
-			newActions := make([]cleanerActionReference, 0, len(cleaner.actions)-1)
-			if i > 0 {
-				newActions = append(newActions, cleaner.actions[0:i]...)
-			}
-			if i < len(cleaner.actions)-1 {
-				newActions = append(newActions, cleaner.actions[i+1:len(cleaner.actions)]...)
-			}
-			cleaner.actions = newActions
-			return nil
-		}
-	}
-	return topo.ErrNoNode
-}
-
-//
-// ChangeSlaveTypeAction CleanerFunction
-//
-
-// ChangeSlaveTypeActionName is the name of the action to change a slave type
-// (can be used to find such an action by name)
-const ChangeSlaveTypeActionName = "ChangeSlaveTypeAction"
-
-// RecordChangeSlaveTypeAction records a new ChangeSlaveTypeAction
+// RecordChangeTabletTypeAction records a new ChangeTabletTypeAction
 // into the specified Cleaner
-func RecordChangeSlaveTypeAction(cleaner *Cleaner, tabletAlias *topodatapb.TabletAlias, from topodatapb.TabletType, to topodatapb.TabletType) {
-	cleaner.Record(ChangeSlaveTypeActionName, topoproto.TabletAliasString(tabletAlias), func(ctx context.Context, wr *Wrangler) error {
+func RecordChangeTabletTypeAction(cleaner *Cleaner, tabletAlias *topodatapb.TabletAlias, from topodatapb.TabletType, to topodatapb.TabletType) {
+	cleaner.Record(ChangeTabletTypeActionName, topoproto.TabletAliasString(tabletAlias), func(ctx context.Context, wr *Wrangler) error {
 		ti, err := wr.ts.GetTablet(ctx, tabletAlias)
 		if err != nil {
 			return err
@@ -143,7 +131,7 @@ func RecordChangeSlaveTypeAction(cleaner *Cleaner, tabletAlias *topodatapb.Table
 			return fmt.Errorf("tablet %v is not of the right type (got %v expected %v), not changing it to %v", topoproto.TabletAliasString(tabletAlias), ti.Type, from, to)
 		}
 		if !topo.IsTrivialTypeChange(ti.Type, to) {
-			return fmt.Errorf("tablet %v type change %v -> %v is not an allowed transition for ChangeSlaveType", topoproto.TabletAliasString(tabletAlias), ti.Type, to)
+			return fmt.Errorf("tablet %v type change %v -> %v is not an allowed transition for ChangeTabletType", topoproto.TabletAliasString(tabletAlias), ti.Type, to)
 		}
 
 		// ask the tablet to make the change
@@ -151,58 +139,19 @@ func RecordChangeSlaveTypeAction(cleaner *Cleaner, tabletAlias *topodatapb.Table
 	})
 }
 
-//
-// TabletTagAction CleanerFunction
-//
-
-// TabletTagActionName is the name of the Tag action
-const TabletTagActionName = "TabletTagAction"
-
-// RecordTabletTagAction records a new action to set / remove a tag
+// RecordStartReplicationAction records a new action to restart binlog replication on a server
 // into the specified Cleaner
-func RecordTabletTagAction(cleaner *Cleaner, tabletAlias *topodatapb.TabletAlias, name, value string) {
-	cleaner.Record(TabletTagActionName, topoproto.TabletAliasString(tabletAlias), func(ctx context.Context, wr *Wrangler) error {
-		_, err := wr.TopoServer().UpdateTabletFields(ctx, tabletAlias, func(tablet *topodatapb.Tablet) error {
-			if tablet.Tags == nil {
-				tablet.Tags = make(map[string]string)
-			}
-			if value != "" {
-				tablet.Tags[name] = value
-			} else {
-				delete(tablet.Tags, name)
-			}
-			return nil
-		})
+func RecordStartReplicationAction(cleaner *Cleaner, tablet *topodatapb.Tablet) {
+	cleaner.Record(StartReplicationActionName, topoproto.TabletAliasString(tablet.Alias), func(ctx context.Context, wr *Wrangler) error {
+		return wr.TabletManagerClient().StartReplication(ctx, tablet)
+	})
+}
+
+// RecordVReplicationAction records an action to restart binlog replication on a server
+// into the specified Cleaner
+func RecordVReplicationAction(cleaner *Cleaner, tablet *topodatapb.Tablet, query string) {
+	cleaner.Record(VReplicationActionName, topoproto.TabletAliasString(tablet.Alias), func(ctx context.Context, wr *Wrangler) error {
+		_, err := wr.TabletManagerClient().VReplicationExec(ctx, tablet, query)
 		return err
-	})
-}
-
-//
-// StartSlaveAction CleanerAction
-//
-
-// StartSlaveActionName is the name of the slave start action
-const StartSlaveActionName = "StartSlaveAction"
-
-// RecordStartSlaveAction records a new action to restart binlog replication on a server
-// into the specified Cleaner
-func RecordStartSlaveAction(cleaner *Cleaner, tablet *topodatapb.Tablet) {
-	cleaner.Record(StartSlaveActionName, topoproto.TabletAliasString(tablet.Alias), func(ctx context.Context, wr *Wrangler) error {
-		return wr.TabletManagerClient().StartSlave(ctx, tablet)
-	})
-}
-
-//
-// StartBlpAction CleanerAction
-//
-
-// StartBlpActionName is the name of the action to start binlog player
-const StartBlpActionName = "StartBlpAction"
-
-// RecordStartBlpAction records an action to restart binlog replication on a server
-// into the specified Cleaner
-func RecordStartBlpAction(cleaner *Cleaner, tablet *topodatapb.Tablet) {
-	cleaner.Record(StartBlpActionName, topoproto.TabletAliasString(tablet.Alias), func(ctx context.Context, wr *Wrangler) error {
-		return wr.TabletManagerClient().StartBlp(ctx, tablet)
 	})
 }

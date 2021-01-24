@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,9 +23,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/youtube/vitess/go/sync2"
-	"github.com/youtube/vitess/go/vt/callerid"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
+
+	"vitess.io/vitess/go/vt/callerid"
+
+	"vitess.io/vitess/go/streamlog"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 func testNotRedacted(t *testing.T, r *httptest.ResponseRecorder) {
@@ -41,41 +44,48 @@ func testRedacted(t *testing.T, r *httptest.ResponseRecorder) {
 }
 
 func testHandler(req *http.Request, t *testing.T) {
+	// Test with redactions off to start
+	*streamlog.RedactDebugUIQueries = false
+
 	response := httptest.NewRecorder()
 	tabletenv.TxLogger.Send("test msg")
 	txlogzHandler(response, req)
 	if !strings.Contains(response.Body.String(), "error") {
 		t.Fatalf("should show an error page since transaction log format is invalid.")
 	}
-	txConn := &TxConnection{
-		TransactionID:     123456,
-		StartTime:         time.Now(),
-		Queries:           []string{"select * from test"},
-		Conclusion:        "unknown",
-		LogToFile:         sync2.AtomicInt32{},
-		EffectiveCallerID: callerid.NewEffectiveCallerID("effective-caller", "component", "subcomponent"),
-		ImmediateCallerID: callerid.NewImmediateCallerID("immediate-caller"),
+	txConn := &StatefulConnection{
+		ConnID: 123456,
+		txProps: &tx.Properties{
+			EffectiveCaller: callerid.NewEffectiveCallerID("effective-caller", "component", "subcomponent"),
+			ImmediateCaller: callerid.NewImmediateCallerID("immediate-caller"),
+			StartTime:       time.Now(),
+			Conclusion:      "unknown",
+			Queries:         []string{"select * from test"},
+		},
 	}
-	txConn.EndTime = txConn.StartTime
+	txConn.txProps.EndTime = txConn.txProps.StartTime
 	response = httptest.NewRecorder()
 	tabletenv.TxLogger.Send(txConn)
 	txlogzHandler(response, req)
 	testNotRedacted(t, response)
-	txConn.EndTime = txConn.StartTime.Add(time.Duration(2) * time.Second)
+	txConn.txProps.EndTime = txConn.txProps.StartTime.Add(time.Duration(2) * time.Second)
 	response = httptest.NewRecorder()
 	tabletenv.TxLogger.Send(txConn)
 	txlogzHandler(response, req)
 	testNotRedacted(t, response)
-	txConn.EndTime = txConn.StartTime.Add(time.Duration(500) * time.Millisecond)
+	txConn.txProps.EndTime = txConn.txProps.StartTime.Add(time.Duration(500) * time.Millisecond)
 	response = httptest.NewRecorder()
 	tabletenv.TxLogger.Send(txConn)
 	txlogzHandler(response, req)
 	testNotRedacted(t, response)
-	*tabletenv.RedactDebugUIQueries = true
+
+	// Test with redactions on
+	*streamlog.RedactDebugUIQueries = true
 	txlogzHandler(response, req)
 	testRedacted(t, response)
-	*tabletenv.RedactDebugUIQueries = false
 
+	// Reset to default redaction state
+	*streamlog.RedactDebugUIQueries = false
 }
 
 func TestTxlogzHandler(t *testing.T) {

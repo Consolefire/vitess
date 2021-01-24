@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package tableacl
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -26,15 +25,14 @@ import (
 	"strings"
 	"sync"
 
-	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 	"github.com/tchap/go-patricia/patricia"
-	"github.com/youtube/vitess/go/vt/health"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/tableacl/acl"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
-	tableaclpb "github.com/youtube/vitess/go/vt/proto/tableacl"
+	"vitess.io/vitess/go/json2"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/tableacl/acl"
+
+	tableaclpb "vitess.io/vitess/go/vt/proto/tableacl"
 )
 
 // ACLResult embeds an acl.ACL and also tell which table group it belongs to.
@@ -109,19 +107,17 @@ func (tacl *tableACL) init(configFile string, aclCB func()) error {
 	if configFile == "" {
 		return nil
 	}
-	log.Infof("Loading Table ACL from local file: %v", configFile)
 	data, err := ioutil.ReadFile(configFile)
 	if err != nil {
-		log.Infof("unable to read tableACL config file: %v", err)
+		log.Infof("unable to read tableACL config file: %v  Error: %v", configFile, err)
 		return err
 	}
 	config := &tableaclpb.Config{}
 	if err := proto.Unmarshal(data, config); err != nil {
-		log.Infof("unable to parse tableACL config file as a protobuf file: %v", err)
 		// try to parse tableacl as json file
-		if jsonErr := json.Unmarshal(data, config); jsonErr != nil {
-			log.Infof("unable to parse tableACL config file as a json file: %v", jsonErr)
-			return fmt.Errorf("Unable to unmarshal Table ACL data: %v", data)
+		if jsonErr := json2.Unmarshal(data, config); jsonErr != nil {
+			log.Infof("unable to parse tableACL config file as a protobuf or json file.  protobuf err: %v  json err: %v", err, jsonErr)
+			return fmt.Errorf("unable to unmarshal Table ACL data: %s", data)
 		}
 	}
 	return tacl.Set(config)
@@ -176,7 +172,7 @@ func load(config *tableaclpb.Config, newACL func([]string) (acl.ACL, error)) (en
 
 func (tacl *tableACL) aclFactory() (acl.Factory, error) {
 	if tacl.factory == nil {
-		return GetCurrentAclFactory()
+		return GetCurrentACLFactory()
 	}
 	return tacl.factory, nil
 }
@@ -301,8 +297,8 @@ func SetDefaultACL(name string) {
 	defaultACL = name
 }
 
-// GetCurrentAclFactory returns current table acl implementation.
-func GetCurrentAclFactory() (acl.Factory, error) {
+// GetCurrentACLFactory returns current table acl implementation.
+func GetCurrentACLFactory() (acl.Factory, error) {
 	mu.Lock()
 	defer mu.Unlock()
 	if len(acls) == 0 {
@@ -320,23 +316,4 @@ func GetCurrentAclFactory() (acl.Factory, error) {
 		return aclFactory, nil
 	}
 	return nil, fmt.Errorf("aclFactory for given default: %s is not found", defaultACL)
-}
-
-func checkHealth(acl *tableACL) error {
-	if !acl.Valid() {
-		return errors.New("the tableacl is not valid")
-	}
-	return nil
-}
-
-func init() {
-	servenv.OnRun(func() {
-		if !tabletenv.Config.StrictTableACL {
-			return
-		}
-		if tabletenv.Config.EnableTableACLDryRun {
-			return
-		}
-		health.DefaultAggregator.RegisterSimpleCheck("tableacl", func() error { return checkHealth(&currentTableACL) })
-	})
 }

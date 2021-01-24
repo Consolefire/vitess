@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,11 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
-	"github.com/youtube/vitess/go/vt/vterrors"
+	"github.com/stretchr/testify/require"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 func TestResult(t *testing.T) {
@@ -49,13 +51,6 @@ func TestResult(t *testing.T) {
 			NULL,
 			NULL,
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}
 	p3Result := &querypb.QueryResult{
 		Fields:       fields,
@@ -68,13 +63,6 @@ func TestResult(t *testing.T) {
 			Lengths: []int64{2, -1, -1},
 			Values:  []byte("bb"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}
 	p3converted := ResultToProto3(sqlResult)
 	if !proto.Equal(p3converted, p3Result) {
@@ -125,13 +113,6 @@ func TestResults(t *testing.T) {
 			TestValue(Int64, "1"),
 			TestValue(Float64, "2"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}, {
 		Fields:       fields2,
 		InsertID:     3,
@@ -141,13 +122,6 @@ func TestResults(t *testing.T) {
 			TestValue(Int64, "3"),
 			TestValue(Float64, "4"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard1",
-				Position:  "position1",
-			},
-		},
 	}}
 	p3Results := []*querypb.QueryResult{{
 		Fields:       fields1,
@@ -157,13 +131,6 @@ func TestResults(t *testing.T) {
 			Lengths: []int64{2, 1, 1},
 			Values:  []byte("aa12"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}, {
 		Fields:       fields2,
 		InsertId:     3,
@@ -172,13 +139,6 @@ func TestResults(t *testing.T) {
 			Lengths: []int64{2, 1, 1},
 			Values:  []byte("bb34"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard1",
-				Position:  "position1",
-			},
-		},
 	}}
 	p3converted := ResultsToProto3(sqlResults)
 	if !Proto3ResultsEqual(p3converted, p3Results) {
@@ -224,13 +184,6 @@ func TestQueryReponses(t *testing.T) {
 					TestValue(Int64, "1"),
 					TestValue(Float64, "2"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard0",
-						Position:  "position0",
-					},
-				},
 			},
 			QueryError: nil,
 		}, {
@@ -243,13 +196,6 @@ func TestQueryReponses(t *testing.T) {
 					TestValue(Int64, "3"),
 					TestValue(Float64, "4"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard1",
-						Position:  "position1",
-					},
-				},
 			},
 			QueryError: nil,
 		}, {
@@ -269,13 +215,6 @@ func TestQueryReponses(t *testing.T) {
 					Lengths: []int64{2, 1, 1},
 					Values:  []byte("aa12"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard0",
-						Position:  "position0",
-					},
-				},
 			},
 		}, {
 			Error: nil,
@@ -287,13 +226,6 @@ func TestQueryReponses(t *testing.T) {
 					Lengths: []int64{2, 1, 1},
 					Values:  []byte("bb34"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard1",
-						Position:  "position1",
-					},
-				},
 			},
 		}, {
 			Error: &vtrpcpb.RPCError{
@@ -312,5 +244,80 @@ func TestQueryReponses(t *testing.T) {
 	reverse := Proto3ToQueryReponses(p3ResultWithError)
 	if !QueryResponsesEqual(reverse, queryResponses) {
 		t.Errorf("reverse:\n%#v, want\n%#v", reverse, queryResponses)
+	}
+}
+
+func TestProto3ValuesEqual(t *testing.T) {
+	for _, tc := range []struct {
+		v1, v2   []*querypb.Value
+		expected bool
+	}{
+		{
+			v1: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+			},
+			v2: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			expected: false,
+		},
+		{
+			v1: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			v2: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			expected: true,
+		},
+		{
+			v1: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1},
+				},
+			},
+			v2: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			expected: false,
+		},
+	} {
+		require.Equal(t, tc.expected, Proto3ValuesEqual(tc.v1, tc.v2))
 	}
 }

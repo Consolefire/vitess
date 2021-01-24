@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,11 +23,11 @@ import (
 	"sort"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/acl"
-	"github.com/youtube/vitess/go/vt/logz"
-	"github.com/youtube/vitess/go/vt/sqlparser"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/planbuilder"
+	"vitess.io/vitess/go/acl"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logz"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
 )
 
 var (
@@ -36,7 +36,6 @@ var (
 			<th>Query</th>
 			<th>Table</th>
 			<th>Plan</th>
-			<th>Reason</th>
 			<th>Count</th>
 			<th>Time</th>
 			<th>MySQL Time</th>
@@ -54,7 +53,6 @@ var (
 			<td>{{.Query}}</td>
 			<td>{{.Table}}</td>
 			<td>{{.Plan}}</td>
-			<td>{{.Reason}}</td>
 			<td>{{.Count}}</td>
 			<td>{{.Time}}</td>
 			<td>{{.MysqlTime}}</td>
@@ -74,7 +72,6 @@ type queryzRow struct {
 	Query     string
 	Table     string
 	Plan      planbuilder.PlanType
-	Reason    planbuilder.ReasonType
 	Count     int64
 	tm        time.Duration
 	mysqlTime time.Duration
@@ -150,10 +147,9 @@ func queryzHandler(qe *QueryEngine, w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		Value := &queryzRow{
-			Query:  logz.Wrappable(sqlparser.TruncateForUI(v)),
-			Table:  plan.TableName().String(),
-			Plan:   plan.PlanID,
-			Reason: plan.Reason,
+			Query: logz.Wrappable(sqlparser.TruncateForUI(v)),
+			Table: plan.TableName().String(),
+			Plan:  plan.PlanID,
 		}
 		Value.Count, Value.tm, Value.mysqlTime, Value.Rows, Value.Errors = plan.Stats()
 		var timepq time.Duration

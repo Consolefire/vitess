@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,8 +21,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 func TestNormalize(t *testing.T) {
@@ -35,6 +35,23 @@ func TestNormalize(t *testing.T) {
 		// str val
 		in:      "select * from t where v1 = 'aa'",
 		outstmt: "select * from t where v1 = :bv1",
+		outbv: map[string]*querypb.BindVariable{
+			"bv1": sqltypes.BytesBindVariable([]byte("aa")),
+		},
+	}, {
+		// placeholder
+		in:      "select * from t where col=?",
+		outstmt: "select * from t where col = :v1",
+		outbv:   map[string]*querypb.BindVariable{},
+	}, {
+		// qualified table name
+		in:      "select * from `t` where col=?",
+		outstmt: "select * from t where col = :v1",
+		outbv:   map[string]*querypb.BindVariable{},
+	}, {
+		// str val in select
+		in:      "select 'aa' from t",
+		outstmt: "select :bv1 from t",
 		outbv: map[string]*querypb.BindVariable{
 			"bv1": sqltypes.BytesBindVariable([]byte("aa")),
 		},
@@ -118,6 +135,26 @@ func TestNormalize(t *testing.T) {
 		outstmt: "update a set v1 = 0x1234",
 		outbv:   map[string]*querypb.BindVariable{},
 	}, {
+		// Bin value does not convert
+		in:      "select * from t where v1 = b'11'",
+		outstmt: "select * from t where v1 = B'11'",
+		outbv:   map[string]*querypb.BindVariable{},
+	}, {
+		// Bin value does not convert for DMLs
+		in:      "update a set v1 = b'11'",
+		outstmt: "update a set v1 = B'11'",
+		outbv:   map[string]*querypb.BindVariable{},
+	}, {
+		// ORDER BY column_position
+		in:      "select a, b from t order by 1 asc",
+		outstmt: "select a, b from t order by 1 asc",
+		outbv:   map[string]*querypb.BindVariable{},
+	}, {
+		// ORDER BY variable
+		in:      "select a, b from t order by c asc",
+		outstmt: "select a, b from t order by c asc",
+		outbv:   map[string]*querypb.BindVariable{},
+	}, {
 		// Values up to len 256 will reuse.
 		in:      fmt.Sprintf("select * from t where v1 = '%256s' and v2 = '%256s'", "a", "a"),
 		outstmt: "select * from t where v1 = :bv1 and v2 = :bv1",
@@ -168,6 +205,22 @@ func TestNormalize(t *testing.T) {
 		outbv: map[string]*querypb.BindVariable{
 			"bv1": sqltypes.TestBindVariable([]interface{}{1, []byte("2")}),
 		},
+	}, {
+		// Do not normalize cast/convert types
+		in:      `select CAST("test" AS CHAR(60))`,
+		outstmt: `select convert(:bv1, CHAR(60)) from dual`,
+		outbv: map[string]*querypb.BindVariable{
+			"bv1": sqltypes.StringBindVariable("test"),
+		},
+	}, {
+		// insert syntax
+		in:      "insert into a (v1, v2, v3) values (1, '2', 3)",
+		outstmt: "insert into a(v1, v2, v3) values (:bv1, :bv2, :bv3)",
+		outbv: map[string]*querypb.BindVariable{
+			"bv1": sqltypes.Int64BindVariable(1),
+			"bv2": sqltypes.StringBindVariable("2"),
+			"bv3": sqltypes.Int64BindVariable(3),
+		},
 	}}
 	for _, tc := range testcases {
 		stmt, err := Parse(tc.in)
@@ -202,5 +255,22 @@ func TestGetBindVars(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("GetBindVars: %v, want: %v", got, want)
+	}
+}
+
+/*
+Skipping ColName, TableName:
+BenchmarkNormalize-8     1000000              2205 ns/op             821 B/op         27 allocs/op
+Prior to skip:
+BenchmarkNormalize-8      500000              3620 ns/op            1461 B/op         55 allocs/op
+*/
+func BenchmarkNormalize(b *testing.B) {
+	sql := "select 'abcd', 20, 30.0, eid from a where 1=eid and name='3'"
+	ast, err := Parse(sql)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < b.N; i++ {
+		Normalize(ast, map[string]*querypb.BindVariable{}, "")
 	}
 }

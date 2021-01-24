@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,8 +24,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 var packet1 = sqltypes.Result{
@@ -84,7 +86,7 @@ func TestStreamingRows(t *testing.T) {
 	c <- &packet2
 	c <- &packet3
 	close(c)
-	ri := newStreamingRows(&adapter{c: c, err: io.EOF}, nil, &converter{})
+	ri := newStreamingRows(&adapter{c: c, err: io.EOF}, &converter{})
 	wantCols := []string{
 		"field1",
 		"field2",
@@ -102,9 +104,7 @@ func TestStreamingRows(t *testing.T) {
 	}
 	gotRow := make([]driver.Value, 3)
 	err := ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if !reflect.DeepEqual(gotRow, wantRow) {
 		t.Errorf("row1: %v, want %v", gotRow, wantRow)
 	}
@@ -115,9 +115,7 @@ func TestStreamingRows(t *testing.T) {
 		[]byte("value2"),
 	}
 	err = ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if !reflect.DeepEqual(gotRow, wantRow) {
 		t.Errorf("row1: %v, want %v", gotRow, wantRow)
 	}
@@ -136,7 +134,7 @@ func TestStreamingRowsReversed(t *testing.T) {
 	c <- &packet2
 	c <- &packet3
 	close(c)
-	ri := newStreamingRows(&adapter{c: c, err: io.EOF}, nil, &converter{})
+	ri := newStreamingRows(&adapter{c: c, err: io.EOF}, &converter{})
 	defer ri.Close()
 
 	wantRow := []driver.Value{
@@ -146,9 +144,7 @@ func TestStreamingRowsReversed(t *testing.T) {
 	}
 	gotRow := make([]driver.Value, 3)
 	err := ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if !reflect.DeepEqual(gotRow, wantRow) {
 		t.Errorf("row1: %v, want %v", gotRow, wantRow)
 	}
@@ -169,7 +165,7 @@ func TestStreamingRowsReversed(t *testing.T) {
 func TestStreamingRowsError(t *testing.T) {
 	c := make(chan *sqltypes.Result)
 	close(c)
-	ri := newStreamingRows(&adapter{c: c, err: errors.New("error before fields")}, nil, &converter{})
+	ri := newStreamingRows(&adapter{c: c, err: errors.New("error before fields")}, &converter{})
 
 	gotCols := ri.Columns()
 	if gotCols != nil {
@@ -186,7 +182,7 @@ func TestStreamingRowsError(t *testing.T) {
 	c = make(chan *sqltypes.Result, 1)
 	c <- &packet1
 	close(c)
-	ri = newStreamingRows(&adapter{c: c, err: errors.New("error after fields")}, nil, &converter{})
+	ri = newStreamingRows(&adapter{c: c, err: errors.New("error after fields")}, &converter{})
 	wantCols := []string{
 		"field1",
 		"field2",
@@ -213,12 +209,10 @@ func TestStreamingRowsError(t *testing.T) {
 	c <- &packet1
 	c <- &packet2
 	close(c)
-	ri = newStreamingRows(&adapter{c: c, err: errors.New("error after rows")}, nil, &converter{})
+	ri = newStreamingRows(&adapter{c: c, err: errors.New("error after rows")}, &converter{})
 	gotRow = make([]driver.Value, 3)
 	err = ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	err = ri.Next(gotRow)
 	wantErr = "error after rows"
 	if err == nil || !strings.Contains(err.Error(), wantErr) {
@@ -229,7 +223,7 @@ func TestStreamingRowsError(t *testing.T) {
 	c = make(chan *sqltypes.Result, 1)
 	c <- &packet2
 	close(c)
-	ri = newStreamingRows(&adapter{c: c, err: io.EOF}, nil, &converter{})
+	ri = newStreamingRows(&adapter{c: c, err: io.EOF}, &converter{})
 	gotRow = make([]driver.Value, 3)
 	err = ri.Next(gotRow)
 	wantErr = "first packet did not return fields"

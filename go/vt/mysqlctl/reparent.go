@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,9 +26,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/youtube/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/vt/log"
 
-	"golang.org/x/net/context"
+	"context"
 )
 
 // CreateReparentJournal returns the commands to execute to create
@@ -84,38 +85,36 @@ func (mysqld *Mysqld) WaitForReparentJournal(ctx context.Context, timeCreatedNS 
 		t := time.After(100 * time.Millisecond)
 		select {
 		case <-ctx.Done():
+			log.Warning("WaitForReparentJournal failed to see row before timeout.")
 			return ctx.Err()
 		case <-t:
 		}
 	}
 }
 
-// DemoteMaster will gracefully demote a master mysql instance to read only.
-// If the master is still alive, then we need to demote it gracefully
-// make it read-only, flush the writes and get the position
-func (mysqld *Mysqld) DemoteMaster() (rp mysql.Position, err error) {
-	cmds := []string{
-		"FLUSH TABLES WITH READ LOCK",
-		"UNLOCK TABLES",
-	}
-	if err = mysqld.ExecuteSuperQueryList(context.TODO(), cmds); err != nil {
-		return rp, err
-	}
-	return mysqld.MasterPosition()
-}
-
-// PromoteSlave will promote a slave to be the new master.
-func (mysqld *Mysqld) PromoteSlave(hookExtraEnv map[string]string) (mysql.Position, error) {
-	// Since we handle replication, just stop it.
-	cmds := []string{
-		SQLStopSlave,
-		"RESET SLAVE ALL", // "ALL" makes it forget master host:port.
-	}
-
-	// Promote to master.
-	if err := mysqld.ExecuteSuperQueryList(context.TODO(), cmds); err != nil {
+// Promote will promote this server to be the new master.
+func (mysqld *Mysqld) Promote(hookExtraEnv map[string]string) (mysql.Position, error) {
+	ctx := context.TODO()
+	conn, err := getPoolReconnect(ctx, mysqld.dbaPool)
+	if err != nil {
 		return mysql.Position{}, err
 	}
+	defer conn.Recycle()
 
-	return mysqld.MasterPosition()
+	// Since we handle replication, just stop it.
+	cmds := []string{
+		conn.StopReplicationCommand(),
+		"RESET SLAVE ALL", // "ALL" makes it forget master host:port.
+		// When using semi-sync and GTID, a replica first connects to the new master with a given GTID set,
+		// it can take a long time to scan the current binlog file to find the corresponding position.
+		// This can cause commits that occur soon after the master is promoted to take a long time waiting
+		// for a semi-sync ACK, since replication is not fully set up.
+		// More details in: https://github.com/vitessio/vitess/issues/4161
+		"FLUSH BINARY LOGS",
+	}
+
+	if err := mysqld.executeSuperQueryListConn(ctx, conn, cmds); err != nil {
+		return mysql.Position{}, err
+	}
+	return conn.MasterPosition()
 }

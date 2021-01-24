@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,17 +19,21 @@ limitations under the License.
 package wrangler
 
 import (
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtctl/grpcvtctldserver"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+
+	vtctlservicepb "vitess.io/vitess/go/vt/proto/vtctlservice"
 )
 
 var (
 	// DefaultActionTimeout is a good default for interactive
 	// remote actions. We usually take a lock then do an action,
-	// so basing this to be greater than DefaultLockTimeout is good.
+	// lock actions use RemoteOperationTimeout,
+	// so basing this to be greater than RemoteOperationTimeout is good.
 	// Use this as the default value for Context that need a deadline.
-	DefaultActionTimeout = topo.DefaultLockTimeout * 4
+	DefaultActionTimeout = *topo.RemoteOperationTimeout * 4
 )
 
 // Wrangler manages complex actions on the topology, like reparents,
@@ -39,21 +43,23 @@ var (
 // provided they want to share the same logger / topo server / lock timeout.
 type Wrangler struct {
 	logger logutil.Logger
-	ts     topo.Server
+	ts     *topo.Server
 	tmc    tmclient.TabletManagerClient
+	vtctld vtctlservicepb.VtctldServer
 }
 
 // New creates a new Wrangler object.
-func New(logger logutil.Logger, ts topo.Server, tmc tmclient.TabletManagerClient) *Wrangler {
+func New(logger logutil.Logger, ts *topo.Server, tmc tmclient.TabletManagerClient) *Wrangler {
 	return &Wrangler{
 		logger: logger,
 		ts:     ts,
 		tmc:    tmc,
+		vtctld: grpcvtctldserver.NewVtctldServer(ts),
 	}
 }
 
 // TopoServer returns the topo.Server this wrangler is using.
-func (wr *Wrangler) TopoServer() topo.Server {
+func (wr *Wrangler) TopoServer() *topo.Server {
 	return wr.ts
 }
 
@@ -61,6 +67,12 @@ func (wr *Wrangler) TopoServer() topo.Server {
 // wrangler is using.
 func (wr *Wrangler) TabletManagerClient() tmclient.TabletManagerClient {
 	return wr.tmc
+}
+
+// VtctldServer returns the vtctlservicepb.VtctldServer implementation this
+// wrangler is using.
+func (wr *Wrangler) VtctldServer() vtctlservicepb.VtctldServer {
+	return wr.vtctld
 }
 
 // SetLogger can be used to change the current logger. Not synchronized,

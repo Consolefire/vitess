@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,17 +19,13 @@ package vindexes
 import (
 	"bytes"
 	"fmt"
-	"sync"
-	"unicode/utf8"
 
-	"github.com/youtube/vitess/go/sqltypes"
-
-	"golang.org/x/text/collate"
-	"golang.org/x/text/language"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/key"
 )
 
 var (
-	_ Functional = (*UnicodeLooseMD5)(nil)
+	_ SingleColumn = (*UnicodeLooseMD5)(nil)
 )
 
 // UnicodeLooseMD5 is a vindex that normalizes and hashes unicode strings
@@ -56,87 +52,40 @@ func (vind *UnicodeLooseMD5) Cost() int {
 	return 1
 }
 
+// IsUnique returns true since the Vindex is unique.
+func (vind *UnicodeLooseMD5) IsUnique() bool {
+	return true
+}
+
+// NeedsVCursor satisfies the Vindex interface.
+func (vind *UnicodeLooseMD5) NeedsVCursor() bool {
+	return false
+}
+
 // Verify returns true if ids maps to ksids.
 func (vind *UnicodeLooseMD5) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, len(ids))
 	for i := range ids {
-		data, err := unicodeHash(ids[i])
+		data, err := unicodeHash(vMD5Hash, ids[i])
 		if err != nil {
 			return nil, fmt.Errorf("UnicodeLooseMD5.Verify: %v", err)
 		}
-		out[i] = (bytes.Compare(data, ksids[i]) == 0)
+		out[i] = bytes.Equal(data, ksids[i])
 	}
 	return out, nil
 }
 
-// Map returns the corresponding keyspace id values for the given ids.
-func (vind *UnicodeLooseMD5) Map(_ VCursor, ids []sqltypes.Value) ([][]byte, error) {
-	out := make([][]byte, 0, len(ids))
+// Map can map ids to key.Destination objects.
+func (vind *UnicodeLooseMD5) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
-		data, err := unicodeHash(id)
+		data, err := unicodeHash(vMD5Hash, id)
 		if err != nil {
 			return nil, fmt.Errorf("UnicodeLooseMD5.Map: %v", err)
 		}
-		out = append(out, data)
+		out = append(out, key.DestinationKeyspaceID(data))
 	}
 	return out, nil
-}
-
-func unicodeHash(key sqltypes.Value) ([]byte, error) {
-	collator := collatorPool.Get().(pooledCollator)
-	defer collatorPool.Put(collator)
-
-	norm, err := normalize(collator.col, collator.buf, key.ToBytes())
-	if err != nil {
-		return nil, err
-	}
-	return binHash(norm), nil
-}
-
-func normalize(col *collate.Collator, buf *collate.Buffer, in []byte) ([]byte, error) {
-	// We cannot pass invalid UTF-8 to the collator.
-	if !utf8.Valid(in) {
-		return nil, fmt.Errorf("cannot normalize string containing invalid UTF-8: %q", string(in))
-	}
-
-	// Ref: http://dev.mysql.com/doc/refman/5.6/en/char.html.
-	// Trailing spaces are ignored by MySQL.
-	in = bytes.TrimRight(in, " ")
-
-	// We use the collation key which can be used to
-	// perform lexical comparisons.
-	return col.Key(buf, in), nil
-}
-
-// pooledCollator pairs a Collator and a Buffer.
-// These pairs are pooled to avoid reallocating for every request,
-// which would otherwise be required because they can't be used concurrently.
-//
-// Note that you must ensure no active references into the buffer remain
-// before you return this pair back to the pool.
-// That is, either do your processing on the result first, or make a copy.
-type pooledCollator struct {
-	col *collate.Collator
-	buf *collate.Buffer
-}
-
-var collatorPool = sync.Pool{New: newPooledCollator}
-
-func newPooledCollator() interface{} {
-	// Ref: http://www.unicode.org/reports/tr10/#Introduction.
-	// Unicode seems to define a universal (or default) order.
-	// But various locales have conflicting order,
-	// which they have the right to override.
-	// Unfortunately, the Go library requires you to specify a locale.
-	// So, I chose English assuming that it won't override
-	// the Unicode universal order. But I couldn't find an easy
-	// way to verify this.
-	// Also, the locale differences are not an issue for level 1,
-	// because the conservative comparison makes them all equal.
-	return pooledCollator{
-		col: collate.New(language.English, collate.Loose),
-		buf: new(collate.Buffer),
-	}
 }
 
 func init() {

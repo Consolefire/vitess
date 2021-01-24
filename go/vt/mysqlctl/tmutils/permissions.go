@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,11 +24,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/concurrency"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/concurrency"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 )
 
 // This file contains helper methods to deal with Permissions.
@@ -71,7 +71,7 @@ func NewUserPermission(fields []*querypb.Field, values []sqltypes.Value) *tablet
 			up.PasswordChecksum = crc64.Checksum(values[i].ToBytes(), hashTable)
 		case "password_last_changed":
 			// we skip this one, as the value may be
-			// different on master and slaves.
+			// different on master and replicas.
 		default:
 			up.Privileges[field.Name] = values[i].ToString()
 		}
@@ -184,7 +184,7 @@ func diffPermissions(name, leftName string, left permissionList, rightName strin
 
 		// same name, let's see content
 		if lval != rval {
-			er.RecordError(fmt.Errorf("%v and %v disagree on %v %v:\n%v\n differs from:\n%v", leftName, rightName, name, lpk, lval, rval))
+			er.RecordError(fmt.Errorf("permissions differ on %v %v:\n%s: %v\n differs from:\n%s: %v", name, lpk, leftName, lval, rightName, rval))
 		}
 		leftIndex++
 		rightIndex++

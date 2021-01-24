@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,17 +22,17 @@ import (
 	"strconv"
 	"strings"
 
-	log "github.com/golang/glog"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/mysql"
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
-	"github.com/youtube/vitess/go/vt/sqlparser"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 
-	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 var (
@@ -52,11 +52,11 @@ type EventStreamer struct {
 }
 
 // NewEventStreamer returns a new EventStreamer on top of a Streamer
-func NewEventStreamer(dbname string, mysqld mysqlctl.MysqlDaemon, se *schema.Engine, startPos mysql.Position, timestamp int64, sendEvent sendEventFunc) *EventStreamer {
+func NewEventStreamer(cp dbconfigs.Connector, se *schema.Engine, startPos mysql.Position, timestamp int64, sendEvent sendEventFunc) *EventStreamer {
 	evs := &EventStreamer{
 		sendEvent: sendEvent,
 	}
-	evs.bls = NewStreamer(dbname, mysqld, se, nil, startPos, timestamp, evs.transactionToEvent)
+	evs.bls = NewStreamer(cp, se, nil, startPos, timestamp, evs.transactionToEvent)
 	evs.bls.extractPK = true
 	return evs
 }
@@ -169,7 +169,7 @@ func (evs *EventStreamer) buildDMLStatement(stmt FullBinlogStatement, insertid i
 	}
 
 	// then parse the PK values, one at a time
-	for typ, val = tokenizer.Scan(); typ != ';'; typ, val = tokenizer.Scan() {
+	for typ, _ = tokenizer.Scan(); typ != ';'; typ, _ = tokenizer.Scan() {
 		switch typ {
 		case '(':
 			// pkTuple is a list of pk values

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,9 +22,10 @@ import (
 	"html/template"
 	"net/http"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
-	"github.com/youtube/vitess/go/acl"
+	"vitess.io/vitess/go/acl"
+	"vitess.io/vitess/go/vt/log"
 )
 
 var (
@@ -147,7 +148,6 @@ func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
 	var msg string
 	if action != "" {
 		if err != nil {
-			msg = err.Error()
 			msg = fmt.Sprintf("%s(%s): %v", r.FormValue("Action"), dtid, err)
 		} else {
 			msg = fmt.Sprintf("%s(%s): completed.", r.FormValue("Action"), dtid)
@@ -162,8 +162,8 @@ func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
 	if format == "json" {
 		w.Header().Set("Content-Type", "application/json")
 		js, err := json.Marshal(struct {
-			Distributed      []*DistributedTx
-			Prepared, Failed []*PreparedTx
+			Distributed      []*tx.DistributedTx
+			Prepared, Failed []*tx.PreparedTx
 		}{
 			Distributed: distributed,
 			Prepared:    prepared,

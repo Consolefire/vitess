@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,13 +21,16 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestCounters(t *testing.T) {
 	clear()
-	c := NewCounters("counter1")
+	c := NewCountersWithSingleLabel("counter1", "help", "label")
 	c.Add("c1", 1)
 	c.Add("c2", 1)
 	c.Add("c2", 1)
@@ -43,27 +46,18 @@ func TestCounters(t *testing.T) {
 	if counts["c2"] != 2 {
 		t.Errorf("want 2, got %d", counts["c2"])
 	}
-	f := CountersFunc(func() map[string]int64 {
-		return map[string]int64{
-			"c1": 1,
-			"c2": 2,
-		}
-	})
-	if s := f.String(); s != want1 && s != want2 {
-		t.Errorf("want %s or %s, got %s", want1, want2, s)
-	}
 }
 
 func TestCountersTags(t *testing.T) {
 	clear()
-	c := NewCounters("counterTag1")
+	c := NewCountersWithSingleLabel("counterTag1", "help", "label")
 	want := map[string]int64{}
 	got := c.Counts()
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("want %v, got %v", want, got)
 	}
 
-	c = NewCounters("counterTag2", "tag1", "tag2")
+	c = NewCountersWithSingleLabel("counterTag2", "help", "label", "tag1", "tag2")
 	want = map[string]int64{"tag1": 0, "tag2": 0}
 	got = c.Counts()
 	if !reflect.DeepEqual(got, want) {
@@ -73,7 +67,7 @@ func TestCountersTags(t *testing.T) {
 
 func TestMultiCounters(t *testing.T) {
 	clear()
-	c := NewMultiCounters("mapCounter1", []string{"aaa", "bbb"})
+	c := NewCountersWithMultiLabels("mapCounter1", "help", []string{"aaa", "bbb"})
 	c.Add([]string{"c1a", "c1b"}, 1)
 	c.Add([]string{"c2a", "c2b"}, 1)
 	c.Add([]string{"c2a", "c2b"}, 1)
@@ -89,7 +83,7 @@ func TestMultiCounters(t *testing.T) {
 	if counts["c2a.c2b"] != 2 {
 		t.Errorf("want 2, got %d", counts["c2a.c2b"])
 	}
-	f := NewMultiCountersFunc("", []string{"aaa", "bbb"}, func() map[string]int64 {
+	f := NewCountersFuncWithMultiLabels("", "help", []string{"aaa", "bbb"}, func() map[string]int64 {
 		return map[string]int64{
 			"c1a.c1b": 1,
 			"c2a.c2b": 2,
@@ -102,34 +96,38 @@ func TestMultiCounters(t *testing.T) {
 
 func TestMultiCountersDot(t *testing.T) {
 	clear()
-	c := NewMultiCounters("mapCounter2", []string{"aaa", "bbb"})
+	c := NewCountersWithMultiLabels("mapCounter2", "help", []string{"aaa", "bbb"})
 	c.Add([]string{"c1.a", "c1b"}, 1)
 	c.Add([]string{"c2a", "c2.b"}, 1)
 	c.Add([]string{"c2a", "c2.b"}, 1)
-	want1 := `{"c1\\.a.c1b": 1, "c2a.c2\\.b": 2}`
-	want2 := `{"c2a.c2\\.b": 2, "c1\\.a.c1b": 1}`
+	c1a := safeLabel("c1.a")
+	c1aJSON := strings.Replace(c1a, "\\", "\\\\", -1)
+	c2b := safeLabel("c2.b")
+	c2bJSON := strings.Replace(c2b, "\\", "\\\\", -1)
+	want1 := `{"` + c1aJSON + `.c1b": 1, "c2a.` + c2bJSON + `": 2}`
+	want2 := `{"c2a.` + c2bJSON + `": 2, "` + c1aJSON + `.c1b": 1}`
 	if s := c.String(); s != want1 && s != want2 {
 		t.Errorf("want %s or %s, got %s", want1, want2, s)
 	}
 	counts := c.Counts()
-	if counts["c1\\.a.c1b"] != 1 {
-		t.Errorf("want 1, got %d", counts["c1\\.a.c1b"])
+	if counts[c1a+".c1b"] != 1 {
+		t.Errorf("want 1, got %d", counts[c1a+".c1b"])
 	}
-	if counts["c2a.c2\\.b"] != 2 {
-		t.Errorf("want 2, got %d", counts["c2a.c2\\.b"])
+	if counts["c2a."+c2b] != 2 {
+		t.Errorf("want 2, got %d", counts["c2a."+c2b])
 	}
 }
 
 func TestCountersHook(t *testing.T) {
 	var gotname string
-	var gotv *Counters
+	var gotv *CountersWithSingleLabel
 	clear()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
-		gotv = v.(*Counters)
+		gotv = v.(*CountersWithSingleLabel)
 	})
 
-	v := NewCounters("counter2")
+	v := NewCountersWithSingleLabel("counter2", "help", "label")
 	if gotname != "counter2" {
 		t.Errorf("want counter2, got %s", gotname)
 	}
@@ -138,7 +136,7 @@ func TestCountersHook(t *testing.T) {
 	}
 }
 
-var benchCounter = NewCounters("bench")
+var benchCounter = NewCountersWithSingleLabel("bench", "help", "label")
 
 func BenchmarkCounters(b *testing.B) {
 	clear()
@@ -152,7 +150,7 @@ func BenchmarkCounters(b *testing.B) {
 	})
 }
 
-var benchMultiCounter = NewMultiCounters("benchMulti", []string{"call", "keyspace", "dbtype"})
+var benchMultiCounter = NewCountersWithMultiLabels("benchMulti", "help", []string{"call", "keyspace", "dbtype"})
 
 func BenchmarkMultiCounters(b *testing.B) {
 	clear()
@@ -207,4 +205,69 @@ func BenchmarkCountersTailLatency(b *testing.B) {
 
 	close(c)
 	<-done
+}
+
+func TestCountersFuncWithMultiLabels(t *testing.T) {
+	clear()
+	f := NewCountersFuncWithMultiLabels("TestCountersFuncWithMultiLabels", "help", []string{"label1"}, func() map[string]int64 {
+		return map[string]int64{
+			"c1": 1,
+			"c2": 2,
+		}
+	})
+
+	want1 := `{"c1": 1, "c2": 2}`
+	want2 := `{"c2": 2, "c1": 1}`
+	if s := f.String(); s != want1 && s != want2 {
+		t.Errorf("want %s or %s, got %s", want1, want2, s)
+	}
+}
+
+func TestCountersFuncWithMultiLabels_Hook(t *testing.T) {
+	var gotname string
+	var gotv *CountersFuncWithMultiLabels
+	clear()
+	Register(func(name string, v expvar.Var) {
+		gotname = name
+		gotv = v.(*CountersFuncWithMultiLabels)
+	})
+
+	v := NewCountersFuncWithMultiLabels("TestCountersFuncWithMultiLabels_Hook", "help", []string{"label1"}, func() map[string]int64 {
+		return map[string]int64{}
+	})
+	if gotname != "TestCountersFuncWithMultiLabels_Hook" {
+		t.Errorf("want TestCountersFuncWithMultiLabels_Hook, got %s", gotname)
+	}
+	if gotv != v {
+		t.Errorf("want %#v, got %#v", v, gotv)
+	}
+}
+
+func TestCountersCombineDimension(t *testing.T) {
+	clear()
+	// Empty labels shouldn't be combined.
+	c0 := NewCountersWithSingleLabel("counter_combine_dim0", "help", "")
+	c0.Add("c1", 1)
+	assert.Equal(t, `{"c1": 1}`, c0.String())
+
+	clear()
+	*combineDimensions = "a,c"
+
+	c1 := NewCountersWithSingleLabel("counter_combine_dim1", "help", "label")
+	c1.Add("c1", 1)
+	assert.Equal(t, `{"c1": 1}`, c1.String())
+
+	c2 := NewCountersWithSingleLabel("counter_combine_dim2", "help", "a")
+	c2.Add("c1", 1)
+	assert.Equal(t, `{"all": 1}`, c2.String())
+
+	c3 := NewCountersWithSingleLabel("counter_combine_dim3", "help", "a")
+	assert.Equal(t, `{"all": 0}`, c3.String())
+
+	// Anything under "a" and "c" should get reported under a consolidated "all" value
+	// instead of the specific supplied values.
+	c4 := NewCountersWithMultiLabels("counter_combine_dim4", "help", []string{"a", "b", "c"})
+	c4.Add([]string{"c1", "c2", "c3"}, 1)
+	c4.Add([]string{"c4", "c2", "c5"}, 1)
+	assert.Equal(t, `{"all.c2.all": 2}`, c4.String())
 }

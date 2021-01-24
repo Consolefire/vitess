@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,13 +19,13 @@ package mysql
 import (
 	"fmt"
 
-	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
 
 // BinlogEvent represents a single event from a raw MySQL binlog dump stream.
 // The implementation is provided by each supported flavor in go/vt/mysqlctl.
 //
-// binlog.Streamer receives these events through a mysqlctl.SlaveConnection and
+// binlog.Streamer receives these events through a mysqlctl.BinlogConnection and
 // processes them, grouping statements into BinlogTransactions as appropriate.
 //
 // Methods that only access header fields can't fail as long as IsValid()
@@ -70,13 +70,13 @@ type BinlogEvent interface {
 
 	// RBR events.
 
-	// IsTableMapEvent returns true if this is a TABLE_MAP_EVENT.
+	// IsTableMap returns true if this is a TABLE_MAP_EVENT.
 	IsTableMap() bool
-	// IsWriteRowsEvent returns true if this is a WRITE_ROWS_EVENT.
+	// IsWriteRows returns true if this is a WRITE_ROWS_EVENT.
 	IsWriteRows() bool
-	// IsUpdateRowsEvent returns true if this is a UPDATE_ROWS_EVENT.
+	// IsUpdateRows returns true if this is a UPDATE_ROWS_EVENT.
 	IsUpdateRows() bool
-	// IsDeleteRowsEvent returns true if this is a DELETE_ROWS_EVENT.
+	// IsDeleteRows returns true if this is a DELETE_ROWS_EVENT.
 	IsDeleteRows() bool
 
 	// Timestamp returns the timestamp from the event header.
@@ -119,19 +119,25 @@ type BinlogEvent interface {
 	// checksum stripped off, if any. If there is no checksum, it returns
 	// the same event and a nil checksum.
 	StripChecksum(BinlogFormat) (ev BinlogEvent, checksum []byte, err error)
+
+	// IsPseudo is for custom implementations of GTID.
+	IsPseudo() bool
 }
 
 // BinlogFormat contains relevant data from the FORMAT_DESCRIPTION_EVENT.
 // This structure is passed to subsequent event types to let them know how to
 // parse themselves.
 type BinlogFormat struct {
-	// FormatVersion is the version number of the binlog file format.
-	// We only support version 4.
-	FormatVersion uint16
+	// HeaderSizes is an array of sizes of the headers for each message.
+	HeaderSizes []byte
 
 	// ServerVersion is the name of the MySQL server version.
 	// It starts with something like 5.6.33-xxxx.
 	ServerVersion string
+
+	// FormatVersion is the version number of the binlog file format.
+	// We only support version 4.
+	FormatVersion uint16
 
 	// HeaderLength is the size in bytes of event headers other
 	// than FORMAT_DESCRIPTION_EVENT. Almost always 19.
@@ -140,9 +146,6 @@ type BinlogFormat struct {
 	// ChecksumAlgorithm is the ID number of the binlog checksum algorithm.
 	// See three possible values below.
 	ChecksumAlgorithm byte
-
-	// HeaderSizes is an array of sizes of the headers for each message.
-	HeaderSizes []byte
 }
 
 // IsZero returns true if the BinlogFormat has not been initialized.

@@ -1,10 +1,20 @@
 # This file is executed immediately after mysql_install_db,
 # to initialize a fresh data directory.
 
-##########################################
-# Equivalent of mysql_secure_installation
-##########################################
+###############################################################################
+# WARNING: This sql is *NOT* safe for production use,
+#          as it contains default well-known users and passwords.
+#          Care should be taken to change these users and passwords
+#          for production.
+###############################################################################
 
+###############################################################################
+# Equivalent of mysql_secure_installation
+###############################################################################
+
+# Changes during the init db should not make it to the binlog.
+# They could potentially create errant transactions on replicas.
+SET sql_log_bin = 0;
 # Remove anonymous users.
 DELETE FROM mysql.user WHERE User = '';
 
@@ -14,9 +24,9 @@ DELETE FROM mysql.user WHERE User = 'root' AND Host != 'localhost';
 # Remove test database.
 DROP DATABASE IF EXISTS test;
 
-##########################################
+###############################################################################
 # Vitess defaults
-##########################################
+###############################################################################
 
 # Vitess-internal database.
 CREATE DATABASE IF NOT EXISTS _vt;
@@ -25,19 +35,23 @@ CREATE DATABASE IF NOT EXISTS _vt;
 CREATE TABLE IF NOT EXISTS _vt.local_metadata (
   name VARCHAR(255) NOT NULL,
   value VARCHAR(255) NOT NULL,
-  PRIMARY KEY (name)
+  db_name VARBINARY(255) NOT NULL,
+  PRIMARY KEY (db_name, name)
   ) ENGINE=InnoDB;
 CREATE TABLE IF NOT EXISTS _vt.shard_metadata (
   name VARCHAR(255) NOT NULL,
   value MEDIUMBLOB NOT NULL,
-  PRIMARY KEY (name)
+  db_name VARBINARY(255) NOT NULL,
+  PRIMARY KEY (db_name, name)
   ) ENGINE=InnoDB;
 
 # Admin user with all privileges.
+CREATE USER 'vt_dba'@'localhost';
 GRANT ALL ON *.* TO 'vt_dba'@'localhost';
 GRANT GRANT OPTION ON *.* TO 'vt_dba'@'localhost';
 
 # User for app traffic, with global read-write access.
+CREATE USER 'vt_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
   REFERENCES, INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES,
   LOCK TABLES, EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW,
@@ -45,10 +59,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
   ON *.* TO 'vt_app'@'localhost';
 
 # User for app debug traffic, with global read access.
+CREATE USER 'vt_appdebug'@'localhost';
 GRANT SELECT, SHOW DATABASES, PROCESS ON *.* TO 'vt_appdebug'@'localhost';
 
 # User for administrative operations that need to be executed as non-SUPER.
 # Same permissions as vt_app here.
+CREATE USER 'vt_allprivs'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
   REFERENCES, INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES,
   LOCK TABLES, EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW,
@@ -56,21 +72,33 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
   ON *.* TO 'vt_allprivs'@'localhost';
 
 # User for slave replication connections.
+CREATE USER 'vt_repl'@'%';
 GRANT REPLICATION SLAVE ON *.* TO 'vt_repl'@'%';
 
 # User for Vitess filtered replication (binlog player).
 # Same permissions as vt_app.
+CREATE USER 'vt_filtered'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
   REFERENCES, INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES,
   LOCK TABLES, EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW,
   SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, CREATE USER, EVENT, TRIGGER
   ON *.* TO 'vt_filtered'@'localhost';
 
-# User for Orchestrator (https://github.com/github/orchestrator).
+# User for general MySQL monitoring.
+CREATE USER 'vt_monitoring'@'localhost';
+GRANT SELECT, PROCESS, SUPER, REPLICATION CLIENT, RELOAD
+  ON *.* TO 'vt_monitoring'@'localhost';
+GRANT SELECT, UPDATE, DELETE, DROP
+  ON performance_schema.* TO 'vt_monitoring'@'localhost';
+
+# User for Orchestrator (https://github.com/openark/orchestrator).
+CREATE USER 'orc_client_user'@'%' IDENTIFIED BY 'orc_client_user_password';
 GRANT SUPER, PROCESS, REPLICATION SLAVE, RELOAD
-  ON *.* TO 'orc_client_user'@'%' IDENTIFIED BY 'orc_client_user_password';
+  ON *.* TO 'orc_client_user'@'%';
 GRANT SELECT
-  ON _vt.* TO 'orc_client_user'@'%' IDENTIFIED BY 'orc_client_user_password';
+  ON _vt.* TO 'orc_client_user'@'%';
 
 FLUSH PRIVILEGES;
 
+RESET SLAVE ALL;
+RESET MASTER;

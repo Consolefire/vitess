@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,125 +19,23 @@ package stats
 import (
 	"expvar"
 	"testing"
-	"time"
 )
 
 func clear() {
 	defaultVarGroup.vars = make(map[string]expvar.Var)
 	defaultVarGroup.newVarHook = nil
+	*combineDimensions = ""
+	*dropVariables = ""
+	combinedDimensions = nil
+	droppedVars = nil
 }
 
 func TestNoHook(t *testing.T) {
 	clear()
-	v := NewInt("plainint")
-	v.Set(1)
+	v := NewCounter("plainint", "help")
+	v.Add(1)
 	if v.String() != "1" {
 		t.Errorf("want 1, got %s", v.String())
-	}
-}
-
-func TestFloat(t *testing.T) {
-	var gotname string
-	var gotv *Float
-	clear()
-	Register(func(name string, v expvar.Var) {
-		gotname = name
-		gotv = v.(*Float)
-	})
-	v := NewFloat("Float")
-	if gotname != "Float" {
-		t.Errorf("want Float, got %s", gotname)
-	}
-	if gotv != v {
-		t.Errorf("want %#v, got %#v", v, gotv)
-	}
-	v.Set(5.1)
-	if v.Get() != 5.1 {
-		t.Errorf("want 5.1, got %v", v.Get())
-	}
-	v.Add(1.0)
-	if v.Get() != 6.1 {
-		t.Errorf("want 6.1, got %v", v.Get())
-	}
-	if v.String() != "6.1" {
-		t.Errorf("want 6.1, got %v", v.Get())
-	}
-
-	f := FloatFunc(func() float64 {
-		return 1.234
-	})
-	if f.String() != "1.234" {
-		t.Errorf("want 1.234, got %v", f.String())
-	}
-}
-
-func TestInt(t *testing.T) {
-	var gotname string
-	var gotv *Int
-	clear()
-	Register(func(name string, v expvar.Var) {
-		gotname = name
-		gotv = v.(*Int)
-	})
-	v := NewInt("Int")
-	if gotname != "Int" {
-		t.Errorf("want Int, got %s", gotname)
-	}
-	if gotv != v {
-		t.Errorf("want %#v, got %#v", v, gotv)
-	}
-	v.Set(5)
-	if v.Get() != 5 {
-		t.Errorf("want 5, got %v", v.Get())
-	}
-	v.Add(1)
-	if v.Get() != 6 {
-		t.Errorf("want 6, got %v", v.Get())
-	}
-	if v.String() != "6" {
-		t.Errorf("want 6, got %v", v.Get())
-	}
-
-	f := IntFunc(func() int64 {
-		return 1
-	})
-	if f.String() != "1" {
-		t.Errorf("want 1, got %v", f.String())
-	}
-}
-
-func TestDuration(t *testing.T) {
-	var gotname string
-	var gotv *Duration
-	clear()
-	Register(func(name string, v expvar.Var) {
-		gotname = name
-		gotv = v.(*Duration)
-	})
-	v := NewDuration("Duration")
-	if gotname != "Duration" {
-		t.Errorf("want Duration, got %s", gotname)
-	}
-	if gotv != v {
-		t.Errorf("want %#v, got %#v", v, gotv)
-	}
-	v.Set(time.Duration(5))
-	if v.Get() != 5 {
-		t.Errorf("want 5, got %v", v.Get())
-	}
-	v.Add(time.Duration(1))
-	if v.Get() != 6 {
-		t.Errorf("want 6, got %v", v.Get())
-	}
-	if v.String() != "6" {
-		t.Errorf("want 6, got %v", v.Get())
-	}
-
-	f := DurationFunc(func() time.Duration {
-		return time.Duration(1)
-	})
-	if f.String() != "1" {
-		t.Errorf("want 1, got %v", f.String())
 	}
 }
 
@@ -200,15 +98,21 @@ func f() string {
 	return "abcd"
 }
 
+type expvarFunc func() string
+
+func (f expvarFunc) String() string {
+	return f()
+}
+
 func TestPublishFunc(t *testing.T) {
 	var gotname string
-	var gotv JSONFunc
+	var gotv expvarFunc
 	clear()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
-		gotv = v.(JSONFunc)
+		gotv = v.(expvarFunc)
 	})
-	PublishJSONFunc("Myfunc", f)
+	publish("Myfunc", expvarFunc(f))
 	if gotname != "Myfunc" {
 		t.Errorf("want Myfunc, got %s", gotname)
 	}
@@ -217,25 +121,21 @@ func TestPublishFunc(t *testing.T) {
 	}
 }
 
-func TestStringMap(t *testing.T) {
+func TestDropVariable(t *testing.T) {
 	clear()
-	c := NewStringMap("stringmap1")
-	c.Set("c1", "val1")
-	c.Set("c2", "val2")
-	c.Set("c2", "val3")
-	want1 := `{"c1": "val1", "c2": "val3"}`
-	want2 := `{"c2": "val3", "c1": "val1"}`
-	if s := c.String(); s != want1 && s != want2 {
-		t.Errorf("want %s or %s, got %s", want1, want2, s)
-	}
+	*dropVariables = "dropTest"
 
-	f := StringMapFunc(func() map[string]string {
-		return map[string]string{
-			"c1": "val1",
-			"c2": "val3",
-		}
-	})
-	if s := f.String(); s != want1 && s != want2 {
-		t.Errorf("want %s or %s, got %s", want1, want2, s)
+	// This should not panic.
+	_ = NewGaugesWithSingleLabel("dropTest", "help", "label")
+	_ = NewGaugesWithSingleLabel("dropTest", "help", "label")
+}
+
+func TestStringMapToString(t *testing.T) {
+	expected1 := "{\"aaa\": \"111\", \"bbb\": \"222\"}"
+	expected2 := "{\"bbb\": \"222\", \"aaa\": \"111\"}"
+	got := stringMapToString(map[string]string{"aaa": "111", "bbb": "222"})
+
+	if got != expected1 && got != expected2 {
+		t.Errorf("expected %v or %v, got  %v", expected1, expected2, got)
 	}
 }

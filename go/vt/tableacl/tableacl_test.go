@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,16 +23,14 @@ import (
 	"os"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/golang/protobuf/proto"
 
-	"github.com/youtube/vitess/go/vt/health"
-	"github.com/youtube/vitess/go/vt/tableacl/acl"
-	"github.com/youtube/vitess/go/vt/tableacl/simpleacl"
+	"vitess.io/vitess/go/vt/tableacl/acl"
+	"vitess.io/vitess/go/vt/tableacl/simpleacl"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	tableaclpb "github.com/youtube/vitess/go/vt/proto/tableacl"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tableaclpb "vitess.io/vitess/go/vt/proto/tableacl"
 )
 
 type fakeACLFactory struct{}
@@ -221,7 +219,7 @@ func TestGetCurrentAclFactory(t *testing.T) {
 	name := "tableacl-name-TestGetCurrentAclFactory"
 	aclFactory := &simpleacl.Factory{}
 	Register(name+"-1", aclFactory)
-	f, err := GetCurrentAclFactory()
+	f, err := GetCurrentACLFactory()
 	if err != nil {
 		t.Errorf("Fail to get current ACL Factory: %v", err)
 	}
@@ -229,13 +227,13 @@ func TestGetCurrentAclFactory(t *testing.T) {
 		t.Fatalf("should return registered acl factory even if default acl is not set.")
 	}
 	Register(name+"-2", aclFactory)
-	_, err = GetCurrentAclFactory()
+	_, err = GetCurrentACLFactory()
 	if err == nil {
 		t.Fatalf("there are more than one acl factories, but the default is not set")
 	}
 }
 
-func TestGetCurrentAclFactoryWithWrongDefault(t *testing.T) {
+func TestGetCurrentACLFactoryWithWrongDefault(t *testing.T) {
 	acls = make(map[string]acl.Factory)
 	defaultACL = ""
 	name := "tableacl-name-TestGetCurrentAclFactoryWithWrongDefault"
@@ -243,53 +241,8 @@ func TestGetCurrentAclFactoryWithWrongDefault(t *testing.T) {
 	Register(name+"-1", aclFactory)
 	Register(name+"-2", aclFactory)
 	SetDefaultACL("wrong_name")
-	_, err := GetCurrentAclFactory()
+	_, err := GetCurrentACLFactory()
 	if err == nil {
 		t.Fatalf("there are more than one acl factories, but the default given does not match any of these.")
-	}
-}
-
-func TestHealthWithACL(t *testing.T) {
-	tacl := tableACL{factory: &simpleacl.Factory{}}
-	ha := health.NewAggregator()
-	tests := []struct {
-		config *tableaclpb.Config
-		wantOK bool
-	}{
-		{
-			config: nil,
-			wantOK: false,
-		},
-		{
-			config: &tableaclpb.Config{
-				TableGroups: []*tableaclpb.TableGroupSpec{{
-					Name:                 "group01",
-					TableNamesOrPrefixes: []string{"test_table"},
-					Readers:              []string{"vt"},
-					Writers:              []string{"vt"},
-				}}},
-			wantOK: true,
-		},
-		{
-			config: &tableaclpb.Config{},
-			wantOK: true,
-		},
-	}
-	ha.RegisterSimpleCheck("tableacl", func() error { return checkHealth(&tacl) })
-	for _, test := range tests {
-		if test.config != nil {
-			if err := tacl.Set(test.config); err != nil {
-				t.Fatalf("tacl.Set(%#v) = %v, want %v", test.config, err, nil)
-			}
-		}
-		delay, err := ha.Report(true, true)
-		wantErr := error(nil)
-		if !test.wantOK {
-			wantErr = errors.New("<not nil>")
-		}
-		wantDelay := time.Duration(0)
-		if delay != wantDelay || (err == nil) != test.wantOK {
-			t.Errorf("ha.Report(true, true) == (%v, %v), want (%v, %v)", delay, err, wantDelay, wantErr)
-		}
 	}
 }

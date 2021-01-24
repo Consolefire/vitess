@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -26,26 +26,32 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/golang/glog"
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/acl"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/schemamanager"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"github.com/youtube/vitess/go/vt/vtctl"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/workflow"
-	"github.com/youtube/vitess/go/vt/wrangler"
+	"vitess.io/vitess/go/acl"
+	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/schema"
+	"vitess.io/vitess/go/vt/schemamanager"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtctl"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/workflow"
+	"vitess.io/vitess/go/vt/wrangler"
 
-	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/proto/vttime"
 )
 
 var (
 	localCell        = flag.String("cell", "", "cell to use")
 	showTopologyCRUD = flag.Bool("vtctld_show_topology_crud", true, "Controls the display of the CRUD topology actions in the vtctld UI.")
+	proxyTablets     = flag.Bool("proxy_tablets", false, "Setting this true will make vtctld proxy the tablet status instead of redirecting to them")
 )
 
 // This file implements a REST-style API for the vtctld web interface.
@@ -55,6 +61,70 @@ const (
 
 	jsonContentType = "application/json; charset=utf-8"
 )
+
+// TabletStats represents realtime stats from a discovery.LegacyTabletStats struct.
+type TabletStats struct {
+	LastError string                 `json:"last_error,omitempty"`
+	Realtime  *querypb.RealtimeStats `json:"realtime,omitempty"`
+	Serving   bool                   `json:"serving"`
+	Up        bool                   `json:"up"`
+}
+
+// TabletWithStatsAndURL wraps topo.Tablet, adding a URL property and optional realtime stats.
+type TabletWithStatsAndURL struct {
+	Alias               *topodatapb.TabletAlias `json:"alias,omitempty"`
+	Hostname            string                  `json:"hostname,omitempty"`
+	PortMap             map[string]int32        `json:"port_map,omitempty"`
+	Keyspace            string                  `json:"keyspace,omitempty"`
+	Shard               string                  `json:"shard,omitempty"`
+	KeyRange            *topodatapb.KeyRange    `json:"key_range,omitempty"`
+	Type                topodatapb.TabletType   `json:"type,omitempty"`
+	DbNameOverride      string                  `json:"db_name_override,omitempty"`
+	Tags                map[string]string       `json:"tags,omitempty"`
+	MysqlHostname       string                  `json:"mysql_hostname,omitempty"`
+	MysqlPort           int32                   `json:"mysql_port,omitempty"`
+	MasterTermStartTime *vttime.Time            `json:"master_term_start_time,omitempty"`
+	Stats               *TabletStats            `json:"stats,omitempty"`
+	URL                 string                  `json:"url,omitempty"`
+}
+
+func newTabletWithStatsAndURL(t *topodatapb.Tablet, realtimeStats *realtimeStats) *TabletWithStatsAndURL {
+	tablet := &TabletWithStatsAndURL{
+		Alias:               t.Alias,
+		Hostname:            t.Hostname,
+		PortMap:             t.PortMap,
+		Keyspace:            t.Keyspace,
+		Shard:               t.Shard,
+		KeyRange:            t.KeyRange,
+		Type:                t.Type,
+		DbNameOverride:      t.DbNameOverride,
+		Tags:                t.Tags,
+		MysqlHostname:       t.MysqlHostname,
+		MysqlPort:           t.MysqlPort,
+		MasterTermStartTime: t.MasterTermStartTime,
+	}
+
+	if *proxyTablets {
+		tablet.URL = fmt.Sprintf("/vttablet/%s-%d/debug/status", t.Alias.Cell, t.Alias.Uid)
+	} else {
+		tablet.URL = "http://" + netutil.JoinHostPort(t.Hostname, t.PortMap["vt"])
+	}
+
+	if realtimeStats != nil {
+		if stats, err := realtimeStats.tabletStats(tablet.Alias); err == nil {
+			tablet.Stats = &TabletStats{
+				Realtime: stats.Stats,
+				Serving:  stats.Serving,
+				Up:       stats.Up,
+			}
+			if stats.LastError != nil {
+				tablet.Stats.LastError = stats.LastError.Error()
+			}
+		}
+	}
+
+	return tablet
+}
 
 func httpErrorf(w http.ResponseWriter, r *http.Request, format string, args ...interface{}) {
 	errMsg := fmt.Sprintf(format, args...)
@@ -80,7 +150,7 @@ func handleCollection(collection string, getFunc func(*http.Request) (interface{
 		// Get the requested object.
 		obj, err := getFunc(r)
 		if err != nil {
-			if err == topo.ErrNoNode {
+			if topo.IsErrType(err, topo.NoNode) {
 				http.NotFound(w, r)
 				return nil
 			}
@@ -89,6 +159,7 @@ func handleCollection(collection string, getFunc func(*http.Request) (interface{
 
 		// JSON encode response.
 		data, err := vtctl.MarshalJSON(obj)
+		log.Flush()
 		if err != nil {
 			return fmt.Errorf("cannot marshal data: %v", err)
 		}
@@ -121,7 +192,7 @@ func unmarshalRequest(r *http.Request, v interface{}) error {
 	return json.Unmarshal(data, v)
 }
 
-func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, realtimeStats *realtimeStats) {
+func initAPI(ctx context.Context, ts *topo.Server, actions *ActionRepository, realtimeStats *realtimeStats) {
 	tabletHealthCache := newTabletHealthCache(ts)
 	tmClient := tmclient.NewTabletManagerClient()
 
@@ -152,7 +223,7 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 			// Perform an action on a keyspace.
 		case "POST":
 			if keyspace == "" {
-				return nil, errors.New("A POST request needs a keyspace in the URL")
+				return nil, errors.New("a POST request needs a keyspace in the URL")
 			}
 			if err := r.ParseForm(); err != nil {
 				return nil, err
@@ -160,12 +231,72 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 
 			action := r.FormValue("action")
 			if action == "" {
-				return nil, errors.New("A POST request must specify action")
+				return nil, errors.New("a POST request must specify action")
 			}
-			return actions.ApplyKeyspaceAction(ctx, action, keyspace, r), nil
+			return actions.ApplyKeyspaceAction(ctx, action, keyspace), nil
 		default:
 			return nil, fmt.Errorf("unsupported HTTP method: %v", r.Method)
 		}
+	})
+
+	handleCollection("keyspace", func(r *http.Request) (interface{}, error) {
+		// Valid requests: api/keyspace/my_ks/tablets (all shards)
+		// Valid requests: api/keyspace/my_ks/tablets/-80 (specific shard)
+		itemPath := getItemPath(r.URL.Path)
+		parts := strings.SplitN(itemPath, "/", 3)
+
+		malformedRequestError := fmt.Errorf("invalid keyspace path: %q  expected path: /keyspace/<keyspace>/tablets or /keyspace/<keyspace>/tablets/<shard>", itemPath)
+		if len(parts) < 2 {
+			return nil, malformedRequestError
+		}
+		if parts[1] != "tablets" {
+			return nil, malformedRequestError
+		}
+
+		keyspace := parts[0]
+		if keyspace == "" {
+			return nil, errors.New("keyspace is required")
+		}
+		var shardNames []string
+		if len(parts) > 2 && parts[2] != "" {
+			shardNames = []string{parts[2]}
+		} else {
+			var err error
+			shardNames, err = ts.GetShardNames(ctx, keyspace)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if err := r.ParseForm(); err != nil {
+			return nil, err
+		}
+		cell := r.FormValue("cell")
+		cells := r.FormValue("cells")
+		filterCells := []string{} // empty == all cells
+		if cell != "" {
+			filterCells = []string{cell} // single cell
+		} else if cells != "" {
+			filterCells = strings.Split(cells, ",") // list of cells
+		}
+
+		tablets := [](*TabletWithStatsAndURL){}
+		for _, shard := range shardNames {
+			// Get tablets for this shard.
+			tabletAliases, err := ts.FindAllTabletAliasesInShardByCell(ctx, keyspace, shard, filterCells)
+			if err != nil && !topo.IsErrType(err, topo.PartialResult) {
+				return nil, err
+			}
+			for _, tabletAlias := range tabletAliases {
+				t, err := ts.GetTablet(ctx, tabletAlias)
+				if err != nil {
+					return nil, err
+				}
+				tablet := newTabletWithStatsAndURL(t.Tablet, realtimeStats)
+				tablets = append(tablets, tablet)
+			}
+		}
+		return tablets, nil
 	})
 
 	// Shards
@@ -192,7 +323,7 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 			if action == "" {
 				return nil, errors.New("must specify action")
 			}
-			return actions.ApplyShardAction(ctx, action, keyspace, shard, r), nil
+			return actions.ApplyShardAction(ctx, action, keyspace, shard), nil
 		}
 
 		// Get the shard record.
@@ -219,16 +350,24 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 
 		if cell == "local" {
 			if *localCell == "" {
-				return nil, fmt.Errorf("local cell requested, but not specified. Please set with -cell flag")
+				cells, err := ts.GetCellInfoNames(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("could not fetch cell info: %v", err)
+				}
+				if len(cells) == 0 {
+					return nil, fmt.Errorf("no local cells have been created yet")
+				}
+				cell = cells[0]
+			} else {
+				cell = *localCell
 			}
-			cell = *localCell
 		}
 
 		// If a keyspace is provided then return the specified srvkeyspace.
 		if keyspace != "" {
 			srvKeyspace, err := ts.GetSrvKeyspace(ctx, cell, keyspace)
 			if err != nil {
-				return nil, fmt.Errorf("Can't get server keyspace: %v", err)
+				return nil, fmt.Errorf("can't get server keyspace: %v", err)
 			}
 			return srvKeyspace, nil
 		}
@@ -275,13 +414,13 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 				}
 				if cell != "" {
 					result, err := ts.FindAllTabletAliasesInShardByCell(ctx, keyspace, shard, []string{cell})
-					if err != nil && err != topo.ErrPartialResult {
+					if err != nil && !topo.IsErrType(err, topo.PartialResult) {
 						return result, err
 					}
 					return result, nil
 				}
 				result, err := ts.FindAllTabletAliasesInShard(ctx, keyspace, shard)
-				if err != nil && err != topo.ErrPartialResult {
+				if err != nil && !topo.IsErrType(err, topo.PartialResult) {
 					return result, err
 				}
 				return result, nil
@@ -325,8 +464,8 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 		if err != nil {
 			return nil, err
 		}
-		// Pass the embedded proto directly or jsonpb will panic.
-		return t.Tablet, err
+
+		return newTabletWithStatsAndURL(t.Tablet, nil), nil
 	})
 
 	// Healthcheck real time status per (cell, keyspace, tablet type, metric).
@@ -453,8 +592,7 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 		logstream := logutil.NewMemoryLogger()
 
 		wr := wrangler.New(logstream, ts, tmClient)
-		// TODO(enisoc): Context for run command should be request-scoped.
-		err := vtctl.RunCommand(ctx, wr, args)
+		err := vtctl.RunCommand(r.Context(), wr, args)
 		if err != nil {
 			resp.Error = err.Error()
 		}
@@ -475,14 +613,15 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 			return nil
 		}
 		req := struct {
-			Keyspace, SQL       string
-			SlaveTimeoutSeconds int
+			Keyspace, SQL         string
+			ReplicaTimeoutSeconds int
+			DDLStrategy           string `json:"ddl_strategy,omitempty"`
 		}{}
 		if err := unmarshalRequest(r, &req); err != nil {
 			return fmt.Errorf("can't unmarshal request: %v", err)
 		}
-		if req.SlaveTimeoutSeconds <= 0 {
-			req.SlaveTimeoutSeconds = 10
+		if req.ReplicaTimeoutSeconds <= 0 {
+			req.ReplicaTimeoutSeconds = 10
 		}
 
 		logger := logutil.NewCallbackLogger(func(ev *logutilpb.Event) {
@@ -490,8 +629,16 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 		})
 		wr := wrangler.New(logger, ts, tmClient)
 
-		executor := schemamanager.NewTabletExecutor(
-			wr, time.Duration(req.SlaveTimeoutSeconds)*time.Second)
+		apiCallUUID, err := schema.CreateUUID()
+		if err != nil {
+			return err
+		}
+		requestContext := fmt.Sprintf("vtctld/api:%s", apiCallUUID)
+		executor := schemamanager.NewTabletExecutor(requestContext, wr, time.Duration(req.ReplicaTimeoutSeconds)*time.Second)
+
+		if err := executor.SetDDLStrategy(req.DDLStrategy); err != nil {
+			return fmt.Errorf("error setting DDL strategy: %v", err)
+		}
 
 		return schemamanager.Run(ctx,
 			schemamanager.NewUIController(req.SQL, req.Keyspace, w), executor)
@@ -505,7 +652,7 @@ func initAPI(ctx context.Context, ts topo.Server, actions *ActionRepository, rea
 		}
 
 		resp := make(map[string]interface{})
-		resp["activeReparents"] = !*vtctl.DisableActiveReparents
+		resp["activeReparents"] = !*mysqlctl.DisableActiveReparents
 		resp["showStatus"] = *enableRealtimeStats
 		resp["showTopologyCRUD"] = *showTopologyCRUD
 		resp["showWorkflows"] = *workflowManagerInit

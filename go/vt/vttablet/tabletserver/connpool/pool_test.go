@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,19 @@ limitations under the License.
 package connpool
 
 import (
-	"fmt"
-	"math/rand"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/youtube/vitess/go/mysql/fakesqldb"
-	"github.com/youtube/vitess/go/vt/callerid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+
+	"context"
 )
 
 func TestConnPoolGet(t *testing.T) {
@@ -46,6 +50,64 @@ func TestConnPoolGet(t *testing.T) {
 		t.Fatalf("db conn pool should not be nil")
 	}
 	dbConn.Recycle()
+}
+
+func TestConnPoolTimeout(t *testing.T) {
+	db := fakesqldb.New(t)
+	defer db.Close()
+	connPool := NewPool(tabletenv.NewEnv(nil, "PoolTest"), "TestPool", tabletenv.ConnPoolConfig{
+		Size:               1,
+		TimeoutSeconds:     1,
+		IdleTimeoutSeconds: 10,
+	})
+	connPool.Open(db.ConnParams(), db.ConnParams(), db.ConnParams())
+	defer connPool.Close()
+	dbConn, err := connPool.Get(context.Background())
+	require.NoError(t, err)
+	defer dbConn.Recycle()
+	_, err = connPool.Get(context.Background())
+	assert.EqualError(t, err, "resource pool timed out")
+}
+
+func TestConnPoolMaxWaiters(t *testing.T) {
+	db := fakesqldb.New(t)
+	defer db.Close()
+	connPool := NewPool(tabletenv.NewEnv(nil, "PoolTest"), "TestPool", tabletenv.ConnPoolConfig{
+		Size:       1,
+		MaxWaiters: 1,
+	})
+	connPool.Open(db.ConnParams(), db.ConnParams(), db.ConnParams())
+	defer connPool.Close()
+	dbConn, err := connPool.Get(context.Background())
+	require.NoError(t, err)
+
+	// waiter 1
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c1, err := connPool.Get(context.Background())
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+			return
+		}
+		c1.Recycle()
+	}()
+	// Wait for the first waiter to increment count.
+	for {
+		runtime.Gosched()
+		if connPool.waiterCount.Get() == 1 {
+			break
+		}
+	}
+
+	// waiter 2
+	_, err = connPool.Get(context.Background())
+	assert.EqualError(t, err, "pool TestPool waiter count exceeded")
+
+	// This recycle will make waiter1 succeed.
+	dbConn.Recycle()
+	wg.Wait()
 }
 
 func TestConnPoolGetEmptyDebugConfig(t *testing.T) {
@@ -191,28 +253,38 @@ func TestConnPoolStateWhilePoolIsOpen(t *testing.T) {
 	if connPool.Available() != 100 {
 		t.Fatalf("pool available connections should be 100")
 	}
+	if connPool.Active() != 0 {
+		t.Fatalf("pool active connections should be 0")
+	}
+	if connPool.InUse() != 0 {
+		t.Fatalf("pool inUse connections should be 0")
+	}
 	dbConn, _ := connPool.Get(context.Background())
 	if connPool.Available() != 99 {
 		t.Fatalf("pool available connections should be 99")
 	}
+	if connPool.Active() != 1 {
+		t.Fatalf("pool active connections should be 1")
+	}
+	if connPool.InUse() != 1 {
+		t.Fatalf("pool inUse connections should be 1")
+	}
+
 	dbConn.Recycle()
 	if connPool.Available() != 100 {
 		t.Fatalf("pool available connections should be 100")
 	}
+	if connPool.Active() != 1 {
+		t.Fatalf("pool active connections should be 1")
+	}
+	if connPool.InUse() != 0 {
+		t.Fatalf("pool inUse connections should be 0")
+	}
 }
-
-type dummyChecker struct {
-}
-
-func (dummyChecker) CheckMySQL() {}
-
-var checker = dummyChecker{}
 
 func newPool() *Pool {
-	return New(
-		fmt.Sprintf("TestPool%d", rand.Int63()),
-		100,
-		10*time.Second,
-		checker,
-	)
+	return NewPool(tabletenv.NewEnv(nil, "PoolTest"), "TestPool", tabletenv.ConnPoolConfig{
+		Size:               100,
+		IdleTimeoutSeconds: 10,
+	})
 }

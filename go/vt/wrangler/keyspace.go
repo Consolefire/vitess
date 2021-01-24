@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,24 +17,28 @@ limitations under the License.
 package wrangler
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/youtube/vitess/go/event"
-	"github.com/youtube/vitess/go/vt/concurrency"
-	"github.com/youtube/vitess/go/vt/discovery"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/topoproto"
-	"github.com/youtube/vitess/go/vt/topotools"
-	"github.com/youtube/vitess/go/vt/topotools/events"
-	"golang.org/x/net/context"
+	"context"
 
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
-	vschemapb "github.com/youtube/vitess/go/vt/proto/vschema"
+	"vitess.io/vitess/go/event"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/binlog/binlogplayer"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/key"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/topotools/events"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 const (
@@ -70,7 +74,7 @@ func (wr *Wrangler) SetKeyspaceShardingInfo(ctx context.Context, keyspace, shard
 		if force {
 			wr.Logger().Warningf("Forcing keyspace ShardingColumnName change from %v to %v", ki.ShardingColumnName, shardingColumnName)
 		} else {
-			return fmt.Errorf("Cannot change ShardingColumnName from %v to %v (use -force to override)", ki.ShardingColumnName, shardingColumnName)
+			return fmt.Errorf("cannot change ShardingColumnName from %v to %v (use -force to override)", ki.ShardingColumnName, shardingColumnName)
 		}
 	}
 
@@ -78,7 +82,7 @@ func (wr *Wrangler) SetKeyspaceShardingInfo(ctx context.Context, keyspace, shard
 		if force {
 			wr.Logger().Warningf("Forcing keyspace ShardingColumnType change from %v to %v", ki.ShardingColumnType, shardingColumnType)
 		} else {
-			return fmt.Errorf("Cannot change ShardingColumnType from %v to %v (use -force to override)", ki.ShardingColumnType, shardingColumnType)
+			return fmt.Errorf("cannot change ShardingColumnType from %v to %v (use -force to override)", ki.ShardingColumnType, shardingColumnType)
 		}
 	}
 
@@ -87,19 +91,317 @@ func (wr *Wrangler) SetKeyspaceShardingInfo(ctx context.Context, keyspace, shard
 	return wr.ts.UpdateKeyspace(ctx, ki)
 }
 
+// validateNewWorkflow ensures that the specified workflow doesn't already exist
+// in the keyspace.
+func (wr *Wrangler) validateNewWorkflow(ctx context.Context, keyspace, workflow string) error {
+	allshards, err := wr.ts.FindAllShardsInKeyspace(ctx, keyspace)
+	if err != nil {
+		return err
+	}
+	var wg sync.WaitGroup
+	allErrors := &concurrency.AllErrorRecorder{}
+	for _, si := range allshards {
+		if si.MasterAlias == nil {
+			allErrors.RecordError(fmt.Errorf("shard has no master: %v", si.ShardName()))
+			continue
+		}
+		wg.Add(1)
+		go func(si *topo.ShardInfo) {
+			defer wg.Done()
+
+			master, err := wr.ts.GetTablet(ctx, si.MasterAlias)
+			if err != nil {
+				allErrors.RecordError(vterrors.Wrap(err, "validateWorkflowName.GetTablet"))
+				return
+			}
+			validations := []struct {
+				query string
+				msg   string
+			}{{
+				fmt.Sprintf("select 1 from _vt.vreplication where db_name=%s and workflow=%s", encodeString(master.DbName()), encodeString(workflow)),
+				fmt.Sprintf("workflow %s already exists in keyspace %s on tablet %d", workflow, keyspace, master.Alias.Uid),
+			}, {
+				fmt.Sprintf("select 1 from _vt.vreplication where db_name=%s and message='FROZEN'", encodeString(master.DbName())),
+				fmt.Sprintf("found previous frozen workflow on tablet %d, please review and delete it first before creating a new workflow",
+					master.Alias.Uid),
+			}}
+			for _, validation := range validations {
+				p3qr, err := wr.tmc.VReplicationExec(ctx, master.Tablet, validation.query)
+				if err != nil {
+					allErrors.RecordError(vterrors.Wrap(err, "validateWorkflowName.VReplicationExec"))
+					return
+				}
+				if p3qr != nil && len(p3qr.Rows) != 0 {
+					allErrors.RecordError(vterrors.Wrap(fmt.Errorf(validation.msg), "validateWorkflowName.VReplicationExec"))
+					return
+				}
+			}
+		}(si)
+	}
+	wg.Wait()
+	return allErrors.AggrError(vterrors.Aggregate)
+}
+
+// SplitClone initiates a SplitClone workflow.
+func (wr *Wrangler) SplitClone(ctx context.Context, keyspace string, from, to []string) error {
+	var fromShards, toShards []*topo.ShardInfo
+	for _, shard := range from {
+		si, err := wr.ts.GetShard(ctx, keyspace, shard)
+		if err != nil {
+			return vterrors.Wrapf(err, "GetShard(%s) failed", shard)
+		}
+		fromShards = append(fromShards, si)
+	}
+	for _, shard := range to {
+		si, err := wr.ts.GetShard(ctx, keyspace, shard)
+		if err != nil {
+			return vterrors.Wrapf(err, "GetShard(%s) failed", shard)
+		}
+		toShards = append(toShards, si)
+	}
+	// TODO(sougou): validate from and to shards.
+
+	for _, dest := range toShards {
+		master, err := wr.ts.GetTablet(ctx, dest.MasterAlias)
+		if err != nil {
+			return vterrors.Wrapf(err, "GetTablet(%v) failed", dest.MasterAlias)
+		}
+		var ids []uint64
+		for _, source := range fromShards {
+			filter := &binlogdatapb.Filter{
+				Rules: []*binlogdatapb.Rule{{
+					Match:  "/.*",
+					Filter: key.KeyRangeString(dest.KeyRange),
+				}},
+			}
+			bls := &binlogdatapb.BinlogSource{
+				Keyspace: keyspace,
+				Shard:    source.ShardName(),
+				Filter:   filter,
+			}
+			cmd := binlogplayer.CreateVReplicationState("VSplitClone", bls, "", binlogplayer.BlpStopped, master.DbName())
+			qr, err := wr.TabletManagerClient().VReplicationExec(ctx, master.Tablet, cmd)
+			if err != nil {
+				return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", dest.MasterAlias, cmd)
+			}
+			if err := wr.SourceShardAdd(ctx, keyspace, dest.ShardName(), uint32(qr.InsertId), keyspace, source.ShardName(), source.Shard.KeyRange, nil); err != nil {
+				return vterrors.Wrapf(err, "SourceShardAdd(%s, %s) failed", dest.ShardName(), source.ShardName())
+			}
+			ids = append(ids, qr.InsertId)
+		}
+		// Start vreplication only if all metadata was successfully created.
+		for _, id := range ids {
+			cmd := fmt.Sprintf("update _vt.vreplication set state='%s' where id=%d", binlogplayer.VReplicationInit, id)
+			if _, err = wr.TabletManagerClient().VReplicationExec(ctx, master.Tablet, cmd); err != nil {
+				return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", dest.MasterAlias, cmd)
+			}
+		}
+	}
+	return wr.refreshMasters(ctx, toShards)
+}
+
+// VerticalSplitClone initiates a VerticalSplitClone workflow.
+func (wr *Wrangler) VerticalSplitClone(ctx context.Context, fromKeyspace, toKeyspace string, tables []string) error {
+	source, err := wr.ts.GetOnlyShard(ctx, fromKeyspace)
+	if err != nil {
+		return vterrors.Wrapf(err, "GetOnlyShard(%s) failed", fromKeyspace)
+	}
+	dest, err := wr.ts.GetOnlyShard(ctx, toKeyspace)
+	if err != nil {
+		return vterrors.Wrapf(err, "GetOnlyShard(%s) failed", toKeyspace)
+	}
+	// TODO(sougou): validate from and to shards.
+
+	master, err := wr.ts.GetTablet(ctx, dest.MasterAlias)
+	if err != nil {
+		return vterrors.Wrapf(err, "GetTablet(%v) failed", dest.MasterAlias)
+	}
+	filter := &binlogdatapb.Filter{}
+	for _, table := range tables {
+		filter.Rules = append(filter.Rules, &binlogdatapb.Rule{
+			Match: table,
+		})
+	}
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: fromKeyspace,
+		Shard:    source.ShardName(),
+		Filter:   filter,
+	}
+	cmd := binlogplayer.CreateVReplicationState("VSplitClone", bls, "", binlogplayer.BlpStopped, master.DbName())
+	qr, err := wr.TabletManagerClient().VReplicationExec(ctx, master.Tablet, cmd)
+	if err != nil {
+		return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", dest.MasterAlias, cmd)
+	}
+	if err := wr.SourceShardAdd(ctx, toKeyspace, dest.ShardName(), uint32(qr.InsertId), fromKeyspace, source.ShardName(), nil, tables); err != nil {
+		return vterrors.Wrapf(err, "SourceShardAdd(%s, %s) failed", dest.ShardName(), source.ShardName())
+	}
+	// Start vreplication only if metadata was successfully created.
+	cmd = fmt.Sprintf("update _vt.vreplication set state='%s' where id=%d", binlogplayer.VReplicationInit, qr.InsertId)
+	if _, err = wr.TabletManagerClient().VReplicationExec(ctx, master.Tablet, cmd); err != nil {
+		return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", dest.MasterAlias, cmd)
+	}
+	return wr.refreshMasters(ctx, []*topo.ShardInfo{dest})
+}
+
+// ShowResharding shows all resharding related metadata for the keyspace/shard.
+func (wr *Wrangler) ShowResharding(ctx context.Context, keyspace, shard string) (err error) {
+	ki, err := wr.ts.GetKeyspace(ctx, keyspace)
+	if err != nil {
+		return err
+	}
+	if len(ki.ServedFroms) == 0 {
+		return wr.showHorizontalResharding(ctx, keyspace, shard)
+	}
+	return wr.showVerticalResharding(ctx, keyspace, shard)
+}
+
+func (wr *Wrangler) showHorizontalResharding(ctx context.Context, keyspace, shard string) error {
+	osList, err := topotools.FindOverlappingShards(ctx, wr.ts, keyspace)
+	if err != nil {
+		return fmt.Errorf("FindOverlappingShards failed: %v", err)
+	}
+	os := topotools.OverlappingShardsForShard(osList, shard)
+	if os == nil {
+		wr.Logger().Printf("No resharding in progress\n")
+		return nil
+	}
+
+	sourceShards, destinationShards, err := wr.findSourceDest(ctx, os)
+	if err != nil {
+		return err
+	}
+	wr.Logger().Printf("Horizontal Resharding for %v:\n", keyspace)
+	wr.Logger().Printf("  Sources:\n")
+	if err := wr.printShards(ctx, sourceShards); err != nil {
+		return err
+	}
+	wr.Logger().Printf("  Destinations:\n")
+	return wr.printShards(ctx, destinationShards)
+}
+
+func (wr *Wrangler) printShards(ctx context.Context, si []*topo.ShardInfo) error {
+	for _, si := range si {
+		wr.Logger().Printf("    Shard: %v\n", si.ShardName())
+		if len(si.SourceShards) != 0 {
+			wr.Logger().Printf("      Source Shards: %v\n", si.SourceShards)
+		}
+		ti, err := wr.ts.GetTablet(ctx, si.MasterAlias)
+		if err != nil {
+			return err
+		}
+		qr, err := wr.tmc.VReplicationExec(ctx, ti.Tablet, fmt.Sprintf("select * from _vt.vreplication where db_name=%v", encodeString(ti.DbName())))
+		if err != nil {
+			return err
+		}
+		res := sqltypes.Proto3ToResult(qr)
+		if len(res.Rows) != 0 {
+			wr.Logger().Printf("      VReplication:\n")
+			for _, row := range res.Rows {
+				wr.Logger().Printf("        %v\n", row)
+			}
+		}
+		wr.Logger().Printf("      Is Master Serving: %v\n", si.IsMasterServing)
+		if len(si.TabletControls) != 0 {
+			wr.Logger().Printf("      Tablet Controls: %v\n", si.TabletControls)
+		}
+	}
+	return nil
+}
+
+// CancelResharding cancels any resharding in progress on the specified keyspace/shard.
+// This works for horizontal as well as vertical resharding.
+func (wr *Wrangler) CancelResharding(ctx context.Context, keyspace, shard string) (err error) {
+	ctx, unlock, lockErr := wr.ts.LockKeyspace(ctx, keyspace, "CancelResharding")
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock(&err)
+
+	ki, err := wr.ts.GetKeyspace(ctx, keyspace)
+	if err != nil {
+		return err
+	}
+	if len(ki.ServedFroms) == 0 {
+		return wr.cancelHorizontalResharding(ctx, keyspace, shard)
+	}
+	return wr.cancelVerticalResharding(ctx, keyspace, shard)
+}
+
+func (wr *Wrangler) cancelHorizontalResharding(ctx context.Context, keyspace, shard string) error {
+	wr.Logger().Infof("Finding the overlapping shards in keyspace %v", keyspace)
+	osList, err := topotools.FindOverlappingShards(ctx, wr.ts, keyspace)
+	if err != nil {
+		return fmt.Errorf("FindOverlappingShards failed: %v", err)
+	}
+
+	// find our shard in there
+	os := topotools.OverlappingShardsForShard(osList, shard)
+	if os == nil {
+		return fmt.Errorf("shard %v is not involved in any overlapping shards", shard)
+	}
+
+	_, destinationShards, err := wr.findSourceDest(ctx, os)
+	if err != nil {
+		return err
+	}
+
+	// get srvKeyspaces in all cells to check if they are already serving this shard
+	srvKeyspaces, err := wr.ts.GetSrvKeyspaceAllCells(ctx, keyspace)
+	if err != nil {
+		return err
+	}
+
+	for _, si := range destinationShards {
+		for _, srvKeyspace := range srvKeyspaces {
+			if topo.ShardIsServing(srvKeyspace, si.Shard) {
+				return fmt.Errorf("some served types have migrated for %v/%v, please undo them before canceling", keyspace, shard)
+			}
+		}
+	}
+	for i, si := range destinationShards {
+		ti, err := wr.ts.GetTablet(ctx, si.MasterAlias)
+		if err != nil {
+			return err
+		}
+		for _, sourceShard := range si.SourceShards {
+			if _, err := wr.tmc.VReplicationExec(ctx, ti.Tablet, binlogplayer.DeleteVReplication(sourceShard.Uid)); err != nil {
+				return err
+			}
+		}
+		updatedShard, err := wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
+			si.TabletControls = nil
+			si.SourceShards = nil
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		destinationShards[i] = updatedShard
+
+		if err := wr.RefreshTabletsByShard(ctx, si, nil, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // MigrateServedTypes is used during horizontal splits to migrate a
 // served type from a list of shards to another.
-func (wr *Wrangler) MigrateServedTypes(ctx context.Context, keyspace, shard string, cells []string, servedType topodatapb.TabletType, reverse, skipReFreshState bool, filteredReplicationWaitTime time.Duration) (err error) {
+func (wr *Wrangler) MigrateServedTypes(ctx context.Context, keyspace, shard string, cells []string, servedType topodatapb.TabletType, reverse, skipReFreshState bool, filteredReplicationWaitTime time.Duration, reverseReplication bool) (err error) {
 	// check input parameters
 	if servedType == topodatapb.TabletType_MASTER {
 		// we cannot migrate a master back, since when master migration
 		// is done, the source shards are dead
 		if reverse {
-			return fmt.Errorf("Cannot migrate master back to %v/%v", keyspace, shard)
+			return fmt.Errorf("cannot migrate master back to %v/%v", keyspace, shard)
 		}
 		// we cannot skip refresh state for a master
 		if skipReFreshState {
-			return fmt.Errorf("Cannot skip refresh state for master migration on %v/%v", keyspace, shard)
+			return fmt.Errorf("cannot skip refresh state for master migration on %v/%v", keyspace, shard)
+		}
+		if cells != nil {
+			return fmt.Errorf("cannot specify cells for master migration on %v/%v", keyspace, shard)
 		}
 	}
 
@@ -120,88 +422,89 @@ func (wr *Wrangler) MigrateServedTypes(ctx context.Context, keyspace, shard stri
 	// find our shard in there
 	os := topotools.OverlappingShardsForShard(osList, shard)
 	if os == nil {
-		return fmt.Errorf("Shard %v is not involved in any overlapping shards", shard)
+		return fmt.Errorf("shard %v is not involved in any overlapping shards", shard)
 	}
 
-	// find which list is which: the sources have no source
-	// shards, the destination have source shards. We check the
-	// first entry in the lists, then just check they're
-	// consistent
-	var sourceShards []*topo.ShardInfo
-	var destinationShards []*topo.ShardInfo
-	if len(os.Left[0].SourceShards) == 0 {
-		if len(os.Right[0].SourceShards) == 0 {
-			return fmt.Errorf("neither Shard '%v' nor Shard '%v' have a 'SourceShards' entry. Did you successfully run vtworker SplitClone before? Or did you already migrate the MASTER type?", os.Left[0].ShardName(), os.Right[0].ShardName())
-		}
-		sourceShards = os.Left
-		destinationShards = os.Right
-	} else {
-		sourceShards = os.Right
-		destinationShards = os.Left
-	}
-
-	// Verify the sources has the type we're migrating (or not if reverse)
-	for _, si := range sourceShards {
-		if err := si.CheckServedTypesMigration(servedType, cells, !reverse); err != nil {
-			return err
-		}
-	}
-
-	// Verify the destinations do not have the type we're
-	// migrating (or do if reverse)
-	for _, si := range destinationShards {
-		if err := si.CheckServedTypesMigration(servedType, cells, reverse); err != nil {
-			return err
-		}
+	sourceShards, destinationShards, err := wr.findSourceDest(ctx, os)
+	if err != nil {
+		return err
 	}
 
 	// execute the migration
-	if err = wr.migrateServedTypesLocked(ctx, keyspace, sourceShards, destinationShards, cells, servedType, reverse, filteredReplicationWaitTime); err != nil {
-		return err
+	if servedType == topodatapb.TabletType_MASTER {
+		if err = wr.masterMigrateServedType(ctx, keyspace, sourceShards, destinationShards, filteredReplicationWaitTime, reverseReplication); err != nil {
+			return err
+		}
+	} else {
+		if err = wr.replicaMigrateServedType(ctx, keyspace, sourceShards, destinationShards, cells, servedType, reverse); err != nil {
+			return err
+		}
 	}
 
-	// rebuild the keyspace serving graph now that there is no error
-	if err = topotools.RebuildKeyspaceLocked(ctx, wr.logger, wr.ts, keyspace, cells); err != nil {
-		return err
+	// Master migrate performs its own refresh.
+	// Otherwise, honor skipRefreshState if requested.
+	if servedType == topodatapb.TabletType_MASTER || skipReFreshState {
+		return nil
 	}
 
-	// Send a refresh to the tablets we just disabled, iff:
-	// - we're not migrating a master
-	// - we don't have any errors
-	// - we're not told to skip the refresh
-	if servedType != topodatapb.TabletType_MASTER && !skipReFreshState {
-		rec := concurrency.AllErrorRecorder{}
-		var refreshShards []*topo.ShardInfo
-		if reverse {
-			// For a backwards migration, we just disabled query service on the destination shards
-			refreshShards = destinationShards
-		} else {
-			// For a forwards migration, we just disabled query service on the source shards
-			refreshShards = sourceShards
-		}
-
-		// TODO(b/26388813): Integrate vtctl WaitForDrain here instead of just sleeping.
-		var waitForDrainSleep time.Duration
-		switch servedType {
-		case topodatapb.TabletType_RDONLY:
-			waitForDrainSleep = *waitForDrainSleepRdonly
-		case topodatapb.TabletType_REPLICA:
-			waitForDrainSleep = *waitForDrainSleepReplica
-		default:
-			wr.Logger().Warningf("invalid TabletType: %v for MigrateServedTypes command", servedType)
-		}
-
-		wr.Logger().Infof("WaitForDrain: Sleeping for %.0f seconds before shutting down query service on old tablets...", waitForDrainSleep.Seconds())
-		time.Sleep(waitForDrainSleep)
-		wr.Logger().Infof("WaitForDrain: Sleeping finished. Shutting down queryservice on old tablets now.")
-
-		for _, si := range refreshShards {
-			rec.RecordError(wr.RefreshTabletsByShard(ctx, si, []topodatapb.TabletType{servedType}, cells))
-		}
-		return rec.Error()
+	// refresh
+	// TODO(b/26388813): Integrate vtctl WaitForDrain here instead of just sleeping.
+	// Anything that's not a replica will use the RDONLY sleep time.
+	waitForDrainSleep := *waitForDrainSleepRdonly
+	if servedType == topodatapb.TabletType_REPLICA {
+		waitForDrainSleep = *waitForDrainSleepReplica
 	}
+	wr.Logger().Infof("WaitForDrain: Sleeping for %.0f seconds before shutting down query service on old tablets...", waitForDrainSleep.Seconds())
+	time.Sleep(waitForDrainSleep)
+	wr.Logger().Infof("WaitForDrain: Sleeping finished. Shutting down queryservice on old tablets now.")
 
-	return nil
+	rec := concurrency.AllErrorRecorder{}
+	refreshShards := sourceShards
+	if reverse {
+		// For a backwards migration, we should refresh (disable) destination shards instead.
+		refreshShards = destinationShards
+	}
+	for _, si := range refreshShards {
+		rec.RecordError(wr.RefreshTabletsByShard(ctx, si, []topodatapb.TabletType{servedType}, cells))
+	}
+	return rec.Error()
+}
+
+// findSourceDest derives the source and destination from the overlapping shards.
+// Whichever side has SourceShards is a destination.
+func (wr *Wrangler) findSourceDest(ctx context.Context, os *topotools.OverlappingShards) (sourceShards, destinationShards []*topo.ShardInfo, err error) {
+	// It's possible that both source and destination have source shards because of reversible replication.
+	// If so, the Frozen flag in the tablet control record dictates the direction.
+	// So, check that first.
+	for _, left := range os.Left {
+		tc := left.GetTabletControl(topodatapb.TabletType_MASTER)
+		if tc == nil {
+			continue
+		}
+		if tc.Frozen {
+			return os.Left, os.Right, nil
+		}
+	}
+	for _, right := range os.Right {
+		tc := right.GetTabletControl(topodatapb.TabletType_MASTER)
+		if tc == nil {
+			continue
+		}
+		if tc.Frozen {
+			return os.Right, os.Left, nil
+		}
+	}
+	for _, left := range os.Left {
+		if len(left.SourceShards) != 0 {
+			return os.Right, os.Left, nil
+		}
+	}
+	for _, right := range os.Right {
+		if len(right.SourceShards) != 0 {
+			return os.Left, os.Right, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("neither Shard '%v' nor Shard '%v' have a 'SourceShards' entry. Did you successfully run vtworker SplitClone before? Or did you already migrate the MASTER type?", os.Left[0].ShardName(), os.Right[0].ShardName())
 }
 
 func (wr *Wrangler) getMastersPosition(ctx context.Context, shards []*topo.ShardInfo) (map[*topo.ShardInfo]string, error) {
@@ -244,16 +547,16 @@ func (wr *Wrangler) waitForFilteredReplication(ctx context.Context, sourcePositi
 		wg.Add(1)
 		go func(si *topo.ShardInfo) {
 			defer wg.Done()
-			for _, sourceShard := range si.SourceShards {
-				// we're waiting on this guy
-				blpPosition := &tabletmanagerdatapb.BlpPosition{
-					Uid: sourceShard.Uid,
-				}
+			ctx, cancel := context.WithTimeout(ctx, waitTime)
+			defer cancel()
 
+			var pos string
+			for _, sourceShard := range si.SourceShards {
 				// find the position it should be at
-				for s, pos := range sourcePositions {
+				for s, sp := range sourcePositions {
 					if s.Keyspace() == sourceShard.Keyspace && s.ShardName() == sourceShard.Shard {
-						blpPosition.Position = pos
+						pos = sp
+						break
 					}
 				}
 
@@ -265,8 +568,12 @@ func (wr *Wrangler) waitForFilteredReplication(ctx context.Context, sourcePositi
 					return
 				}
 
-				if err := wr.tmc.WaitBlpPosition(ctx, ti.Tablet, blpPosition, waitTime); err != nil {
-					rec.RecordError(err)
+				if err := wr.tmc.VReplicationWaitForPos(ctx, ti.Tablet, int(sourceShard.Uid), pos); err != nil {
+					if strings.Contains(err.Error(), "not found") {
+						wr.Logger().Infof("%v stream %d was not found. Skipping wait.", topoproto.TabletAliasString(si.MasterAlias), sourceShard.Uid)
+					} else {
+						rec.RecordError(err)
+					}
 				} else {
 					wr.Logger().Infof("%v caught up", topoproto.TabletAliasString(si.MasterAlias))
 				}
@@ -303,22 +610,8 @@ func (wr *Wrangler) refreshMasters(ctx context.Context, shards []*topo.ShardInfo
 	return rec.Error()
 }
 
-// migrateServedTypesLocked operates with the keyspace locked
-func (wr *Wrangler) migrateServedTypesLocked(ctx context.Context, keyspace string, sourceShards, destinationShards []*topo.ShardInfo, cells []string, servedType topodatapb.TabletType, reverse bool, filteredReplicationWaitTime time.Duration) (err error) {
-
-	// re-read all the shards so we are up to date
-	wr.Logger().Infof("Re-reading all shards")
-	for i, si := range sourceShards {
-		if sourceShards[i], err = wr.ts.GetShard(ctx, si.Keyspace(), si.ShardName()); err != nil {
-			return err
-		}
-	}
-	for i, si := range destinationShards {
-		if destinationShards[i], err = wr.ts.GetShard(ctx, si.Keyspace(), si.ShardName()); err != nil {
-			return err
-		}
-	}
-
+// replicaMigrateServedType operates with the keyspace locked
+func (wr *Wrangler) replicaMigrateServedType(ctx context.Context, keyspace string, sourceShards, destinationShards []*topo.ShardInfo, cells []string, servedType topodatapb.TabletType, reverse bool) (err error) {
 	ev := &events.MigrateServedTypes{
 		KeyspaceName:      keyspace,
 		SourceShards:      sourceShards,
@@ -333,139 +626,342 @@ func (wr *Wrangler) migrateServedTypesLocked(ctx context.Context, keyspace strin
 		}
 	}()
 
-	// For master type migration, need to:
-	// - switch the source shards to read-only by disabling query service
-	// - gather all replication points
-	// - wait for filtered replication to catch up before we continue
-	// - we will disable filtered replication after the fact in the
-	//   next phases
-	if servedType == topodatapb.TabletType_MASTER {
-		event.DispatchUpdate(ev, "disabling query service on all source masters")
-		for i, si := range sourceShards {
-			// update our internal record too
-			if sourceShards[i], err = wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
-				return si.UpdateDisableQueryService(ctx, topodatapb.TabletType_MASTER, nil, true)
-			}); err != nil {
-				return err
-			}
-		}
-		if err := wr.refreshMasters(ctx, sourceShards); err != nil {
-			return err
-		}
-
-		event.DispatchUpdate(ev, "getting positions of source masters")
-		masterPositions, err := wr.getMastersPosition(ctx, sourceShards)
-		if err != nil {
-			return err
-		}
-
-		event.DispatchUpdate(ev, "waiting for destination masters to catch up")
-		if err := wr.waitForFilteredReplication(ctx, masterPositions, destinationShards, filteredReplicationWaitTime); err != nil {
-			return err
-		}
+	fromShards, toShards := sourceShards, destinationShards
+	if reverse {
+		fromShards, toShards = toShards, fromShards
 	}
 
 	// Check and update all source shard records.
-	// We remember if we need to refresh the state of the source tablets
-	// so their query service is enabled again, for reverse migration.
-	event.DispatchUpdate(ev, "updating source shards")
-	needToRefreshSourceTablets := false
-	for i, si := range sourceShards {
-		sourceShards[i], err = wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
-			if err := si.UpdateServedTypesMap(servedType, cells, !reverse); err != nil {
-				return err
-			}
-			if tc := si.GetTabletControl(servedType); reverse && tc != nil && tc.DisableQueryService {
-				// this is a backward migration, where the
-				// source tablets were disabled previously, so
-				// we need to refresh them
-				if err := si.UpdateDisableQueryService(ctx, servedType, cells, false); err != nil {
-					return err
-				}
-				needToRefreshSourceTablets = true
-			}
-			if !reverse && servedType != topodatapb.TabletType_MASTER {
-				// this is a forward migration, we need to
-				// disable query service on the source shards.
-				// (this was already done for masters earlier)
-				if err := si.UpdateDisableQueryService(ctx, servedType, cells, true); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
+	// Enable query service if needed
+	event.DispatchUpdate(ev, "updating shards to migrate from")
+	if err = wr.updateShardRecords(ctx, keyspace, fromShards, cells, servedType, true /* isFrom */, false /* clearSourceShards */); err != nil {
+		return err
 	}
-	if needToRefreshSourceTablets {
-		event.DispatchUpdate(ev, "refreshing source shard tablets so they restart their query service")
-		for _, si := range sourceShards {
-			wr.RefreshTabletsByShard(ctx, si, []topodatapb.TabletType{servedType}, cells)
+
+	// Do the same for destination shards
+	event.DispatchUpdate(ev, "updating shards to migrate to")
+	if err = wr.updateShardRecords(ctx, keyspace, toShards, cells, servedType, false, false); err != nil {
+		return err
+	}
+
+	// Now update serving keyspace
+
+	if err = wr.ts.MigrateServedType(ctx, keyspace, toShards, fromShards, servedType, cells); err != nil {
+		return err
+	}
+
+	event.DispatchUpdate(ev, "finished")
+	return nil
+}
+
+// masterMigrateServedType operates with the keyspace locked
+func (wr *Wrangler) masterMigrateServedType(ctx context.Context, keyspace string, sourceShards, destinationShards []*topo.ShardInfo, filteredReplicationWaitTime time.Duration, reverseReplication bool) (err error) {
+	// Ensure other served types have migrated.
+	srvKeyspaces, err := wr.ts.GetSrvKeyspaceAllCells(ctx, keyspace)
+	if err != nil {
+		return err
+	}
+
+	si := sourceShards[0]
+	for _, srvKeyspace := range srvKeyspaces {
+		var shardServedTypes []string
+		for _, partition := range srvKeyspace.GetPartitions() {
+			if partition.GetServedType() != topodatapb.TabletType_MASTER {
+				for _, shardReference := range partition.GetShardReferences() {
+					if key.KeyRangeEqual(shardReference.GetKeyRange(), si.GetKeyRange()) {
+						shardServedTypes = append(shardServedTypes, partition.GetServedType().String())
+					}
+				}
+			}
+		}
+		if len(shardServedTypes) > 0 {
+			return fmt.Errorf("cannot migrate MASTER away from %v/%v until everything else is migrated. Make sure that the following types are migrated first: %v", si.Keyspace(), si.ShardName(), strings.Join(shardServedTypes, ", "))
 		}
 	}
 
-	// We remember if we need to refresh the state of the
-	// destination tablets so their query service will be enabled.
+	ev := &events.MigrateServedTypes{
+		KeyspaceName:      keyspace,
+		SourceShards:      sourceShards,
+		DestinationShards: destinationShards,
+		ServedType:        topodatapb.TabletType_MASTER,
+	}
+	event.DispatchUpdate(ev, "start")
+	defer func() {
+		if err != nil {
+			event.DispatchUpdate(ev, "failed: "+err.Error())
+		}
+	}()
+
+	// Phase 1
+	// - check topology service can successfully refresh both source and target master
+	// - switch the source shards to read-only by disabling query service
+	// - gather all replication points
+	// - wait for filtered replication to catch up
+	// - mark source shards as frozen
+	event.DispatchUpdate(ev, "disabling query service on all source masters")
+	// making sure the refreshMaster on both source and target are working before turning off query service on source
+	if err := wr.refreshMasters(ctx, sourceShards); err != nil {
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		return err
+	}
+	if err := wr.refreshMasters(ctx, destinationShards); err != nil {
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		return err
+	}
+
+	if err := wr.updateShardRecords(ctx, keyspace, sourceShards, nil, topodatapb.TabletType_MASTER, true, false); err != nil {
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		return err
+	}
+	if err := wr.refreshMasters(ctx, sourceShards); err != nil {
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		return err
+	}
+
+	event.DispatchUpdate(ev, "getting positions of source masters")
+	masterPositions, err := wr.getMastersPosition(ctx, sourceShards)
+	if err != nil {
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		return err
+	}
+
+	event.DispatchUpdate(ev, "waiting for destination masters to catch up")
+	if err := wr.waitForFilteredReplication(ctx, masterPositions, destinationShards, filteredReplicationWaitTime); err != nil {
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		return err
+	}
+
+	// We've reached the point of no return. Freeze the tablet control records in the source masters.
+	if err := wr.updateFrozenFlag(ctx, sourceShards, true); err != nil {
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		return err
+	}
+
+	// Phase 2
+	// Always setup reverse replication. We'll start it later if reverseReplication was specified.
+	// This will allow someone to reverse the replication later if they change their mind.
+	if err := wr.setupReverseReplication(ctx, sourceShards, destinationShards); err != nil {
+		// It's safe to unfreeze if reverse replication setup fails.
+		wr.cancelMasterMigrateServedTypes(ctx, keyspace, sourceShards)
+		unfreezeErr := wr.updateFrozenFlag(ctx, sourceShards, false)
+		if unfreezeErr != nil {
+			wr.Logger().Errorf("Problem recovering for failed reverse replication: %v", unfreezeErr)
+		}
+
+		return err
+	}
+
+	// Destination shards need different handling than what updateShardRecords does.
 	event.DispatchUpdate(ev, "updating destination shards")
-	needToRefreshDestinationTablets := false
+
+	// Enable query service
+	err = wr.ts.UpdateDisableQueryService(ctx, keyspace, destinationShards, topodatapb.TabletType_MASTER, nil, false)
+	if err != nil {
+		return err
+	}
+
 	for i, si := range destinationShards {
-		destinationShards[i], err = wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
-			if err := si.UpdateServedTypesMap(servedType, cells, reverse); err != nil {
+		ti, err := wr.ts.GetTablet(ctx, si.MasterAlias)
+		if err != nil {
+			return err
+		}
+		// Stop VReplication streams.
+		for _, sourceShard := range si.SourceShards {
+			if _, err := wr.tmc.VReplicationExec(ctx, ti.Tablet, binlogplayer.DeleteVReplication(sourceShard.Uid)); err != nil {
 				return err
 			}
-			if tc := si.GetTabletControl(servedType); !reverse && tc != nil && tc.DisableQueryService {
-				// This is a forwards migration, and the
-				// destination query service was already in a
-				// disabled state. We need to enable and force
-				// a refresh, otherwise it's possible that both
-				// the source and destination will have query
-				// service disabled at the same time, and
-				// queries would have nowhere to go.
-				if err := si.UpdateDisableQueryService(ctx, servedType, cells, false); err != nil {
-					return err
-				}
-				needToRefreshDestinationTablets = true
-			}
-			if reverse && servedType != topodatapb.TabletType_MASTER {
-				// this is a backwards migration, we need to
-				// disable query service on the destination
-				// shards. (we're not allowed to reverse a
-				// master migration).
-				if err := si.UpdateDisableQueryService(ctx, servedType, cells, true); err != nil {
-					return err
-				}
-			}
-
-			// for master migration, also disable filtered
-			// replication
-			if servedType == topodatapb.TabletType_MASTER {
-				si.SourceShards = nil
-			}
+		}
+		// Similar to updateShardRecords, but we also remove SourceShards.
+		destinationShards[i], err = wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
+			si.SourceShards = nil
+			si.IsMasterServing = true
 			return nil
 		})
 		if err != nil {
 			return err
 		}
 	}
-	if needToRefreshDestinationTablets {
-		event.DispatchUpdate(ev, "refreshing destination shard tablets so they restart their query service")
-		for _, si := range destinationShards {
-			wr.RefreshTabletsByShard(ctx, si, []topodatapb.TabletType{servedType}, cells)
+
+	event.DispatchUpdate(ev, "setting destination masters read-write")
+	if err := wr.refreshMasters(ctx, destinationShards); err != nil {
+		return err
+	}
+
+	// Update srvKeyspace now
+	if err = wr.ts.MigrateServedType(ctx, keyspace, destinationShards, sourceShards, topodatapb.TabletType_MASTER, nil); err != nil {
+		return err
+	}
+
+	// Make sure that from now on source shards have IsMasterServing set to false
+	for _, si := range sourceShards {
+		_, err := wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
+			si.IsMasterServing = false
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 
-	// And tell the new shards masters they can now be read-write.
-	// Invoking a remote action will also make the tablet stop filtered
-	// replication.
-	if servedType == topodatapb.TabletType_MASTER {
-		event.DispatchUpdate(ev, "setting destination masters read-write")
-		if err := wr.refreshMasters(ctx, destinationShards); err != nil {
+	if reverseReplication {
+		if err := wr.startReverseReplication(ctx, sourceShards); err != nil {
+			return err
+		}
+		// We also have to remove the frozen flag as final step.
+		if err := wr.updateFrozenFlag(ctx, sourceShards, false); err != nil {
 			return err
 		}
 	}
 
 	event.DispatchUpdate(ev, "finished")
+	return nil
+}
+
+func (wr *Wrangler) cancelMasterMigrateServedTypes(ctx context.Context, keyspace string, sourceShards []*topo.ShardInfo) {
+	wr.Logger().Infof("source shards cancelMasterMigrateServedTypes: %v", sourceShards)
+	if err := wr.updateShardRecords(ctx, keyspace, sourceShards, nil, topodatapb.TabletType_MASTER, false, true); err != nil {
+		wr.Logger().Errorf2(err, "failed to re-enable source masters")
+		return
+	}
+	if err := wr.refreshMasters(ctx, sourceShards); err != nil {
+		wr.Logger().Errorf2(err, "failed to refresh source masters")
+	}
+}
+
+func (wr *Wrangler) setupReverseReplication(ctx context.Context, sourceShards, destinationShards []*topo.ShardInfo) error {
+	// Retrieve master positions of all destinations.
+	masterPositions := make([]string, len(destinationShards))
+	for i, dest := range destinationShards {
+		ti, err := wr.ts.GetTablet(ctx, dest.MasterAlias)
+		if err != nil {
+			return err
+		}
+
+		wr.Logger().Infof("Gathering master position for %v", topoproto.TabletAliasString(dest.MasterAlias))
+		masterPositions[i], err = wr.tmc.MasterPosition(ctx, ti.Tablet)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Create reverse replication for each source.
+	for i, sourceShard := range sourceShards {
+		ti, err := wr.ts.GetTablet(ctx, sourceShard.MasterAlias)
+		if err != nil {
+			return err
+		}
+		dbName := ti.DbName()
+		if len(sourceShard.SourceShards) != 0 {
+			continue
+		}
+		// Handle the case where the source is "unsharded".
+		kr := sourceShard.KeyRange
+		if kr == nil {
+			kr = &topodatapb.KeyRange{}
+		}
+		// Create replications streams first using the retrieved master positions.
+		uids := make([]uint32, len(destinationShards))
+		for j, dest := range destinationShards {
+			bls := &binlogdatapb.BinlogSource{
+				Keyspace: dest.Keyspace(),
+				Shard:    dest.ShardName(),
+				KeyRange: kr,
+			}
+			qr, err := wr.VReplicationExec(ctx, sourceShard.MasterAlias, binlogplayer.CreateVReplicationState("ReversedResharding", bls, masterPositions[j], binlogplayer.BlpStopped, dbName))
+			if err != nil {
+				return err
+			}
+			uids[j] = uint32(qr.InsertId)
+			wr.Logger().Infof("Created reverse replication for tablet %v/%v: %v, db: %v, pos: %v, uid: %v", sourceShard.Keyspace(), sourceShard.ShardName(), bls, dbName, masterPositions[j], uids[j])
+		}
+		// Source shards have to be atomically added to ensure idempotence.
+		// If this fails, there's no harm because the unstarted vreplication streams will just be abandoned.
+		sourceShards[i], err = wr.ts.UpdateShardFields(ctx, sourceShard.Keyspace(), sourceShard.ShardName(), func(si *topo.ShardInfo) error {
+			for j, dest := range destinationShards {
+				si.SourceShards = append(si.SourceShards, &topodatapb.Shard_SourceShard{
+					Uid:      uids[j],
+					Keyspace: dest.Keyspace(),
+					Shard:    dest.ShardName(),
+					KeyRange: dest.KeyRange,
+				})
+			}
+			return nil
+		})
+		if err != nil {
+			wr.Logger().Errorf("Unstarted vreplication streams for %v/%v need to be deleted: %v", sourceShard.Keyspace(), sourceShard.ShardName(), uids)
+			return fmt.Errorf("failed to setup reverse replication: %v, unstarted vreplication streams for %v/%v need to be deleted: %v", err, sourceShard.Keyspace(), sourceShard.ShardName(), uids)
+		}
+	}
+	return nil
+}
+
+func (wr *Wrangler) startReverseReplication(ctx context.Context, sourceShards []*topo.ShardInfo) error {
+	for _, sourceShard := range sourceShards {
+		for _, dest := range sourceShard.SourceShards {
+			wr.Logger().Infof("Starting reverse replication for tablet %v/%v, uid: %v", sourceShard.Keyspace(), sourceShard.ShardName(), dest.Uid)
+			_, err := wr.VReplicationExec(ctx, sourceShard.MasterAlias, binlogplayer.StartVReplication(dest.Uid))
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// updateShardRecords updates the shard records based on 'from' or 'to' direction.
+func (wr *Wrangler) updateShardRecords(ctx context.Context, keyspace string, shards []*topo.ShardInfo, cells []string, servedType topodatapb.TabletType, isFrom bool, clearSourceShards bool) (err error) {
+	err = wr.ts.UpdateDisableQueryService(ctx, keyspace, shards, servedType, cells, isFrom /* disable */)
+	if err != nil {
+		return err
+	}
+
+	for i, si := range shards {
+		updatedShard, err := wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
+			if clearSourceShards {
+				si.SourceShards = nil
+			}
+			return nil
+		})
+
+		if err != nil {
+			return err
+		}
+
+		shards[i] = updatedShard
+
+		// For 'to' shards, refresh to make them serve.
+		// The 'from' shards will be refreshed after traffic has migrated.
+		if !isFrom {
+			wr.RefreshTabletsByShard(ctx, si, []topodatapb.TabletType{servedType}, cells)
+		}
+	}
+	return nil
+}
+
+// updateFrozenFlag sets or unsets the Frozen flag for master migration. This is performed
+// for all master tablet control records.
+func (wr *Wrangler) updateFrozenFlag(ctx context.Context, shards []*topo.ShardInfo, value bool) (err error) {
+	for i, si := range shards {
+		updatedShard, err := wr.ts.UpdateShardFields(ctx, si.Keyspace(), si.ShardName(), func(si *topo.ShardInfo) error {
+			tc := si.GetTabletControl(topodatapb.TabletType_MASTER)
+			if tc != nil {
+				tc.Frozen = value
+				return nil
+			}
+			// This shard does not have a tablet control record, adding one to set frozen flag
+			tc = &topodatapb.Shard_TabletControl{
+				TabletType: topodatapb.TabletType_MASTER,
+				Frozen:     value,
+			}
+			si.TabletControls = append(si.TabletControls, tc)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		shards[i] = updatedShard
+	}
 	return nil
 }
 
@@ -476,13 +972,13 @@ func (wr *Wrangler) migrateServedTypesLocked(ctx context.Context, keyspace strin
 // be observed.
 func (wr *Wrangler) WaitForDrain(ctx context.Context, cells []string, keyspace, shard string, servedType topodatapb.TabletType,
 	retryDelay, healthCheckTopologyRefresh, healthcheckRetryDelay, healthCheckTimeout, initialWait time.Duration) error {
+	var err error
 	if len(cells) == 0 {
 		// Retrieve list of cells for the shard from the topology.
-		shardInfo, err := wr.ts.GetShard(ctx, keyspace, shard)
+		cells, err = wr.ts.GetCellInfoNames(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to retrieve list of all cells. GetShard() failed: %v", err)
+			return fmt.Errorf("failed to retrieve list of all cells. GetCellInfoNames() failed: %v", err)
 		}
-		cells = shardInfo.Cells
 	}
 
 	// Check all cells in parallel.
@@ -505,16 +1001,16 @@ func (wr *Wrangler) waitForDrainInCell(ctx context.Context, cell, keyspace, shar
 	retryDelay, healthCheckTopologyRefresh, healthcheckRetryDelay, healthCheckTimeout, initialWait time.Duration) error {
 
 	// Create the healthheck module, with a cache.
-	hc := discovery.NewHealthCheck(healthCheckTimeout /* connectTimeout */, healthcheckRetryDelay, healthCheckTimeout)
+	hc := discovery.NewLegacyHealthCheck(healthcheckRetryDelay, healthCheckTimeout)
 	defer hc.Close()
-	tsc := discovery.NewTabletStatsCache(hc, cell)
+	tsc := discovery.NewLegacyTabletStatsCache(hc, wr.TopoServer(), cell)
 
 	// Create a tablet watcher.
-	watcher := discovery.NewShardReplicationWatcher(wr.TopoServer(), hc, cell, keyspace, shard, healthCheckTopologyRefresh, discovery.DefaultTopoReadConcurrency)
+	watcher := discovery.NewLegacyShardReplicationWatcher(ctx, wr.TopoServer(), hc, cell, keyspace, shard, healthCheckTopologyRefresh, discovery.DefaultTopoReadConcurrency)
 	defer watcher.Stop()
 
 	// Wait for at least one tablet.
-	if err := tsc.WaitForTablets(ctx, cell, keyspace, shard, []topodatapb.TabletType{servedType}); err != nil {
+	if err := tsc.WaitForTablets(ctx, keyspace, shard, servedType); err != nil {
 		return fmt.Errorf("%v: error waiting for initial %v tablets for %v/%v: %v", cell, servedType, keyspace, shard, err)
 	}
 
@@ -532,8 +1028,8 @@ func (wr *Wrangler) waitForDrainInCell(ctx context.Context, cell, keyspace, shar
 	startTime := time.Now()
 	for {
 		// map key: tablet uid
-		drainedHealthyTablets := make(map[uint32]*discovery.TabletStats)
-		notDrainedHealtyTablets := make(map[uint32]*discovery.TabletStats)
+		drainedHealthyTablets := make(map[uint32]*discovery.LegacyTabletStats)
+		notDrainedHealtyTablets := make(map[uint32]*discovery.LegacyTabletStats)
 
 		healthyTablets := tsc.GetHealthyTabletStats(keyspace, shard, servedType)
 		for _, ts := range healthyTablets {
@@ -546,14 +1042,14 @@ func (wr *Wrangler) waitForDrainInCell(ctx context.Context, cell, keyspace, shar
 
 		if len(drainedHealthyTablets) == len(healthyTablets) {
 			wr.Logger().Infof("%v: All %d healthy tablets were drained after %.1f seconds (not counting %.1f seconds for the initial wait).",
-				cell, len(healthyTablets), time.Now().Sub(startTime).Seconds(), healthCheckTimeout.Seconds())
+				cell, len(healthyTablets), time.Since(startTime).Seconds(), healthCheckTimeout.Seconds())
 			break
 		}
 
 		// Continue waiting, sleep in between.
 		deadlineString := ""
 		if d, ok := ctx.Deadline(); ok {
-			deadlineString = fmt.Sprintf(" up to %.1f more seconds", d.Sub(time.Now()).Seconds())
+			deadlineString = fmt.Sprintf(" up to %.1f more seconds", time.Until(d).Seconds())
 		}
 		wr.Logger().Infof("%v: Waiting%v for all healthy tablets to be drained (%d/%d done).",
 			cell, deadlineString, len(drainedHealthyTablets), len(healthyTablets))
@@ -576,12 +1072,72 @@ func (wr *Wrangler) waitForDrainInCell(ctx context.Context, cell, keyspace, shar
 	return nil
 }
 
-func formatTabletStats(ts *discovery.TabletStats) string {
+func formatTabletStats(ts *discovery.LegacyTabletStats) string {
 	webURL := "unknown http port"
 	if webPort, ok := ts.Tablet.PortMap["vt"]; ok {
 		webURL = fmt.Sprintf("http://%v:%d/", ts.Tablet.Hostname, webPort)
 	}
 	return fmt.Sprintf("%v: %v stats: %v", topoproto.TabletAliasString(ts.Tablet.Alias), webURL, ts.Stats)
+}
+
+func (wr *Wrangler) showVerticalResharding(ctx context.Context, keyspace, shard string) error {
+	ki, err := wr.ts.GetKeyspace(ctx, keyspace)
+	if err != nil {
+		return err
+	}
+	destinationShard, err := wr.ts.GetShard(ctx, keyspace, shard)
+	if err != nil {
+		return err
+	}
+	if len(destinationShard.SourceShards) != 1 || len(destinationShard.SourceShards[0].Tables) == 0 {
+		wr.Logger().Printf("No resharding in progress\n")
+		return nil
+	}
+	sourceShard, err := wr.ts.GetShard(ctx, destinationShard.SourceShards[0].Keyspace, destinationShard.SourceShards[0].Shard)
+	if err != nil {
+		return err
+	}
+	wr.Logger().Printf("Vertical Resharding:\n")
+	wr.Logger().Printf("  Served From: %v\n", ki.ServedFroms)
+	wr.Logger().Printf("  Source:\n")
+	if err := wr.printShards(ctx, []*topo.ShardInfo{sourceShard}); err != nil {
+		return err
+	}
+	wr.Logger().Printf("  Destination:\n")
+	return wr.printShards(ctx, []*topo.ShardInfo{destinationShard})
+}
+
+func (wr *Wrangler) cancelVerticalResharding(ctx context.Context, keyspace, shard string) error {
+	wr.Logger().Infof("Cancel vertical resharding in keyspace %v", keyspace)
+	destinationShard, err := wr.ts.GetShard(ctx, keyspace, shard)
+	if err != nil {
+		return err
+	}
+	if len(destinationShard.SourceShards) != 1 || len(destinationShard.SourceShards[0].Tables) == 0 {
+		return fmt.Errorf("destination shard %v/%v is not a vertical split target", keyspace, shard)
+	}
+	sourceShard, err := wr.ts.GetShard(ctx, destinationShard.SourceShards[0].Keyspace, destinationShard.SourceShards[0].Shard)
+	if err != nil {
+		return err
+	}
+	if len(sourceShard.TabletControls) != 0 {
+		return fmt.Errorf("some served types have migrated for %v/%v, please undo them before canceling", keyspace, shard)
+	}
+	destinationMasterTabletInfo, err := wr.ts.GetTablet(ctx, destinationShard.MasterAlias)
+	if err != nil {
+		return err
+	}
+	if _, err := wr.tmc.VReplicationExec(ctx, destinationMasterTabletInfo.Tablet, binlogplayer.DeleteVReplication(destinationShard.SourceShards[0].Uid)); err != nil {
+		return err
+	}
+	if _, err = wr.ts.UpdateShardFields(ctx, destinationShard.Keyspace(), destinationShard.ShardName(), func(si *topo.ShardInfo) error {
+		si.SourceShards = nil
+		return nil
+	}); err != nil {
+		return err
+	}
+	// set destination master back to serving
+	return wr.refreshMasters(ctx, []*topo.ShardInfo{destinationShard})
 }
 
 // MigrateServedFrom is used during vertical splits to migrate a
@@ -593,7 +1149,7 @@ func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard strin
 		return err
 	}
 	if len(ki.ServedFroms) == 0 {
-		return fmt.Errorf("Destination keyspace %v is not a vertical split target", keyspace)
+		return fmt.Errorf("destination keyspace %v is not a vertical split target", keyspace)
 	}
 
 	// read the destination shard, check it
@@ -602,7 +1158,7 @@ func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard strin
 		return err
 	}
 	if len(si.SourceShards) != 1 || len(si.SourceShards[0].Tables) == 0 {
-		return fmt.Errorf("Destination shard %v/%v is not a vertical split target", keyspace, shard)
+		return fmt.Errorf("destination shard %v/%v is not a vertical split target", keyspace, shard)
 	}
 
 	// check the migration is valid before locking (will also be checked
@@ -629,7 +1185,7 @@ func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard strin
 
 	// rebuild the keyspace serving graph if there was no error
 	if err == nil {
-		err = topotools.RebuildKeyspaceLocked(ctx, wr.logger, wr.ts, keyspace, cells)
+		err = topotools.RebuildKeyspaceLocked(ctx, wr.logger, wr.ts, keyspace, cells, false)
 	}
 
 	return err
@@ -645,7 +1201,11 @@ func (wr *Wrangler) migrateServedFromLocked(ctx context.Context, ki *topo.Keyspa
 	if reverse {
 		ki.UpdateServedFromMap(servedType, cells, destinationShard.SourceShards[0].Keyspace, false, nil)
 	} else {
-		ki.UpdateServedFromMap(servedType, cells, destinationShard.SourceShards[0].Keyspace, true, destinationShard.Cells)
+		destinationShardcells, err := wr.ts.GetShardServingCells(ctx, destinationShard)
+		if err != nil {
+			return err
+		}
+		ki.UpdateServedFromMap(servedType, cells, destinationShard.SourceShards[0].Keyspace, true, destinationShardcells)
 	}
 
 	// re-read and check the destination shard
@@ -654,7 +1214,7 @@ func (wr *Wrangler) migrateServedFromLocked(ctx context.Context, ki *topo.Keyspa
 		return err
 	}
 	if len(destinationShard.SourceShards) != 1 {
-		return fmt.Errorf("Destination shard %v/%v is not a vertical split target", destinationShard.Keyspace(), destinationShard.ShardName())
+		return fmt.Errorf("destination shard %v/%v is not a vertical split target", destinationShard.Keyspace(), destinationShard.ShardName())
 	}
 	tables := destinationShard.SourceShards[0].Tables
 
@@ -689,7 +1249,7 @@ func (wr *Wrangler) migrateServedFromLocked(ctx context.Context, ki *topo.Keyspa
 	return
 }
 
-// replicaMigrateServedFrom handles the slave (replica, rdonly) migration.
+// replicaMigrateServedFrom handles the migration of (replica, rdonly).
 func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, ki *topo.KeyspaceInfo, sourceShard *topo.ShardInfo, destinationShard *topo.ShardInfo, servedType topodatapb.TabletType, cells []string, reverse bool, tables []string, ev *events.MigrateServedFrom) error {
 	// Save the destination keyspace (its ServedFrom has been changed)
 	event.DispatchUpdate(ev, "updating keyspace")
@@ -708,11 +1268,7 @@ func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, ki *topo.Keysp
 	// Now refresh the source servers so they reload their
 	// blacklisted table list
 	event.DispatchUpdate(ev, "refreshing sources tablets state so they update their blacklisted tables")
-	if err := wr.RefreshTabletsByShard(ctx, sourceShard, []topodatapb.TabletType{servedType}, cells); err != nil {
-		return err
-	}
-
-	return nil
+	return wr.RefreshTabletsByShard(ctx, sourceShard, []topodatapb.TabletType{servedType}, cells)
 }
 
 // masterMigrateServedFrom handles the master migration. The ordering is
@@ -727,6 +1283,8 @@ func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, ki *topo.Keysp
 //   replication and starts accepting writes
 func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, ki *topo.KeyspaceInfo, sourceShard *topo.ShardInfo, destinationShard *topo.ShardInfo, tables []string, ev *events.MigrateServedFrom, filteredReplicationWaitTime time.Duration) error {
 	// Read the data we need
+	ctx, cancel := context.WithTimeout(ctx, filteredReplicationWaitTime)
+	defer cancel()
 	sourceMasterTabletInfo, err := wr.ts.GetTablet(ctx, sourceShard.MasterAlias)
 	if err != nil {
 		return err
@@ -759,10 +1317,14 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, ki *topo.Keyspa
 
 	// wait for it
 	event.DispatchUpdate(ev, "waiting for destination master to catch up to source master")
-	if err := wr.tmc.WaitBlpPosition(ctx, destinationMasterTabletInfo.Tablet, &tabletmanagerdatapb.BlpPosition{
-		Uid:      0,
-		Position: masterPosition,
-	}, filteredReplicationWaitTime); err != nil {
+	uid := destinationShard.SourceShards[0].Uid
+	if err := wr.tmc.VReplicationWaitForPos(ctx, destinationMasterTabletInfo.Tablet, int(uid), masterPosition); err != nil {
+		return err
+	}
+
+	// Stop the VReplication stream.
+	event.DispatchUpdate(ev, "stopping vreplication")
+	if _, err := wr.tmc.VReplicationExec(ctx, destinationMasterTabletInfo.Tablet, binlogplayer.DeleteVReplication(uid)); err != nil {
 		return err
 	}
 
@@ -789,11 +1351,7 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, ki *topo.Keyspa
 	// Invoking a remote action will also make the tablet stop filtered
 	// replication.
 	event.DispatchUpdate(ev, "setting destination shard masters read-write")
-	if err := wr.refreshMasters(ctx, []*topo.ShardInfo{destinationShard}); err != nil {
-		return err
-	}
-
-	return nil
+	return wr.refreshMasters(ctx, []*topo.ShardInfo{destinationShard})
 }
 
 // SetKeyspaceServedFrom locks a keyspace and changes its ServerFromMap
@@ -822,10 +1380,10 @@ func (wr *Wrangler) SetKeyspaceServedFrom(ctx context.Context, keyspace string, 
 func (wr *Wrangler) RefreshTabletsByShard(ctx context.Context, si *topo.ShardInfo, tabletTypes []topodatapb.TabletType, cells []string) error {
 	wr.Logger().Infof("RefreshTabletsByShard called on shard %v/%v", si.Keyspace(), si.ShardName())
 	tabletMap, err := wr.ts.GetTabletMapForShardByCell(ctx, si.Keyspace(), si.ShardName(), cells)
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		// keep going
-	case topo.ErrPartialResult:
+	case topo.IsErrType(err, topo.PartialResult):
 		wr.Logger().Warningf("RefreshTabletsByShard: got partial result for shard %v/%v, may not refresh all tablets everywhere", si.Keyspace(), si.ShardName())
 	default:
 		return err
@@ -835,6 +1393,12 @@ func (wr *Wrangler) RefreshTabletsByShard(ctx context.Context, si *topo.ShardInf
 	wg := sync.WaitGroup{}
 	for _, ti := range tabletMap {
 		if tabletTypes != nil && !topoproto.IsTypeInList(ti.Type, tabletTypes) {
+			continue
+		}
+		if ti.Hostname == "" {
+			// The tablet is not running, we don't have the host
+			// name to connect to, so we just skip this tablet.
+			wr.Logger().Infof("Tablet %v has no hostname, skipping its RefreshState", ti.AliasString())
 			continue
 		}
 
@@ -868,7 +1432,7 @@ func (wr *Wrangler) DeleteKeyspace(ctx context.Context, keyspace string, recursi
 		wr.Logger().Infof("Deleting all shards (and their tablets) in keyspace %v", keyspace)
 		for _, shard := range shards {
 			wr.Logger().Infof("Recursively deleting shard %v/%v", keyspace, shard)
-			if err := wr.DeleteShard(ctx, keyspace, shard, true /* recursive */, true /* evenIfServing */); err != nil && err != topo.ErrNoNode {
+			if err := wr.DeleteShard(ctx, keyspace, shard, true /* recursive */, true /* evenIfServing */); err != nil && !topo.IsErrType(err, topo.NoNode) {
 				// Unlike the errors below in non-recursive steps, we don't want to
 				// continue if a DeleteShard fails. If we continue and delete the
 				// keyspace, the tablet records will be orphaned, since we'll
@@ -889,20 +1453,13 @@ func (wr *Wrangler) DeleteKeyspace(ctx context.Context, keyspace string, recursi
 		return err
 	}
 	for _, cell := range cells {
-		if err := wr.ts.DeleteKeyspaceReplication(ctx, cell, keyspace); err != nil && err != topo.ErrNoNode {
+		if err := wr.ts.DeleteKeyspaceReplication(ctx, cell, keyspace); err != nil && !topo.IsErrType(err, topo.NoNode) {
 			wr.Logger().Warningf("Cannot delete KeyspaceReplication in cell %v for %v: %v", cell, keyspace, err)
 		}
 
-		if err := wr.ts.DeleteSrvKeyspace(ctx, cell, keyspace); err != nil && err != topo.ErrNoNode {
+		if err := wr.ts.DeleteSrvKeyspace(ctx, cell, keyspace); err != nil && !topo.IsErrType(err, topo.NoNode) {
 			wr.Logger().Warningf("Cannot delete SrvKeyspace in cell %v for %v: %v", cell, keyspace, err)
 		}
-	}
-
-	// Delete the cell-global VSchema path
-	// If not remove this, vtctld web page Dashboard will Display Error
-	vschema := &vschemapb.Keyspace{}
-	if err := wr.ts.SaveVSchema(ctx, keyspace, vschema); err != nil && err != topo.ErrNoNode {
-		return err
 	}
 
 	return wr.ts.DeleteKeyspace(ctx, keyspace)
@@ -926,4 +1483,10 @@ func (wr *Wrangler) RemoveKeyspaceCell(ctx context.Context, keyspace, cell strin
 	// Now remove the SrvKeyspace object.
 	wr.Logger().Infof("Removing cell %v keyspace %v SrvKeyspace object", cell, keyspace)
 	return wr.ts.DeleteSrvKeyspace(ctx, cell, keyspace)
+}
+
+func encodeString(in string) string {
+	buf := bytes.NewBuffer(nil)
+	sqltypes.NewVarChar(in).EncodeSQL(buf)
+	return buf.String()
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,20 +19,21 @@ package tabletmanager
 import (
 	"time"
 
-	"github.com/youtube/vitess/go/vt/hook"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/mysqlctl/tmutils"
-	"golang.org/x/net/context"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	replicationdatapb "github.com/youtube/vitess/go/vt/proto/replicationdata"
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/hook"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	replicationdatapb "vitess.io/vitess/go/vt/proto/replicationdata"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-// RPCAgent defines the interface implemented by the Agent for RPCs.
+// RPCTM defines the interface implemented by the TM for RPCs.
 // It is useful for RPC implementations to test their full stack.
-type RPCAgent interface {
+type RPCTM interface {
 	// RPC calls
 
 	// Various read-only methods
@@ -65,6 +66,10 @@ type RPCAgent interface {
 
 	ApplySchema(ctx context.Context, change *tmutils.SchemaChange) (*tabletmanagerdatapb.SchemaChangeResult, error)
 
+	LockTables(ctx context.Context) error
+
+	UnlockTables(ctx context.Context) error
+
 	ExecuteFetchAsDba(ctx context.Context, query []byte, dbName string, maxrows int, disableBinlogs bool, reloadSchema bool) (*querypb.QueryResult, error)
 
 	ExecuteFetchAsAllPrivs(ctx context.Context, query []byte, dbName string, maxrows int, reloadSchema bool) (*querypb.QueryResult, error)
@@ -72,28 +77,30 @@ type RPCAgent interface {
 	ExecuteFetchAsApp(ctx context.Context, query []byte, maxrows int) (*querypb.QueryResult, error)
 
 	// Replication related methods
+	MasterStatus(ctx context.Context) (*replicationdatapb.MasterStatus, error)
 
-	SlaveStatus(ctx context.Context) (*replicationdatapb.Status, error)
+	ReplicationStatus(ctx context.Context) (*replicationdatapb.Status, error)
+
+	StopReplication(ctx context.Context) error
+
+	StopReplicationMinimum(ctx context.Context, position string, waitTime time.Duration) (string, error)
+
+	StartReplication(ctx context.Context) error
+
+	StartReplicationUntilAfter(ctx context.Context, position string, waitTime time.Duration) error
+
+	GetReplicas(ctx context.Context) ([]string, error)
 
 	MasterPosition(ctx context.Context) (string, error)
 
-	StopSlave(ctx context.Context) error
+	WaitForPosition(ctx context.Context, pos string) error
 
-	StopSlaveMinimum(ctx context.Context, position string, waitTime time.Duration) (string, error)
+	// VExec generic API
+	VExec(ctx context.Context, query, workflow, keyspace string) (*querypb.QueryResult, error)
 
-	StartSlave(ctx context.Context) error
-
-	TabletExternallyReparented(ctx context.Context, externalID string) error
-
-	GetSlaves(ctx context.Context) ([]string, error)
-
-	WaitBlpPosition(ctx context.Context, blpPosition *tabletmanagerdatapb.BlpPosition, waitTime time.Duration) error
-
-	StopBlp(ctx context.Context) ([]*tabletmanagerdatapb.BlpPosition, error)
-
-	StartBlp(ctx context.Context) error
-
-	RunBlpUntil(ctx context.Context, bpl []*tabletmanagerdatapb.BlpPosition, waitTime time.Duration) (string, error)
+	// VReplication API
+	VReplicationExec(ctx context.Context, query string) (*querypb.QueryResult, error)
+	VReplicationWaitForPos(ctx context.Context, id int, pos string) error
 
 	// Reparenting related functions
 
@@ -103,25 +110,25 @@ type RPCAgent interface {
 
 	PopulateReparentJournal(ctx context.Context, timeCreatedNS int64, actionName string, masterAlias *topodatapb.TabletAlias, pos string) error
 
-	InitSlave(ctx context.Context, parent *topodatapb.TabletAlias, replicationPosition string, timeCreatedNS int64) error
+	InitReplica(ctx context.Context, parent *topodatapb.TabletAlias, replicationPosition string, timeCreatedNS int64) error
 
-	DemoteMaster(ctx context.Context) (string, error)
+	DemoteMaster(ctx context.Context) (*replicationdatapb.MasterStatus, error)
 
-	PromoteSlaveWhenCaughtUp(ctx context.Context, replicationPosition string) (string, error)
+	UndoDemoteMaster(ctx context.Context) error
 
-	SlaveWasPromoted(ctx context.Context) error
+	ReplicaWasPromoted(ctx context.Context) error
 
-	SetMaster(ctx context.Context, parent *topodatapb.TabletAlias, timeCreatedNS int64, forceStartSlave bool) error
+	SetMaster(ctx context.Context, parent *topodatapb.TabletAlias, timeCreatedNS int64, waitPosition string, forceStartReplication bool) error
 
-	SlaveWasRestarted(ctx context.Context, parent *topodatapb.TabletAlias) error
+	StopReplicationAndGetStatus(ctx context.Context, stopReplicationMode replicationdatapb.StopReplicationMode) (StopReplicationAndGetStatusResponse, error)
 
-	StopReplicationAndGetStatus(ctx context.Context) (*replicationdatapb.Status, error)
+	ReplicaWasRestarted(ctx context.Context, parent *topodatapb.TabletAlias) error
 
-	PromoteSlave(ctx context.Context) (string, error)
+	PromoteReplica(ctx context.Context) (string, error)
 
 	// Backup / restore related methods
 
-	Backup(ctx context.Context, concurrency int, logger logutil.Logger) error
+	Backup(ctx context.Context, concurrency int, logger logutil.Logger, allowMaster bool) error
 
 	RestoreFromBackup(ctx context.Context, logger logutil.Logger) error
 

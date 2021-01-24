@@ -1,5 +1,5 @@
 /*
-Copyright 2017 GitHub Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/youtube/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql"
 )
 
 // MySQLManager is an interface to a mysqld process manager, capable
@@ -60,8 +60,6 @@ func (ctl *Mysqlctl) Setup() error {
 		"-alsologtostderr",
 		"-tablet_uid", "1",
 		"-mysql_port", fmt.Sprintf("%d", ctl.Port),
-		"-db-config-dba-charset", "utf8",
-		"-db-config-dba-uname", "vt_dba",
 		"init",
 		"-init_db_sql_file", ctl.InitFile,
 	)
@@ -86,8 +84,6 @@ func (ctl *Mysqlctl) TearDown() error {
 		"-alsologtostderr",
 		"-tablet_uid", "1",
 		"-mysql_port", fmt.Sprintf("%d", ctl.Port),
-		"-db-config-dba-charset", "utf8",
-		"-db-config-dba-uname", "vt_dba",
 		"shutdown",
 	)
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,34 +17,34 @@ limitations under the License.
 package txthrottler
 
 // Commands to generate the mocks for this test.
-//go:generate mockgen -destination mock_toposerver_impl_test.go -package txthrottler github.com/youtube/vitess/go/vt/topo Impl
-// We need the following to fix the generated mock_impl.go, since mockgen imports the 'context'
-// package from the wrong place.
-// TODO(mberlin): Remove the next line once we use the Go 1.7 package 'context' everywhere.
-//go:generate sed -i s,github.com/youtube/vitess/vendor/,,g mock_toposerver_impl_test.go
-//go:generate mockgen -destination mock_healthcheck_test.go -package txthrottler github.com/youtube/vitess/go/vt/discovery HealthCheck
-//go:generate mockgen -destination mock_throttler_test.go -package txthrottler github.com/youtube/vitess/go/vt/vttablet/tabletserver/txthrottler ThrottlerInterface
-//go:generate mockgen -destination mock_topology_watcher_test.go -package txthrottler github.com/youtube/vitess/go/vt/vttablet/tabletserver/txthrottler TopologyWatcherInterface
+//go:generate mockgen -destination mock_healthcheck_test.go -package txthrottler vitess.io/vitess/go/vt/discovery LegacyHealthCheck
+//go:generate mockgen -destination mock_throttler_test.go -package txthrottler vitess.io/vitess/go/vt/vttablet/tabletserver/txthrottler ThrottlerInterface
+//go:generate mockgen -destination mock_topology_watcher_test.go -package txthrottler vitess.io/vitess/go/vt/vttablet/tabletserver/txthrottler TopologyWatcherInterface
 
 import (
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
-	"github.com/youtube/vitess/go/vt/discovery"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func TestDisabledThrottler(t *testing.T) {
-	oldConfig := tabletenv.Config
-	defer func() { tabletenv.Config = oldConfig }()
-	tabletenv.Config.EnableTxThrottler = false
-	throttler := CreateTxThrottlerFromTabletConfig(topo.Server{})
-	if err := throttler.Open("keyspace", "shard"); err != nil {
+	config := tabletenv.NewDefaultConfig()
+	config.EnableTxThrottler = false
+	throttler := NewTxThrottler(config, nil)
+	throttler.InitDBConfig(querypb.Target{
+		Keyspace: "keyspace",
+		Shard:    "shard",
+	})
+	if err := throttler.Open(); err != nil {
 		t.Fatalf("want: nil, got: %v", err)
 	}
 	if result := throttler.Throttle(); result != false {
@@ -58,22 +58,22 @@ func TestEnabledThrottler(t *testing.T) {
 	defer mockCtrl.Finish()
 
 	defer resetTxThrottlerFactories()
-	mockTopoServer, _ := NewMockServer(mockCtrl)
+	ts := memorytopo.NewServer("cell1", "cell2")
 
 	mockHealthCheck := NewMockHealthCheck(mockCtrl)
-	var hcListener discovery.HealthCheckStatsListener
+	var hcListener discovery.LegacyHealthCheckStatsListener
 	hcCall1 := mockHealthCheck.EXPECT().SetListener(gomock.Any(), false /* sendDownEvents */)
-	hcCall1.Do(func(listener discovery.HealthCheckStatsListener, sendDownEvents bool) {
+	hcCall1.Do(func(listener discovery.LegacyHealthCheckStatsListener, sendDownEvents bool) {
 		// Record the listener we're given.
 		hcListener = listener
 	})
 	hcCall2 := mockHealthCheck.EXPECT().Close()
 	hcCall2.After(hcCall1)
-	healthCheckFactory = func() discovery.HealthCheck { return mockHealthCheck }
+	healthCheckFactory = func() discovery.LegacyHealthCheck { return mockHealthCheck }
 
-	topologyWatcherFactory = func(topoServer topo.Server, tr discovery.TabletRecorder, cell, keyspace, shard string, refreshInterval time.Duration, topoReadConcurrency int) TopologyWatcherInterface {
-		if mockTopoServer.Impl != topoServer.Impl {
-			t.Errorf("want: %v, got: %v", mockTopoServer, topoServer)
+	topologyWatcherFactory = func(topoServer *topo.Server, tr discovery.LegacyTabletRecorder, cell, keyspace, shard string, refreshInterval time.Duration, topoReadConcurrency int) TopologyWatcherInterface {
+		if ts != topoServer {
+			t.Errorf("want: %v, got: %v", ts, topoServer)
 		}
 		if cell != "cell1" && cell != "cell2" {
 			t.Errorf("want: cell1 or cell2, got: %v", cell)
@@ -100,7 +100,7 @@ func TestEnabledThrottler(t *testing.T) {
 	call0 := mockThrottler.EXPECT().UpdateConfiguration(gomock.Any(), true /* copyZeroValues */)
 	call1 := mockThrottler.EXPECT().Throttle(0)
 	call1.Return(0 * time.Second)
-	tabletStats := &discovery.TabletStats{
+	tabletStats := &discovery.LegacyTabletStats{
 		Target: &querypb.Target{
 			TabletType: topodatapb.TabletType_REPLICA,
 		},
@@ -114,23 +114,26 @@ func TestEnabledThrottler(t *testing.T) {
 	call3.After(call2)
 	call4.After(call3)
 
-	oldConfig := tabletenv.Config
-	defer func() { tabletenv.Config = oldConfig }()
-	tabletenv.Config.EnableTxThrottler = true
-	tabletenv.Config.TxThrottlerHealthCheckCells = []string{"cell1", "cell2"}
+	config := tabletenv.NewDefaultConfig()
+	config.EnableTxThrottler = true
+	config.TxThrottlerHealthCheckCells = []string{"cell1", "cell2"}
 
-	throttler, err := tryCreateTxThrottler(mockTopoServer)
+	throttler, err := tryCreateTxThrottler(config, ts)
 	if err != nil {
 		t.Fatalf("want: nil, got: %v", err)
 	}
-	if err := throttler.Open("keyspace", "shard"); err != nil {
+	throttler.InitDBConfig(querypb.Target{
+		Keyspace: "keyspace",
+		Shard:    "shard",
+	})
+	if err := throttler.Open(); err != nil {
 		t.Fatalf("want: nil, got: %v", err)
 	}
 	if result := throttler.Throttle(); result != false {
 		t.Errorf("want: false, got: %v", result)
 	}
 	hcListener.StatsUpdate(tabletStats)
-	rdonlyTabletStats := &discovery.TabletStats{
+	rdonlyTabletStats := &discovery.LegacyTabletStats{
 		Target: &querypb.Target{
 			TabletType: topodatapb.TabletType_RDONLY,
 		},

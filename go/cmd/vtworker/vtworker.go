@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,18 +29,21 @@ import (
 	"os"
 	"time"
 
-	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/exit"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/worker"
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/exit"
+	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/worker"
 )
 
 var (
 	cell                   = flag.String("cell", "", "cell to pick servers from")
 	commandDisplayInterval = flag.Duration("command_display_interval", time.Second, "Interval between each status update when vtworker is executing a single command from the command line")
+	username               = flag.String("username", "", "If set, value is set as immediate caller id in the request and used by vttablet for TableACL check")
 )
 
 func init() {
@@ -87,7 +90,15 @@ func main() {
 		wi.InitInteractiveMode()
 	} else {
 		// In single command mode, just run it.
-		worker, done, err := wi.RunCommand(context.Background(), args, nil /*custom wrangler*/, true /*runFromCli*/)
+		ctx := context.Background()
+
+		if *username != "" {
+			ctx = callerid.NewContext(ctx,
+				callerid.NewEffectiveCallerID("vtworker", "" /* component */, "" /* subComponent */),
+				callerid.NewImmediateCallerID(*username))
+		}
+
+		worker, done, err := wi.RunCommand(ctx, args, nil /*custom wrangler*/, true /*runFromCli*/)
 		if err != nil {
 			log.Error(err)
 			exit.Return(1)

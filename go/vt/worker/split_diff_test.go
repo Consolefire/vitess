@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,21 +22,23 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
 
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/mysqlctl/tmutils"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/vttablet/grpcqueryservice"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice/fakes"
-	"github.com/youtube/vitess/go/vt/wrangler"
-	"github.com/youtube/vitess/go/vt/wrangler/testlib"
+	"context"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
-	vschemapb "github.com/youtube/vitess/go/vt/proto/vschema"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vttablet/grpcqueryservice"
+	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
+	"vitess.io/vitess/go/vt/wrangler"
+	"vitess.io/vitess/go/vt/wrangler/testlib"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
 // destinationTabletServer is a local QueryService implementation to
@@ -48,7 +50,7 @@ type destinationTabletServer struct {
 	excludedTable string
 }
 
-func (sq *destinationTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error {
+func (sq *destinationTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error {
 	if strings.Contains(sql, sq.excludedTable) {
 		sq.t.Errorf("Split Diff operation on destination should skip the excluded table: %v query: %v", sq.excludedTable, sql)
 	}
@@ -110,7 +112,7 @@ type sourceTabletServer struct {
 	v3            bool
 }
 
-func (sq *sourceTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error {
+func (sq *sourceTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error {
 	if strings.Contains(sql, sq.excludedTable) {
 		sq.t.Errorf("Split Diff operation on source should skip the excluded table: %v query: %v", sq.excludedTable, sql)
 	}
@@ -168,7 +170,13 @@ func (sq *sourceTabletServer) StreamExecute(ctx context.Context, target *querypb
 
 // TODO(aaijazi): Create a test in which source and destination data does not match
 
-func testSplitDiff(t *testing.T, v3 bool) {
+func testSplitDiff(t *testing.T, v3 bool, destinationTabletType topodatapb.TabletType) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	*useV3ReshardingMode = v3
 	ts := memorytopo.NewServer("cell1", "cell2")
 	ctx := context.Background()
@@ -219,9 +227,9 @@ func testSplitDiff(t *testing.T, v3 bool) {
 	leftMaster := testlib.NewFakeTablet(t, wi.wr, "cell1", 10,
 		topodatapb.TabletType_MASTER, nil, testlib.TabletKeyspaceShard(t, "ks", "-40"))
 	leftRdonly1 := testlib.NewFakeTablet(t, wi.wr, "cell1", 11,
-		topodatapb.TabletType_RDONLY, nil, testlib.TabletKeyspaceShard(t, "ks", "-40"))
+		destinationTabletType, nil, testlib.TabletKeyspaceShard(t, "ks", "-40"))
 	leftRdonly2 := testlib.NewFakeTablet(t, wi.wr, "cell1", 12,
-		topodatapb.TabletType_RDONLY, nil, testlib.TabletKeyspaceShard(t, "ks", "-40"))
+		destinationTabletType, nil, testlib.TabletKeyspaceShard(t, "ks", "-40"))
 
 	// add the topo and schema data we'll need
 	if err := ts.CreateShard(ctx, "ks", "80-"); err != nil {
@@ -231,7 +239,7 @@ func testSplitDiff(t *testing.T, v3 bool) {
 	if err := wi.wr.SetKeyspaceShardingInfo(ctx, "ks", "keyspace_id", topodatapb.KeyspaceIdType_UINT64, false); err != nil {
 		t.Fatalf("SetKeyspaceShardingInfo failed: %v", err)
 	}
-	if err := wi.wr.RebuildKeyspaceGraph(ctx, "ks", nil); err != nil {
+	if err := wi.wr.RebuildKeyspaceGraph(ctx, "ks", nil, false); err != nil {
 		t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
 
@@ -266,6 +274,7 @@ func testSplitDiff(t *testing.T, v3 bool) {
 		qs.AddDefaultHealthResponse()
 		grpcqueryservice.Register(sourceRdonly.RPCServer, &sourceTabletServer{
 			t: t,
+
 			StreamHealthQueryService: qs,
 			excludedTable:            excludedTable,
 			v3:                       v3,
@@ -277,6 +286,7 @@ func testSplitDiff(t *testing.T, v3 bool) {
 		qs.AddDefaultHealthResponse()
 		grpcqueryservice.Register(destRdonly.RPCServer, &destinationTabletServer{
 			t: t,
+
 			StreamHealthQueryService: qs,
 			excludedTable:            excludedTable,
 		})
@@ -288,10 +298,12 @@ func testSplitDiff(t *testing.T, v3 bool) {
 		defer ft.StopActionLoop(t)
 	}
 
+	tabletTypeName := topodatapb.TabletType_name[int32(destinationTabletType)]
 	// Run the vtworker command.
 	args := []string{
 		"SplitDiff",
 		"-exclude_tables", excludedTable,
+		"-dest_tablet_type", tabletTypeName,
 		"ks/-40",
 	}
 	// We need to use FakeTabletManagerClient because we don't
@@ -304,9 +316,13 @@ func testSplitDiff(t *testing.T, v3 bool) {
 }
 
 func TestSplitDiffv2(t *testing.T) {
-	testSplitDiff(t, false)
+	testSplitDiff(t, false, topodatapb.TabletType_RDONLY)
 }
 
 func TestSplitDiffv3(t *testing.T) {
-	testSplitDiff(t, true)
+	testSplitDiff(t, true, topodatapb.TabletType_RDONLY)
+}
+
+func TestSplitDiffWithReplica(t *testing.T) {
+	testSplitDiff(t, true, topodatapb.TabletType_REPLICA)
 }

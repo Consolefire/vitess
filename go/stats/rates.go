@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,6 +36,15 @@ type CountTracker interface {
 	// the total count across all categories (e.g. timing.go does this).
 	Counts() map[string]int64
 }
+
+// wrappedCountTracker implements the CountTracker interface.
+// It is used in multidimensional.go to publish specific, one-dimensional
+// counters.
+type wrappedCountTracker struct {
+	f func() map[string]int64
+}
+
+func (t wrappedCountTracker) Counts() map[string]int64 { return t.f() }
 
 // Rates is capable of reporting the rate (typically QPS)
 // for any variable that satisfies the CountTracker interface.
@@ -168,6 +177,35 @@ func (rt *Rates) TotalRate() float64 {
 
 func (rt *Rates) String() string {
 	data, err := json.Marshal(rt.Get())
+	if err != nil {
+		data, _ = json.Marshal(err.Error())
+	}
+	return string(data)
+}
+
+type RatesFunc struct {
+	F    func() map[string][]float64
+	help string
+}
+
+func NewRateFunc(name string, help string, f func() map[string][]float64) *RatesFunc {
+	c := &RatesFunc{
+		F:    f,
+		help: help,
+	}
+
+	if name != "" {
+		publish(name, c)
+	}
+	return c
+}
+
+func (rf *RatesFunc) Help() string {
+	return rf.help
+}
+
+func (rf *RatesFunc) String() string {
+	data, err := json.Marshal(rf.F())
 	if err != nil {
 		data, _ = json.Marshal(err.Error())
 	}

@@ -1,297 +1,286 @@
 #!/bin/bash
+# shellcheck disable=SC2164
 
-# Copyright 2017 Google Inc.
-# 
+# Copyright 2019 The Vitess Authors.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-SKIP_ROOT_INSTALLS=False
-if [ "$1" = "--skip_root_installs" ]; then
-  SKIP_ROOT_INSTALLS=True
-fi
+### This file is executed by 'make tools'. You do not need to execute it directly.
 
-# Run parallel make, based on number of cores available.
-case $(uname) in
-  Linux)  NB_CORES=$(grep -c '^processor' /proc/cpuinfo);;
-  Darwin) NB_CORES=$(sysctl hw.ncpu | awk '{ print $2 }');;
-esac
-if [ -n "$NB_CORES" ]; then
-  export MAKEFLAGS="-j$((NB_CORES+1)) -l${NB_CORES}"
-fi
-
-function fail() {
-  echo "ERROR: $1"
-  exit 1
-}
-
-[ "$(dirname $0)" = '.' ] || fail "bootstrap.sh must be run from its current directory"
-
-go version 2>&1 >/dev/null || fail "Go is not installed or is not on \$PATH"
-
-# Set up the proper GOPATH for go get below.
 source ./dev.env
 
-mkdir -p $VTROOT/dist
-mkdir -p $VTROOT/bin
-mkdir -p $VTROOT/lib
-mkdir -p $VTROOT/vthook
+# Outline of this file.
+# 0. Initialization and helper methods.
+# 1. Installation of dependencies.
 
-echo "Updating git submodules..."
-git submodule update --init
+BUILD_JAVA=${BUILD_JAVA:-1}
+BUILD_CONSUL=${BUILD_CONSUL:-1}
+BUILD_CHROME=${BUILD_CHROME:-1}
 
-# Install "protoc" protobuf compiler binary.
-protoc_version=3.4.0
-protoc_dist=$VTROOT/dist/protoc
-protoc_version_file=$protoc_dist/version
-if [[ -f $protoc_version_file && "$(cat $protoc_version_file)" == "$protoc_version" ]]; then
-  echo "skipping protoc install. remove $protoc_version_file to force re-install."
-else
-  rm -rf $protoc_dist
-  mkdir -p $protoc_dist
-  download_url=https://github.com/google/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-x86_64.zip
-  (cd $protoc_dist && \
-    wget $download_url && \
-    unzip protoc-${protoc_version}-linux-x86_64.zip)
-  [ $? -eq 0 ] || fail "protoc download failed"
-  echo "$protoc_version" > $protoc_version_file
-fi
-ln -snf $protoc_dist/bin/protoc $VTROOT/bin/protoc
+VITESS_RESOURCES_DOWNLOAD_BASE_URL="https://github.com/vitessio/vitess-resources/releases/download"
+VITESS_RESOURCES_RELEASE="v1.0"
+VITESS_RESOURCES_DOWNLOAD_URL="${VITESS_RESOURCES_DOWNLOAD_BASE_URL}/${VITESS_RESOURCES_RELEASE}"
+#
+# 0. Initialization and helper methods.
+#
 
-# install zookeeper
-zk_ver=3.4.6
-zk_dist=$VTROOT/dist/vt-zookeeper-$zk_ver
-if [ -f $zk_dist/.build_finished ]; then
-  echo "skipping zookeeper build. remove $zk_dist to force rebuild."
-else
-  rm -rf $zk_dist
-  (cd $VTROOT/dist && \
-    wget http://apache.org/dist/zookeeper/zookeeper-$zk_ver/zookeeper-$zk_ver.tar.gz && \
-    tar -xzf zookeeper-$zk_ver.tar.gz && \
-    mkdir -p $zk_dist/lib && \
-    cp zookeeper-$zk_ver/contrib/fatjar/zookeeper-$zk_ver-fatjar.jar $zk_dist/lib && \
-    rm -rf zookeeper-$zk_ver zookeeper-$zk_ver.tar.gz)
-  [ $? -eq 0 ] || fail "zookeeper build failed"
-  touch $zk_dist/.build_finished
-fi
+[[ "$(dirname "$0")" = "." ]] || fail "bootstrap.sh must be run from its current directory"
 
-# Download and install etcd, link etcd binary into our root.
-etcd_version=v3.1.0-rc.1
-etcd_dist=$VTROOT/dist/etcd
-etcd_version_file=$etcd_dist/version
-if [[ -f $etcd_version_file && "$(cat $etcd_version_file)" == "$etcd_version" ]]; then
-  echo "skipping etcd install. remove $etcd_version_file to force re-install."
-else
-  rm -rf $etcd_dist
-  mkdir -p $etcd_dist
-  download_url=https://github.com/coreos/etcd/releases/download
-  (cd $etcd_dist && \
-    wget ${download_url}/${etcd_version}/etcd-${etcd_version}-linux-amd64.tar.gz && \
-    tar xzf etcd-${etcd_version}-linux-amd64.tar.gz)
-  [ $? -eq 0 ] || fail "etcd download failed"
-  echo "$etcd_version" > $etcd_version_file
-fi
-ln -snf $etcd_dist/etcd-${etcd_version}-linux-amd64/etcd $VTROOT/bin/etcd
+# install_dep is a helper function to generalize the download and installation of dependencies.
+#
+# If the installation is successful, it puts the installed version string into
+# the $dist/.installed_version file. If the version has not changed, bootstrap
+# will skip future installations.
+install_dep() {
+  if [[ $# != 4 ]]; then
+    fail "install_dep function requires exactly 4 parameters (and not $#). Parameters: $*"
+  fi
+  local name="$1"
+  local version="$2"
+  local dist="$3"
+  local install_func="$4"
 
-# Download and install consul, link consul binary into our root.
-consul_version=0.7.2
-consul_dist=$VTROOT/dist/consul
-consul_version_file=$consul_dist/version
-if [[ -f $consul_version_file && "$(cat $consul_version_file)" == "$consul_version" ]]; then
-  echo "skipping consul install. remove $consul_version_file to force re-install."
-else
-  rm -rf $consul_dist
-  mkdir -p $consul_dist
-  download_url=https://releases.hashicorp.com/consul
-  (cd $consul_dist && \
-    wget ${download_url}/${consul_version}/consul_${consul_version}_linux_amd64.zip && \
-    unzip consul_${consul_version}_linux_amd64.zip)
-  [ $? -eq 0 ] || fail "consul download failed"
-  echo "$consul_version" > $consul_version_file
-fi
-ln -snf $consul_dist/consul $VTROOT/bin/consul
-
-# install gRPC C++ base, so we can install the python adapters.
-# this also installs protobufs
-grpc_dist=$VTROOT/dist/grpc
-grpc_ver=v1.7.0
-if [ $SKIP_ROOT_INSTALLS == "True" ]; then
-  echo "skipping grpc build, as root version was already installed."
-elif [[ -f $grpc_dist/.build_finished && "$(cat $grpc_dist/.build_finished)" == "$grpc_ver" ]]; then
-  echo "skipping gRPC build. remove $grpc_dist to force rebuild."
-else
-  # unlink homebrew's protobuf, to be able to compile the downloaded protobuf package
-  if [[ `uname -s` == "Darwin" && "$(brew list -1 | grep google-protobuf)" ]]; then
-    brew unlink grpc/grpc/google-protobuf
+  version_file="$dist/.installed_version"
+  if [[ -f "$version_file" && "$(cat "$version_file")" == "$version" ]]; then
+    echo "skipping $name install. remove $dist to force re-install."
+    return
   fi
 
-  # protobuf used to be a separate package, now we use the gRPC one.
-  rm -rf $VTROOT/dist/protobuf
+  echo "installing $name $version"
+
+  # shellcheck disable=SC2064
+  trap "fail '$name build failed'; exit 1" ERR
 
   # Cleanup any existing data and re-create the directory.
-  rm -rf $grpc_dist
-  mkdir -p $grpc_dist
+  rm -rf "$dist"
+  mkdir -p "$dist"
 
-  ./travis/install_grpc.sh $grpc_dist || fail "gRPC build failed"
-  echo "$grpc_ver" > $grpc_dist/.build_finished
+  # Change $CWD to $dist before calling "install_func".
+  pushd "$dist" >/dev/null
+  # -E (same as "set -o errtrace") makes sure that "install_func" inherits the
+  # trap. If here's an error, the trap will be called which will exit this
+  # script.
+  set -E
+  $install_func "$version" "$dist"
+  set +E
+  popd >/dev/null
 
-  # link homebrew's protobuf back
-  if [[ `uname -s` == "Darwin" && "$(brew list -1 | grep google-protobuf)" ]]; then
-    brew link grpc/grpc/google-protobuf
+  trap - ERR
+
+  echo "$version" > "$version_file"
+}
+
+
+#
+# 1. Installation of dependencies.
+#
+
+# We should not use the arch command, since it is not reliably
+# available on macOS or some linuxes:
+# https://www.gnu.org/software/coreutils/manual/html_node/arch-invocation.html
+get_arch() {
+  uname -m
+}
+
+# Install protoc.
+install_protoc() {
+  local version="$1"
+  local dist="$2"
+
+  case $(uname) in
+    Linux)  local platform=linux;;
+    Darwin) local platform=osx;;
+  esac
+
+  case $(get_arch) in
+      aarch64)  local target=aarch_64;;
+      x86_64)  local target=x86_64;;
+      *)   echo "ERROR: unsupported architecture"; exit 1;;
+  esac
+
+  # This is how we'd download directly from source:
+  # wget https://github.com/protocolbuffers/protobuf/releases/download/v$version/protoc-$version-$platform-${target}.zip
+  wget "${VITESS_RESOURCES_DOWNLOAD_URL}/protoc-$version-$platform-${target}.zip"
+  unzip "protoc-$version-$platform-${target}.zip"
+  ln -snf "$dist/bin/protoc" "$VTROOT/bin/protoc"
+}
+
+
+# Install Zookeeper.
+install_zookeeper() {
+  local version="$1"
+  local dist="$2"
+
+  zk="zookeeper-$version"
+  # This is how we'd download directly from source:
+  # wget "https://archive.apache.org/dist/zookeeper/$zk/$zk.tar.gz"
+  wget "${VITESS_RESOURCES_DOWNLOAD_URL}/${zk}.tar.gz"
+  tar -xzf "$zk.tar.gz"
+  ant -f "$zk/build.xml" package
+  ant -f "$zk/zookeeper-contrib/zookeeper-contrib-fatjar/build.xml" jar
+  mkdir -p lib
+  cp "$zk/build/zookeeper-contrib/zookeeper-contrib-fatjar/zookeeper-dev-fatjar.jar" "lib/$zk-fatjar.jar"
+  zip -d "lib/$zk-fatjar.jar" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*SF' || true # needed for >=3.4.10 <3.5
+  rm -rf "$zk" "$zk.tar.gz"
+}
+
+
+# Download and install etcd, link etcd binary into our root.
+install_etcd() {
+  local version="$1"
+  local dist="$2"
+
+  case $(uname) in
+    Linux)  local platform=linux; local ext=tar.gz;;
+    Darwin) local platform=darwin; local ext=zip;;
+  esac
+
+  case $(get_arch) in
+      aarch64)  local target=arm64;;
+      x86_64)  local target=amd64;;
+      *)   echo "ERROR: unsupported architecture"; exit 1;;
+  esac
+
+  file="etcd-${version}-${platform}-${target}.${ext}"
+
+  # This is how we'd download directly from source:
+  # download_url=https://github.com/etcd-io/etcd/releases/download
+  # wget "$download_url/$version/$file"
+  wget "${VITESS_RESOURCES_DOWNLOAD_URL}/${file}"
+  if [ "$ext" = "tar.gz" ]; then
+    tar xzf "$file"
+  else
+    unzip "$file"
   fi
+  rm "$file"
+  ln -snf "$dist/etcd-${version}-${platform}-${target}/etcd" "$VTROOT/bin/etcd"
+  ln -snf "$dist/etcd-${version}-${platform}-${target}/etcdctl" "$VTROOT/bin/etcdctl"
+}
 
-  # Add newly installed Python code to PYTHONPATH such that other Python module
-  # installations can reuse it. (Once bootstrap.sh has finished, run
-  # source dev.env instead to set the correct PYTHONPATH.)
-  export PYTHONPATH=$(prepend_path $PYTHONPATH $grpc_dist/usr/local/lib/python2.7/dist-packages)
-fi
 
-# Install third-party Go tools used as part of the development workflow.
-#
-# DO NOT ADD LIBRARY DEPENDENCIES HERE. Instead use govendor as described below.
-#
-# Note: We explicitly do not vendor the tools below because a) we want to stay
-# their latest version and b) it's easier to "go install" them this way.
-gotools=" \
-       github.com/golang/lint/golint \
-       github.com/golang/mock/mockgen \
-       github.com/kardianos/govendor \
-       golang.org/x/tools/cmd/goimports \
-       golang.org/x/tools/cmd/goyacc \
-       honnef.co/go/tools/cmd/unused \
-"
+# Download and install k3s, link k3s binary into our root
+install_k3s() {
+  local version="$1"
+  local dist="$2"
 
-# The cover tool needs to be installed into the Go toolchain, so it will fail
-# if Go is installed somewhere that requires root access.
-source tools/shell_functions.inc
-if goversion_min 1.4; then
-  gotools+=" golang.org/x/tools/cmd/cover"
-else
-  gotools+=" code.google.com/p/go.tools/cmd/cover"
-fi
+  case $(uname) in
+    Linux)  local platform=linux;;
+    *)   echo "WARNING: unsupported platform. K3s only supports running on Linux, the k8s topology will not be available for local examples."; return;;
+  esac
 
-echo "Installing dev tools with 'go get'..."
-go get -u $gotools || fail "Failed to download some Go tools with 'go get'. Please re-run bootstrap.sh in case of transient errors."
+  case $(get_arch) in
+      aarch64)  local target="-arm64";;
+      x86_64)  local target="";;
+      *)   echo "WARNING: unsupported architecture, the k8s topology will not be available for local examples."; return;;
+  esac
 
-# Download dependencies that are version-pinned via govendor.
-#
-# To add a new dependency, run:
-#   govendor fetch <package_path>
-#
-# Existing dependencies can be updated to the latest version with 'fetch' as well.
-#
-# Then:
-#   git add vendor/vendor.json
-#   git commit
-#
-# See https://github.com/kardianos/govendor for more options.
-echo "Updating govendor dependencies..."
-govendor sync || fail "Failed to download/update dependencies with govendor. Please re-run bootstrap.sh in case of transient errors."
+  file="k3s${target}"
 
-ln -snf $VTTOP/config $VTROOT/config
-ln -snf $VTTOP/data $VTROOT/data
-ln -snf $VTTOP/py $VTROOT/py-vtdb
-ln -snf $VTTOP/go/zk/zkctl/zksrv.sh $VTROOT/bin/zksrv.sh
-ln -snf $VTTOP/test/vthook-test.sh $VTROOT/vthook/test.sh
-ln -snf $VTTOP/test/vthook-test_backup_error $VTROOT/vthook/test_backup_error
-ln -snf $VTTOP/test/vthook-test_backup_transform $VTROOT/vthook/test_backup_transform
+  local dest="$dist/k3s${target}-${version}-${platform}"
+  # This is how we'd download directly from source:
+  # download_url=https://github.com/rancher/k3s/releases/download
+  # wget -O  $dest "$download_url/$version/$file"
+  wget -O  $dest "${VITESS_RESOURCES_DOWNLOAD_URL}/$file-$version"
+  chmod +x $dest
+  ln -snf  $dest "$VTROOT/bin/k3s"
+}
 
-# find mysql and prepare to use libmysqlclient
-if [ -z "$MYSQL_FLAVOR" ]; then
-  export MYSQL_FLAVOR=MySQL56
-  echo "MYSQL_FLAVOR environment variable not set. Using default: $MYSQL_FLAVOR"
-fi
-case "$MYSQL_FLAVOR" in
-  "MySQL56")
-    myversion=`$VT_MYSQL_ROOT/bin/mysql --version`
-    [[ "$myversion" =~ Distrib\ 5\.[67] ]] || fail "Couldn't find MySQL 5.6+ in $VT_MYSQL_ROOT. Set VT_MYSQL_ROOT to override search location."
-    echo "Found MySQL 5.6+ installation in $VT_MYSQL_ROOT."
-    ;;
 
-  "MariaDB")
-    myversion=`$VT_MYSQL_ROOT/bin/mysql --version`
-    [[ "$myversion" =~ MariaDB ]] || fail "Couldn't find MariaDB in $VT_MYSQL_ROOT. Set VT_MYSQL_ROOT to override search location."
-    echo "Found MariaDB installation in $VT_MYSQL_ROOT."
-    ;;
+# Download and install consul, link consul binary into our root.
+install_consul() {
+  local version="$1"
+  local dist="$2"
 
-  *)
-    fail "Unsupported MYSQL_FLAVOR $MYSQL_FLAVOR"
-    ;;
+  case $(uname) in
+    Linux)  local platform=linux;;
+    Darwin) local platform=darwin;;
+  esac
 
-esac
+  case $(get_arch) in
+      aarch64)  local target=arm64;;
+      x86_64)  local target=amd64;;
+      *)   echo "ERROR: unsupported architecture"; exit 1;;
+  esac
 
-# save the flavor that was used in bootstrap, so it can be restored
-# every time dev.env is sourced.
-echo "$MYSQL_FLAVOR" > $VTROOT/dist/MYSQL_FLAVOR
+  # This is how we'd download directly from source:
+  # download_url=https://releases.hashicorp.com/consul
+  # wget "${download_url}/${version}/consul_${version}_${platform}_${target}.zip"
+  wget "${VITESS_RESOURCES_DOWNLOAD_URL}/consul_${version}_${platform}_${target}.zip"
+  unzip "consul_${version}_${platform}_${target}.zip"
+  ln -snf "$dist/consul" "$VTROOT/bin/consul"
+}
 
-# generate pkg-config, so go can use mysql C client
-[ -x $VT_MYSQL_ROOT/bin/mysql_config ] || fail "Cannot execute $VT_MYSQL_ROOT/bin/mysql_config. Did you install a client dev package?"
-
-cp $VTTOP/config/gomysql.pc.tmpl $VTROOT/lib/gomysql.pc
-myversion=`$VT_MYSQL_ROOT/bin/mysql_config --version`
-echo "Version:" "$myversion" >> $VTROOT/lib/gomysql.pc
-echo "Cflags:" "$($VT_MYSQL_ROOT/bin/mysql_config --cflags) -ggdb -fPIC" >> $VTROOT/lib/gomysql.pc
-# Note we add $VT_MYSQL_ROOT/lib as an extra path in the case where
-# we installed the standard MySQL packages from a distro into a sub-directory
-# and the provided mysql_config assumes the <root>/lib directory
-# is already in the library path.
-if [[ "$MYSQL_FLAVOR" == "MariaDB" || "$myversion" =~ ^5\.7\. ]]; then
-  # Use static linking because the shared library doesn't export
-  # some internal functions we use, like cli_safe_read.
-  echo "Libs:" "-L$VT_MYSQL_ROOT/lib $($VT_MYSQL_ROOT/bin/mysql_config --libs_r | sed -e 's,-lmysqlclient\(_r\)*,-l:libmysqlclient.a -lstdc++,')" >> $VTROOT/lib/gomysql.pc
-else
-  echo "Libs:" "-L$VT_MYSQL_ROOT/lib $($VT_MYSQL_ROOT/bin/mysql_config --libs_r)" >> $VTROOT/lib/gomysql.pc
-fi
-
-# install mock
-mock_dist=$VTROOT/dist/py-mock-1.0.1
-if [ -f $mock_dist/.build_finished ]; then
-  echo "skipping mock python build"
-else
-  # Cleanup any existing data
-  # (e.g. necessary for Travis CI caching which creates .build_finished as directory and prevents this script from creating it as file).
-  rm -rf $mock_dist
-  # For some reason, it seems like setuptools won't create directories even with the --prefix argument
-  mkdir -p $mock_dist/lib/python2.7/site-packages
-  export PYTHONPATH=$(prepend_path $PYTHONPATH $mock_dist/lib/python2.7/site-packages)
-  cd $VTTOP/third_party/py && \
-    tar -xzf mock-1.0.1.tar.gz && \
-    cd mock-1.0.1 && \
-    $PYTHON ./setup.py install --prefix=$mock_dist && \
-    touch $mock_dist/.build_finished && \
-    cd .. && \
-    rm -r mock-1.0.1
-fi
-
-# Create the Git hooks.
-echo "creating git hooks"
-mkdir -p $VTTOP/.git/hooks
-ln -sf $VTTOP/misc/git/pre-commit $VTTOP/.git/hooks/pre-commit
-ln -sf $VTTOP/misc/git/prepare-commit-msg.bugnumber $VTTOP/.git/hooks/prepare-commit-msg
-ln -sf $VTTOP/misc/git/commit-msg.bugnumber $VTTOP/.git/hooks/commit-msg
-(cd $VTTOP && git config core.hooksPath $VTTOP/.git/hooks)
 
 # Download chromedriver
-echo "Installing selenium and chromedriver"
-selenium_dist=$VTROOT/dist/selenium
-mkdir -p $selenium_dist
-$VIRTUALENV $selenium_dist
-PIP=$selenium_dist/bin/pip
-# PYTHONPATH is removed for `pip install` because otherwise it can pick up go/dist/grpc/usr/local/lib/python2.7/site-packages
-# instead of go/dist/selenium/lib/python3.5/site-packages and then can't find module 'pip._vendor.requests'
-PYTHONPATH= $PIP install selenium
-mkdir -p $VTROOT/dist/chromedriver
-curl -sL http://chromedriver.storage.googleapis.com/2.25/chromedriver_linux64.zip > chromedriver_linux64.zip
-unzip -o -q chromedriver_linux64.zip -d $VTROOT/dist/chromedriver
-rm chromedriver_linux64.zip
+install_chromedriver() {
+  local version="$1"
+  local dist="$2"
 
-echo
-echo "bootstrap finished - run 'source dev.env' in your shell before building."
+  case $(uname) in
+    Linux)  local platform=linux;;
+    *)   echo "Platform not supported for vtctl-web tests. Skipping chromedriver install."; return;;
+  esac
+
+  if [ "$(arch)" == "aarch64" ] ; then
+      os=$(cat /etc/*release | grep "^ID=" | cut -d '=' -f 2)
+      case $os in
+        ubuntu|debian)
+          sudo apt-get update -y && sudo apt install -y --no-install-recommends unzip libglib2.0-0 libnss3 libx11-6
+        ;;
+        centos|fedora)
+          sudo yum update -y && yum install -y libX11 unzip wget
+        ;;
+      esac
+      echo "For Arm64, using prebuilt binary from electron (https://github.com/electron/electron/) of version 76.0.3809.126"
+      wget https://github.com/electron/electron/releases/download/v6.0.3/chromedriver-v6.0.3-linux-arm64.zip
+      unzip -o -q chromedriver-v6.0.3-linux-arm64.zip -d "$dist"
+      rm chromedriver-v6.0.3-linux-arm64.zip
+  else
+      curl -sL "https://chromedriver.storage.googleapis.com/$version/chromedriver_linux64.zip" > chromedriver_linux64.zip
+      unzip -o -q chromedriver_linux64.zip -d "$dist"
+      rm chromedriver_linux64.zip
+  fi
+}
+
+install_all() {
+  # protoc
+  protoc_ver=3.6.1
+  install_dep "protoc" "$protoc_ver" "$VTROOT/dist/vt-protoc-$protoc_ver" install_protoc
+
+  # zk
+  zk_ver=${ZK_VERSION:-3.4.14}
+  if [ "$BUILD_JAVA" == 1 ] ; then
+    install_dep "Zookeeper" "$zk_ver" "$VTROOT/dist/vt-zookeeper-$zk_ver" install_zookeeper
+  fi
+
+  # etcd
+  command -v etcd && echo "etcd already installed" || install_dep "etcd" "v3.3.10" "$VTROOT/dist/etcd" install_etcd
+
+  # k3s
+  command -v  k3s || install_dep "k3s" "v1.0.0" "$VTROOT/dist/k3s" install_k3s
+
+  # consul
+  if [ "$BUILD_CONSUL" == 1 ] ; then
+    install_dep "Consul" "1.4.0" "$VTROOT/dist/consul" install_consul
+  fi
+
+  # chromedriver
+  if [ "$BUILD_CHROME" == 1 ] ; then
+    install_dep "chromedriver" "83.0.4103.14" "$VTROOT/dist/chromedriver" install_chromedriver
+  fi
+
+  echo
+  echo "bootstrap finished - run 'make build' to compile"
+}
+
+install_all

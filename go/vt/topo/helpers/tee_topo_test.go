@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,19 +19,19 @@ package helpers
 import (
 	"testing"
 
-	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/topo/test"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/topo/test"
 )
 
-func newFakeTeeServer(t *testing.T) topo.Impl {
-	s1 := memorytopo.New("test")
-	s2 := memorytopo.New("test")
-	return NewTee(s1, s2, false)
-}
-
 func TestTeeTopo(t *testing.T) {
-	test.TopoServerTestSuite(t, func() topo.Impl {
-		return newFakeTeeServer(t)
+	test.TopoServerTestSuite(t, func() *topo.Server {
+		s1 := memorytopo.NewServer(test.LocalCellName)
+		s2 := memorytopo.NewServer(test.LocalCellName)
+		tee, err := NewTee(s1, s2, false)
+		if err != nil {
+			t.Fatalf("NewTee() failed: %v", err)
+		}
+		return tee
 	})
 }

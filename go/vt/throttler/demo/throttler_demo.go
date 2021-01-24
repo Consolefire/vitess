@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,21 +24,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/youtube/vitess/go/vt/discovery"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/throttler"
-	"github.com/youtube/vitess/go/vt/topo/memorytopo"
-	"github.com/youtube/vitess/go/vt/vttablet/grpcqueryservice"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice/fakes"
-	"github.com/youtube/vitess/go/vt/vttablet/tmclient"
-	"github.com/youtube/vitess/go/vt/wrangler"
-	"github.com/youtube/vitess/go/vt/wrangler/testlib"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/throttler"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vttablet/grpcqueryservice"
+	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/wrangler"
+	"vitess.io/vitess/go/vt/wrangler/testlib"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 
-	log "github.com/golang/glog"
+	"vitess.io/vitess/go/vt/log"
 )
 
 // This file contains a demo binary that demonstrates how the resharding
@@ -213,7 +213,7 @@ func (r *replica) stop() {
 type client struct {
 	master *master
 
-	healthCheck discovery.HealthCheck
+	healthCheck discovery.LegacyHealthCheck
 	throttler   *throttler.Throttler
 
 	stopChan chan struct{}
@@ -226,7 +226,7 @@ func newClient(master *master, replica *replica) *client {
 		log.Fatal(err)
 	}
 
-	healthCheck := discovery.NewHealthCheck(1*time.Minute, 5*time.Second, 1*time.Minute)
+	healthCheck := discovery.NewLegacyHealthCheck(5*time.Second, 1*time.Minute)
 	c := &client{
 		master:      master,
 		healthCheck: healthCheck,
@@ -273,10 +273,10 @@ func (c *client) stop() {
 	c.throttler.Close()
 }
 
-// StatsUpdate implements discovery.HealthCheckStatsListener.
+// StatsUpdate implements discovery.LegacyHealthCheckStatsListener.
 // It gets called by the healthCheck instance every time a tablet broadcasts
 // a health update.
-func (c *client) StatsUpdate(ts *discovery.TabletStats) {
+func (c *client) StatsUpdate(ts *discovery.LegacyTabletStats) {
 	// Ignore unless REPLICA or RDONLY.
 	if ts.Target.TabletType != topodatapb.TabletType_REPLICA && ts.Target.TabletType != topodatapb.TabletType_RDONLY {
 		return

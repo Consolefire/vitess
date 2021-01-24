@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -48,14 +48,14 @@ func TestTickSkip(t *testing.T) {
 	tkr := NewRandTicker(10*time.Millisecond, 1*time.Millisecond)
 	time.Sleep(35 * time.Millisecond)
 	end := <-tkr.C
-	diff := time.Now().Sub(end)
+	diff := time.Since(end)
 	if diff < 20*time.Millisecond {
 		t.Errorf("diff: %v, want >20ms", diff)
 	}
 
 	// This tick should be up-to-date
 	end = <-tkr.C
-	diff = time.Now().Sub(end)
+	diff = time.Since(end)
 	if diff > 1*time.Millisecond {
 		t.Errorf("diff: %v, want <1ms", diff)
 	}

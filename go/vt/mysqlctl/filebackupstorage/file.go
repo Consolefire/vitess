@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,9 +26,10 @@ import (
 	"os"
 	"path"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/mysqlctl/backupstorage"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 )
 
 var (
@@ -43,6 +44,22 @@ type FileBackupHandle struct {
 	dir      string
 	name     string
 	readOnly bool
+	errors   concurrency.AllErrorRecorder
+}
+
+// RecordError is part of the concurrency.ErrorRecorder interface.
+func (fbh *FileBackupHandle) RecordError(err error) {
+	fbh.errors.RecordError(err)
+}
+
+// HasErrors is part of the concurrency.ErrorRecorder interface.
+func (fbh *FileBackupHandle) HasErrors() bool {
+	return fbh.errors.HasErrors()
+}
+
+// Error is part of the concurrency.ErrorRecorder interface.
+func (fbh *FileBackupHandle) Error() error {
+	return fbh.errors.Error()
 }
 
 // Directory is part of the BackupHandle interface
@@ -56,7 +73,7 @@ func (fbh *FileBackupHandle) Name() string {
 }
 
 // AddFile is part of the BackupHandle interface
-func (fbh *FileBackupHandle) AddFile(ctx context.Context, filename string) (io.WriteCloser, error) {
+func (fbh *FileBackupHandle) AddFile(ctx context.Context, filename string, filesize int64) (io.WriteCloser, error) {
 	if fbh.readOnly {
 		return nil, fmt.Errorf("AddFile cannot be called on read-only backup")
 	}

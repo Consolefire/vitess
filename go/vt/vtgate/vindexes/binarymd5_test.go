@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,30 +17,29 @@ limitations under the License.
 package vindexes
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
-	"strings"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/youtube/vitess/go/sqltypes"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/key"
 )
 
-var binVindex Vindex
+var binVindex SingleColumn
 
 func init() {
-	binVindex, _ = CreateVindex("binary_md5", "binary_md5_varchar", nil)
+	vindex, _ := CreateVindex("binary_md5", "binary_md5_varchar", nil)
+	binVindex = vindex.(SingleColumn)
 }
 
-func TestBinaryMD5Cost(t *testing.T) {
-	if binVindex.Cost() != 1 {
-		t.Errorf("Cost(): %d, want 1", binVindex.Cost())
-	}
-}
-
-func TestBinaryMD5String(t *testing.T) {
-	if strings.Compare("binary_md5_varchar", binVindex.String()) != 0 {
-		t.Errorf("String(): %s, want binary_md5_varchar", binVindex.String())
-	}
+func TestBinaryMD5Info(t *testing.T) {
+	assert.Equal(t, 1, binVindex.Cost())
+	assert.Equal(t, "binary_md5_varchar", binVindex.String())
+	assert.True(t, binVindex.IsUnique())
+	assert.False(t, binVindex.NeedsVCursor())
 }
 
 func TestBinaryMD5Map(t *testing.T) {
@@ -57,11 +56,11 @@ func TestBinaryMD5Map(t *testing.T) {
 		out: "\f\xbcf\x11\xf5T\vЀ\x9a8\x8d\xc9Za[",
 	}}
 	for _, tcase := range tcases {
-		got, err := binVindex.(Unique).Map(nil, []sqltypes.Value{sqltypes.NewVarBinary(tcase.in)})
+		got, err := binVindex.Map(nil, []sqltypes.Value{sqltypes.NewVarBinary(tcase.in)})
 		if err != nil {
 			t.Error(err)
 		}
-		out := string(got[0])
+		out := string(got[0].(key.DestinationKeyspaceID))
 		if out != tcase.out {
 			t.Errorf("Map(%#v): %#v, want %#v", tcase.in, out, tcase.out)
 		}
@@ -83,13 +82,45 @@ func TestBinaryMD5Verify(t *testing.T) {
 
 func TestSQLValue(t *testing.T) {
 	val := sqltypes.NewVarBinary("Test")
-	got, err := binVindex.(Unique).Map(nil, []sqltypes.Value{val})
-	if err != nil {
-		t.Error(err)
-	}
-	out := string(got[0])
+	got, err := binVindex.Map(nil, []sqltypes.Value{val})
+	require.NoError(t, err)
+	out := string(got[0].(key.DestinationKeyspaceID))
 	want := "\f\xbcf\x11\xf5T\vЀ\x9a8\x8d\xc9Za["
 	if out != want {
 		t.Errorf("Map(%#v): %#v, want %#v", val, out, want)
+	}
+}
+
+func BenchmarkMD5Hash(b *testing.B) {
+	for _, benchSize := range []struct {
+		name string
+		n    int
+	}{
+		{"8B", 8},
+		{"32B", 32},
+		{"64B", 64},
+		{"512B", 512},
+		{"1KB", 1e3},
+		{"4KB", 4e3},
+	} {
+		input := make([]byte, benchSize.n)
+		for i := range input {
+			input[i] = byte(i)
+		}
+
+		name := fmt.Sprintf("md5Hash,direct,bytes,n=%s", benchSize.name)
+		b.Run(name, func(b *testing.B) {
+			benchmarkMD5HashBytes(b, input)
+		})
+
+	}
+}
+
+var sinkMD5 []byte
+
+func benchmarkMD5HashBytes(b *testing.B, input []byte) {
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		sinkMD5 = vMD5Hash(input)
 	}
 }

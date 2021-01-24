@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,29 @@ limitations under the License.
 package vitessdriver
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
-	"time"
 
-	"golang.org/x/net/context"
+	"google.golang.org/grpc"
 
-	"github.com/youtube/vitess/go/vt/vtgate/vtgateconn"
+	"vitess.io/vitess/go/vt/vtgate/grpcvtgateconn"
+	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
+)
+
+var (
+	errNoIntermixing        = errors.New("named and positional arguments intermixing disallowed")
+	errIsolationUnsupported = errors.New("isolation levels are not supported")
+)
+
+// Type-check interfaces.
+var (
+	_ driver.QueryerContext   = &conn{}
+	_ driver.ExecerContext    = &conn{}
+	_ driver.StmtQueryContext = &stmt{}
+	_ driver.StmtExecContext  = &stmt{}
 )
 
 func init() {
@@ -35,13 +49,10 @@ func init() {
 // Open is a Vitess helper function for sql.Open().
 //
 // It opens a database connection to vtgate running at "address".
-//
-// Note that this is the vtgate v3 mode and requires a loaded VSchema.
-func Open(address, target string, timeout time.Duration) (*sql.DB, error) {
+func Open(address, target string) (*sql.DB, error) {
 	c := Configuration{
 		Address: address,
 		Target:  target,
-		Timeout: timeout,
 	}
 	return OpenWithConfiguration(c)
 }
@@ -50,12 +61,11 @@ func Open(address, target string, timeout time.Duration) (*sql.DB, error) {
 // the results.
 //
 // The streaming mode is recommended for large results.
-func OpenForStreaming(address, target string, timeout time.Duration) (*sql.DB, error) {
+func OpenForStreaming(address, target string) (*sql.DB, error) {
 	c := Configuration{
 		Address:   address,
 		Target:    target,
 		Streaming: true,
-		Timeout:   timeout,
 	}
 	return OpenWithConfiguration(c)
 }
@@ -65,11 +75,18 @@ func OpenForStreaming(address, target string, timeout time.Duration) (*sql.DB, e
 // It allows to pass in a Configuration struct to control all possible
 // settings of the Vitess Go SQL driver.
 func OpenWithConfiguration(c Configuration) (*sql.DB, error) {
+	c.setDefaults()
+
 	json, err := c.toJSON()
 	if err != nil {
 		return nil, err
 	}
-	return sql.Open("vitess", json)
+
+	if len(c.GRPCDialOptions) != 0 {
+		vtgateconn.RegisterDialer(c.Protocol, grpcvtgateconn.DialWithOpts(context.TODO(), c.GRPCDialOptions...))
+	}
+
+	return sql.Open(c.DriverName, json)
 }
 
 type drv struct {
@@ -86,22 +103,26 @@ type drv struct {
 //
 // Example for a JSON string:
 //
-//   {"protocol": "grpc", "address": "localhost:1111", "target": "@master", "timeout": 1000000000}
+//   {"protocol": "grpc", "address": "localhost:1111", "target": "@master"}
 //
 // For a description of the available fields, see the Configuration struct.
-// Note: In the JSON string, timeout has to be specified in nanoseconds.
 func (d drv) Open(name string) (driver.Conn, error) {
 	c := &conn{}
 	err := json.Unmarshal([]byte(name), c)
 	if err != nil {
 		return nil, err
 	}
+
+	c.setDefaults()
+
 	if c.convert, err = newConverter(&c.Configuration); err != nil {
 		return nil, err
 	}
+
 	if err = c.dial(); err != nil {
 		return nil, err
 	}
+
 	return c, nil
 }
 
@@ -128,21 +149,29 @@ type Configuration struct {
 	// Default: false
 	Streaming bool
 
-	// Timeout after which a pending query will be aborted.
-	// TODO(sougou): deprecate once we switch to go1.8.
-	Timeout time.Duration
-
 	// DefaultLocation is the timezone string that will be used
 	// when converting DATETIME and DATE into time.Time.
 	// This setting has no effect if ConvertDatetime is not set.
 	// Default: UTC
 	DefaultLocation string
+
+	// GRPCDialOptions registers a new vtgateconn dialer with these dial options using the
+	// protocol as the key. This may overwrite the default grpcvtgateconn dial option
+	// if a custom one hasn't been specified in the config.
+	//
+	// Default: none
+	GRPCDialOptions []grpc.DialOption `json:"-"`
+
+	// Driver is the name registered with the database/sql package. This override
+	// is here in case you have wrapped the driver for stats or other interceptors.
+	//
+	// Default: "vitess"
+	DriverName string `json:"-"`
 }
 
 // toJSON converts Configuration to the JSON string which is required by the
 // Vitess driver. Default values for empty fields will be set.
 func (c Configuration) toJSON() (string, error) {
-	c.setDefaults()
 	jsonBytes, err := json.Marshal(c)
 	if err != nil {
 		return "", err
@@ -152,8 +181,14 @@ func (c Configuration) toJSON() (string, error) {
 
 // setDefaults sets the default values for empty fields.
 func (c *Configuration) setDefaults() {
+	// if no protocol is provided default to grpc so the driver is in control
+	// of the connection protocol and not the flag vtgateconn.VtgateProtocol
 	if c.Protocol == "" {
 		c.Protocol = "grpc"
+	}
+
+	if c.DriverName == "" {
+		c.DriverName = "vitess"
 	}
 }
 
@@ -166,11 +201,7 @@ type conn struct {
 
 func (c *conn) dial() error {
 	var err error
-	if c.Protocol == "" {
-		c.conn, err = vtgateconn.Dial(context.Background(), c.Address, c.Timeout)
-	} else {
-		c.conn, err = vtgateconn.DialProtocol(context.Background(), c.Protocol, c.Address, c.Timeout)
-	}
+	c.conn, err = vtgateconn.DialProtocol(context.Background(), c.Protocol, c.Address)
 	if err != nil {
 		return err
 	}
@@ -198,6 +229,15 @@ func (c *conn) Begin() (driver.Tx, error) {
 	return c, nil
 }
 
+func (c *conn) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	// We don't use the context. The function signature accepts the context
+	// to signal to the driver that it's allowed to call Rollback on Cancel.
+	if opts.Isolation != driver.IsolationLevel(0) || opts.ReadOnly {
+		return nil, errIsolationUnsupported
+	}
+	return c.Begin()
+}
+
 func (c *conn) Commit() error {
 	_, err := c.Exec("commit", nil)
 	return err
@@ -209,8 +249,7 @@ func (c *conn) Rollback() error {
 }
 
 func (c *conn) Exec(query string, args []driver.Value) (driver.Result, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
-	defer cancel()
+	ctx := context.TODO()
 
 	if c.Streaming {
 		return nil, errors.New("Exec not allowed for streaming connections")
@@ -227,8 +266,24 @@ func (c *conn) Exec(query string, args []driver.Value) (driver.Result, error) {
 	return result{int64(qr.InsertID), int64(qr.RowsAffected)}, nil
 }
 
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if c.Streaming {
+		return nil, errors.New("Exec not allowed for streaming connections")
+	}
+
+	bv, err := c.convert.bindVarsFromNamedValues(args)
+	if err != nil {
+		return nil, err
+	}
+	qr, err := c.session.Execute(ctx, query, bv)
+	if err != nil {
+		return nil, err
+	}
+	return result{int64(qr.InsertID), int64(qr.RowsAffected)}, nil
+}
+
 func (c *conn) Query(query string, args []driver.Value) (driver.Rows, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
+	ctx := context.TODO()
 	bindVars, err := c.convert.buildBindVars(args)
 	if err != nil {
 		return nil, err
@@ -237,16 +292,33 @@ func (c *conn) Query(query string, args []driver.Value) (driver.Rows, error) {
 	if c.Streaming {
 		stream, err := c.session.StreamExecute(ctx, query, bindVars)
 		if err != nil {
-			cancel()
 			return nil, err
 		}
-		return newStreamingRows(stream, cancel, c.convert), nil
+		return newStreamingRows(stream, c.convert), nil
 	}
-	// Do not cancel in case of a streaming query.
-	// It will be called when streamingRows is closed later.
-	defer cancel()
 
 	qr, err := c.session.Execute(ctx, query, bindVars)
+	if err != nil {
+		return nil, err
+	}
+	return newRows(qr, c.convert), nil
+}
+
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	bv, err := c.convert.bindVarsFromNamedValues(args)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.Streaming {
+		stream, err := c.session.StreamExecute(ctx, query, bv)
+		if err != nil {
+			return nil, err
+		}
+		return newStreamingRows(stream, c.convert), nil
+	}
+
+	qr, err := c.session.Execute(ctx, query, bv)
 	if err != nil {
 		return nil, err
 	}
@@ -271,8 +343,16 @@ func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	return s.c.Exec(s.query, args)
 }
 
+func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	return s.c.ExecContext(ctx, s.query, args)
+}
+
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	return s.c.Query(s.query, args)
+}
+
+func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return s.c.QueryContext(ctx, s.query, args)
 }
 
 type result struct {

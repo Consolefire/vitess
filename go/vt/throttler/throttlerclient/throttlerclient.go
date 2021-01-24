@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,12 +24,12 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/youtube/vitess/go/vt/proto/throttlerdata"
+	"context"
 
-	"golang.org/x/net/context"
+	throttlerdatapb "vitess.io/vitess/go/vt/proto/throttlerdata"
 )
 
-// protocol specifices which RPC client implementation should be used.
+// protocol specifics which RPC client implementation should be used.
 var protocol = flag.String("throttler_client_protocol", "grpc", "the protocol to use to talk to the integrated throttler service")
 
 // Client defines the generic RPC interface for the throttler service.
@@ -44,7 +44,7 @@ type Client interface {
 
 	// GetConfiguration returns the configuration of the MaxReplicationlag module
 	// for the given throttler or all throttlers if "throttlerName" is empty.
-	GetConfiguration(ctx context.Context, throttlerName string) (map[string]*throttlerdata.Configuration, error)
+	GetConfiguration(ctx context.Context, throttlerName string) (map[string]*throttlerdatapb.Configuration, error)
 
 	// UpdateConfiguration (partially) updates the configuration of the
 	// MaxReplicationlag module for the given throttler or all throttlers if
@@ -52,7 +52,7 @@ type Client interface {
 	// If "copyZeroValues" is true, fields with zero values will be copied
 	// as well.
 	// The function returns the names of the updated throttlers.
-	UpdateConfiguration(ctx context.Context, throttlerName string, configuration *throttlerdata.Configuration, copyZeroValues bool) ([]string, error)
+	UpdateConfiguration(ctx context.Context, throttlerName string, configuration *throttlerdatapb.Configuration, copyZeroValues bool) ([]string, error)
 
 	// ResetConfiguration resets the configuration of the MaxReplicationlag module
 	// to the initial configuration for the given throttler or all throttlers if

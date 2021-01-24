@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,10 +26,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/youtube/vitess/go/mysql"
-	vtenv "github.com/youtube/vitess/go/vt/env"
-	"github.com/youtube/vitess/go/vt/tlstest"
-	"github.com/youtube/vitess/go/vt/vttest"
+	"vitess.io/vitess/go/mysql"
+	vtenv "vitess.io/vitess/go/vt/env"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/tlstest"
+	"vitess.io/vitess/go/vt/vttest"
+
+	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
 )
 
 var (
@@ -74,6 +77,32 @@ func runMysql(t *testing.T, params *mysql.ConnParams, command string) (string, b
 	// The args contain '-v' 3 times, to switch to very verbose output.
 	// In particular, it has the message:
 	// Query OK, 1 row affected (0.00 sec)
+
+	version, getErr := mysqlctl.GetVersionString()
+	f, v, err := mysqlctl.ParseVersionString(version)
+
+	if getErr != nil || err != nil {
+		f, v, err = mysqlctl.GetVersionFromEnv()
+		if err != nil {
+			vtenvMysqlRoot, _ := vtenv.VtMysqlRoot()
+			message := fmt.Sprintf(`could not auto-detect MySQL version. You may need to set your PATH so a mysqld binary can be found, or set the environment variable MYSQL_FLAVOR if mysqld is not available locally:
+	PATH: %s
+	VT_MYSQL_ROOT: %s
+	VTROOT: %s
+	vtenv.VtMysqlRoot(): %s
+	MYSQL_FLAVOR: %s
+	`,
+				os.Getenv("PATH"),
+				os.Getenv("VT_MYSQL_ROOT"),
+				os.Getenv("VTROOT"),
+				vtenvMysqlRoot,
+				os.Getenv("MYSQL_FLAVOR"))
+			panic(message)
+		}
+	}
+
+	t.Logf("Using flavor: %v, version: %v", f, v)
+
 	args := []string{
 		"-v", "-v", "-v",
 	}
@@ -95,12 +124,15 @@ func runMysql(t *testing.T, params *mysql.ConnParams, command string) (string, b
 		args = append(args, "-D", params.DbName)
 	}
 	if params.Flags&mysql.CapabilityClientSSL > 0 {
+		if f != mysqlctl.FlavorMySQL || v.Major != 8 {
+			args = append(args,
+				"--ssl",
+				"--ssl-verify-server-cert")
+		}
 		args = append(args,
-			"--ssl",
 			"--ssl-ca", params.SslCa,
 			"--ssl-cert", params.SslCert,
-			"--ssl-key", params.SslKey,
-			"--ssl-verify-server-cert")
+			"--ssl-key", params.SslKey)
 	}
 	env := []string{
 		"LD_LIBRARY_PATH=" + path.Join(dir, "lib/mysql"),
@@ -161,26 +193,43 @@ ssl-key=%v/server-key.pem
 			return 1
 		}
 
+		// For LargeQuery tests
+		cnf = "max_allowed_packet=100M\n"
+		maxPacketMyCnf := path.Join(root, "max_packet.cnf")
+		if err := ioutil.WriteFile(maxPacketMyCnf, []byte(cnf), os.ModePerm); err != nil {
+			fmt.Fprintf(os.Stderr, "ioutil.WriteFile(%v) failed: %v", maxPacketMyCnf, err)
+			return 1
+		}
+
 		// Launch MySQL.
-		hdl, err := vttest.LaunchVitess(
-			vttest.MySQLOnly("vttest"),
-			vttest.NoStderr(),
-			vttest.ExtraMyCnf(extraMyCnf))
-		if err != nil {
+		// We need a Keyspace in the topology, so the DbName is set.
+		// We need a Shard too, so the database 'vttest' is created.
+		cfg := vttest.Config{
+			Topology: &vttestpb.VTTestTopology{
+				Keyspaces: []*vttestpb.Keyspace{
+					{
+						Name: "vttest",
+						Shards: []*vttestpb.Shard{
+							{
+								Name:           "0",
+								DbNameOverride: "vttest",
+							},
+						},
+					},
+				},
+			},
+			OnlyMySQL:  true,
+			ExtraMyCnf: []string{extraMyCnf, maxPacketMyCnf},
+		}
+		cluster := vttest.LocalCluster{
+			Config: cfg,
+		}
+		if err := cluster.Setup(); err != nil {
 			fmt.Fprintf(os.Stderr, "could not launch mysql: %v\n", err)
 			return 1
 		}
-		defer func() {
-			err = hdl.TearDown()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "hdl.TearDown failed: %v", err)
-			}
-		}()
-		connParams, err = hdl.MySQLConnParams()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "could not fetch mysql params: %v\n", err)
-			return 1
-		}
+		defer cluster.TearDown()
+		connParams = cluster.MySQLConnParams()
 
 		// Add the SSL parts, but they're not enabled until
 		// the flag is set.
@@ -189,7 +238,8 @@ ssl-key=%v/server-key.pem
 		connParams.SslKey = path.Join(root, "client-key.pem")
 
 		// Uncomment to sleep and be able to connect to MySQL
-		// fmt.Printf("Connect to MySQL using parameters: %v\n", connParams)
+		// fmt.Printf("Connect to MySQL using parameters:\n")
+		// json.NewEncoder(os.Stdout).Encode(connParams)
 		// time.Sleep(10 * time.Minute)
 
 		return m.Run()

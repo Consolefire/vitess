@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,33 +17,43 @@ limitations under the License.
 package tabletserver
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/youtube/vitess/go/vt/dbconfigs"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
-	"github.com/youtube/vitess/go/vt/vttablet/queryservice"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/rules"
-	"github.com/youtube/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vttablet/onlineddl"
+	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
 	"time"
 
-	querypb "github.com/youtube/vitess/go/vt/proto/query"
-	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // Controller defines the control interface for TabletServer.
 type Controller interface {
 	// Register registers this query service with the RPC layer.
 	Register()
-	// AddStatusPart adds the status part to the status page
+
+	// AddStatusHeader adds the header part to the status page.
+	AddStatusHeader()
+
+	// AddStatusHeader adds the status part to the status page
 	AddStatusPart()
 
+	// Stats returns stats vars.
+	Stats() *tabletenv.Stats
+
 	// InitDBConfig sets up the db config vars.
-	InitDBConfig(querypb.Target, dbconfigs.DBConfigs, mysqlctl.MysqlDaemon) error
+	InitDBConfig(target querypb.Target, dbConfigs *dbconfigs.DBConfigs, mysqlDaemon mysqlctl.MysqlDaemon) error
 
 	// SetServingType transitions the query service to the required serving type.
 	// Returns true if the state of QueryService or the tablet type changed.
-	SetServingType(tabletType topodatapb.TabletType, serving bool, alsoAllow []topodatapb.TabletType) (bool, error)
+	SetServingType(tabletType topodatapb.TabletType, terTimestamp time.Time, serving bool, reason string) error
 
 	// EnterLameduck causes tabletserver to enter the lameduck state.
 	EnterLameduck()
@@ -72,15 +82,17 @@ type Controller interface {
 	// QueryService returns the QueryService object used by this Controller
 	QueryService() queryservice.QueryService
 
+	// OnlineDDLExecutor the online DDL executor used by this Controller
+	OnlineDDLExecutor() *onlineddl.Executor
+
 	// SchemaEngine returns the SchemaEngine object used by this Controller
 	SchemaEngine() *schema.Engine
 
 	// BroadcastHealth sends the current health to all listeners
-	BroadcastHealth(terTimestamp int64, stats *querypb.RealtimeStats)
+	BroadcastHealth()
 
-	// HeartbeatLag returns the current lag as calculated by the heartbeat
-	// package, if heartbeat is enabled. Otherwise returns 0.
-	HeartbeatLag() (time.Duration, error)
+	// TopoServer returns the topo server.
+	TopoServer() *topo.Server
 }
 
 // Ensure TabletServer satisfies Controller interface.
